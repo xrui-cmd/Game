@@ -149,6 +149,9 @@ void GameDev::update()
     // 逐个检测金币与玩家是否重叠：重叠即视为"收集成功"
     for (Coin& coin : m_coins)
     {
+        // 推进本枚金币的旋转动画（纯画面表现，不影响 24x24 碰撞盒）
+        coin.update(m_deltaTime);
+
         // AABB 相交检测；返回 true 说明玩家和这枚金币碰到了
         if (rectsOverlap(playerRect, coin.rect()))
         {
