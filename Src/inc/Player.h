@@ -2,8 +2,6 @@
 #define __PLAYER_H__
 
 #include <SDL3/SDL.h>
-#include <iostream>
-#include <windows.h>
 
 class Player
 {
@@ -14,8 +12,14 @@ public:
     // 创建纹理：需要 renderer 和窗口尺寸
     bool load(SDL_Renderer* renderer);
 
-    void update(float deltaTime, const bool* keyboard);
+    // 更新玩家位置：deltaTime 为帧间隔秒数，keyboard 为 SDL 键盘状态数组，
+    // winW/winH 是窗口实际宽高（由 GameDev 查询后传入，边界不再写死）
+    void update(float deltaTime, const bool* keyboard, float winW, float winH);
     void render(SDL_Renderer* renderer) const;
+
+    // 释放纹理：公开给 GameDev::shutdown 提前调用，
+    // 保证纹理先于 renderer 销毁；函数幂等，析构时会再兜底调用一次
+    void release();
 
     float width() const { return m_width; }       // 供外部查询方块宽高
     float height() const { return m_height; }
@@ -33,9 +37,6 @@ public:
         m_x = x; // 直接覆盖 x 坐标，不经过速度/时间累积
         m_y = y; // 直接覆盖 y 坐标，保证重开后位置确定
     }
-
-private:
-    void release();                               // 释放纹理
 
 private:
     float m_x = 640.0f;

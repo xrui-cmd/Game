@@ -6,8 +6,6 @@
 
 
 #include <SDL3/SDL.h>
-#include <iostream>
-#include <windows.h>
 #include <vector>
 #include "ErrorCode.h"
 #include "Player.h"
@@ -50,6 +48,11 @@ private:
     float m_deltaTime = 0.0f;
     Uint64 m_lastTime = 0;
     Player m_player;
+
+    // 窗口实际尺寸（由 SDL_GetWindowSize 查询得到）：
+    // 玩家移动边界、金币重生范围、重开时归位都基于它计算，不再硬编码 1280x720
+    int m_width = 0;
+    int m_height = 0;
 
     // 场上同时存在的金币集合；数量固定为 kCoinCount 个
     std::vector<Coin> m_coins;

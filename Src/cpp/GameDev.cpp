@@ -14,7 +14,8 @@ GameError GameDev::initialize()
     // 初始化 SDL 视频子系统。
     if (!SDL_Init(SDL_INIT_VIDEO))
     {
-        std::cerr << "SDL 初始化失败：" << SDL_GetError() << '\n';
+        // SDL_LogError 由 SDL 统一处理输出（默认写入 stderr），不再依赖 windows.h 的调试输出
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL 初始化失败：%s", SDL_GetError());
         return GameError::SdlInitFailed; // 按现有错误码名称调整
     }
 
@@ -28,7 +29,7 @@ GameError GameDev::initialize()
 
     if (m_window == nullptr)
     {
-        std::cerr << "窗口创建失败：" << SDL_GetError() << '\n';
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "窗口创建失败：%s", SDL_GetError());
         return GameError::WindowCreationFailed;
     }
 
@@ -37,23 +38,20 @@ GameError GameDev::initialize()
 
     if (m_renderer == nullptr)
     {
-        std::cerr << "渲染器创建失败：" << SDL_GetError() << '\n';
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "渲染器创建失败：%s", SDL_GetError());
         return GameError::RendererCreationFailed;
     }
 
 
     if (!m_player.load(m_renderer))
     {
-        OutputDebugStringA("创建玩家纹理失败：");
-        OutputDebugStringA(SDL_GetError());
-        OutputDebugStringA("\n");
+        // 纹理创建失败：用 SDL_LogError 输出原因，格式串里用 %s 拼接 SDL_GetError
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
         return GameError::RenderingFailed;
     }
 
-    // 查询窗口尺寸：金币出生需要知道可放置范围（不硬编码 1280x720）
-    int winW = 0;
-    int winH = 0;
-    SDL_GetWindowSize(m_window, &winW, &winH);
+    // 查询窗口实际尺寸并缓存到成员：金币出生和后续边界计算都基于它
+    SDL_GetWindowSize(m_window, &m_width, &m_height);
 
     // 预创建全部金币对象；resize 按 kCoinCount 构造对象，此时纹理还是空的
     m_coins.resize(kCoinCount);
@@ -66,14 +64,12 @@ GameError GameDev::initialize()
         // 为每个金币程序化创建黄色纹理，任一失败都视为渲染初始化失败
         if (!coin.load(m_renderer))
         {
-            OutputDebugStringA("创建金币纹理失败：");
-            OutputDebugStringA(SDL_GetError());
-            OutputDebugStringA("\n");
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建金币纹理失败：%s", SDL_GetError());
             return GameError::RenderingFailed;
         }
 
         // 立即给一个随机出生点，避免所有金币叠在 (0,0)
-        coin.respawn(winW, winH, playerRect);
+        coin.respawn(m_width, m_height, playerRect);
     }
 
     // 所有资源初始化成功后，游戏才可以进入主循环。
@@ -110,8 +106,6 @@ void GameDev::processEvents()
 {
     SDL_Event event{};
 
-    const bool* keyboard = SDL_GetKeyboardState(nullptr);
-
     // 一帧内可能积累多个事件，因此需要全部取出处理。
     while (SDL_PollEvent(&event))
     {
@@ -140,15 +134,17 @@ void GameDev::update()
     }
 
     const bool* keyboard = SDL_GetKeyboardState(nullptr);
-    m_player.update(m_deltaTime, keyboard);
+
+    // 每帧查询窗口实际尺寸并缓存：玩家边界、金币重生范围都基于它，
+    // 窗口尺寸一旦变化，逻辑也能自动跟随
+    SDL_GetWindowSize(m_window, &m_width, &m_height);
+
+    // 把窗口实际尺寸传给玩家：update 内部据此计算移动边界（不硬编码）
+    m_player.update(m_deltaTime, keyboard,
+                    static_cast<float>(m_width), static_cast<float>(m_height));
 
     // 玩家矩形只取一次：本帧所有金币都对它做碰撞检测
     const SDL_FRect playerRect = m_player.rect();
-
-    // 查询窗口尺寸，供金币重生时限定随机范围（跟随窗口实际大小）
-    int winW = 0;
-    int winH = 0;
-    SDL_GetWindowSize(m_window, &winW, &winH);
 
     // 逐个检测金币与玩家是否重叠：重叠即视为"收集成功"
     for (Coin& coin : m_coins)
@@ -158,8 +154,8 @@ void GameDev::update()
         {
             m_score += 1; // 每枚金币计 1 分，累加到总分里
 
-            // 立刻把这枚金币传送到新的随机位置，实现"无限收集"的循环
-            coin.respawn(winW, winH, playerRect);
+            // 立刻把这枚金币传送到新的随机位置（随机范围跟随窗口实际尺寸）
+            coin.respawn(m_width, m_height, playerRect);
         }
     }
 
@@ -181,14 +177,12 @@ void GameDev::restart()
     m_score = 0;
     m_timeLeft = kRoundSeconds;
 
-    // 查询窗口尺寸：玩家归位和金币重生都需要完整范围
-    int winW = 0;
-    int winH = 0;
-    SDL_GetWindowSize(m_window, &winW, &winH);
+    // 刷新窗口实际尺寸缓存：重开时窗口可能已被调整过大小
+    SDL_GetWindowSize(m_window, &m_width, &m_height);
 
     // 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半
-    m_player.reset(winW / 2.0f - m_player.width() / 2.0f,
-                   winH / 2.0f - m_player.height() / 2.0f);
+    m_player.reset(m_width / 2.0f - m_player.width() / 2.0f,
+                   m_height / 2.0f - m_player.height() / 2.0f);
 
     // 玩家矩形取一次，作为所有金币重生的避让区域
     const SDL_FRect playerRect = m_player.rect();
@@ -196,7 +190,7 @@ void GameDev::restart()
     // 所有金币重新随机位置，避免重开后还停在上一局的位置
     for (Coin& coin : m_coins)
     {
-        coin.respawn(winW, winH, playerRect);
+        coin.respawn(m_width, m_height, playerRect);
     }
 
     // 最后切回 Playing，新一局正式开始
@@ -208,14 +202,14 @@ GameError GameDev::render()
     // 设置清屏颜色。这里使用固定深蓝色作为背景。
     if (!SDL_SetRenderDrawColor(m_renderer, 20, 30, 50, 255))
     {
-        std::cerr << "设置绘制颜色失败：" << SDL_GetError() << '\n';
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "设置绘制颜色失败：%s", SDL_GetError());
         return GameError::RenderingFailed;
     }
 
     // 清除上一帧内容，避免旧画面残留。
     if (!SDL_RenderClear(m_renderer))
     {
-        std::cerr << "清屏失败：" << SDL_GetError() << '\n';
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "清屏失败：%s", SDL_GetError());
         return GameError::RenderingFailed;
     }
 
@@ -235,7 +229,7 @@ GameError GameDev::render()
     // 将本帧绘制结果提交到窗口。
     if (!SDL_RenderPresent(m_renderer))
     {
-        std::cerr << "提交画面失败：" << SDL_GetError() << '\n';
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "提交画面失败：%s", SDL_GetError());
         return GameError::RenderingFailed;
     }
 
@@ -311,6 +305,14 @@ void GameDev::renderHud()
 void GameDev::shutdown()
 {
     m_running = false;
+
+    // 关键顺序：所有纹理必须先于 renderer 释放。
+    // 纹理由 renderer 创建并在其内部持有引用；若 renderer 先被销毁，
+    // 之后再销毁纹理会构成"销毁后使用"的未定义行为（可能崩溃或泄漏驱动资源）。
+    m_player.release(); // 提前释放玩家纹理；release 幂等，之后析构再调一次也安全
+
+    // clear() 会析构所有 Coin 对象，每个 Coin 的析构内部会各自 release 纹理
+    m_coins.clear();
 
     // 按依赖关系的逆序释放：Renderer 依赖 Window。
     if (m_renderer != nullptr)

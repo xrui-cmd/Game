@@ -45,7 +45,7 @@ bool Player::load(SDL_Renderer* renderer)
     return m_texture != nullptr;
 }
 
-void Player::update(float deltaTime, const bool* keyboard)
+void Player::update(float deltaTime, const bool* keyboard, float winW, float winH)
 {
     // WASD 控制方向，注意 SDL 中 y 轴向下为正
     if (keyboard[SDL_SCANCODE_W])
@@ -65,8 +65,10 @@ void Player::update(float deltaTime, const bool* keyboard)
         m_x += m_speed * deltaTime;   // 右
     }
 
-    m_x = std::clamp(m_x, 0.0f, 1280.0f - 50.0f);
-    m_y = std::clamp(m_y, 0.0f, 720.0f - 50.0f);
+    // 边界限制基于调用方传入的窗口实际尺寸（不再硬编码 1280/720）：
+    // 右边界 = 窗口宽 - 自身宽，下边界 = 窗口高 - 自身高
+    m_x = std::clamp(m_x, 0.0f, winW - m_width);
+    m_y = std::clamp(m_y, 0.0f, winH - m_height);
 }
 
 void Player::render(SDL_Renderer* renderer) const
