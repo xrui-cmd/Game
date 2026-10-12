@@ -9,7 +9,8 @@ public:
     Player() = default;
     ~Player();                                    // 析构，销毁纹理
 
-    // 创建纹理：需要 renderer 和窗口尺寸
+    // 加载玩家纹理：优先从 exe 同目录 assets/player.png 加载图片精灵；
+    // 加载失败时回退到程序化 50x50 绿色方块（素材缺失也不至于崩）
     bool load(SDL_Renderer* renderer);
 
     // 更新玩家位置：deltaTime 为帧间隔秒数，keyboard 为 SDL 键盘状态数组，

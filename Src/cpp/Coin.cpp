@@ -1,6 +1,8 @@
 #include "../inc/Coin.h"
 #include "../inc/Rect.h"
+#include <SDL3_image/SDL_image.h> // IMG_LoadTexture：SDL3_image 提供的图片文件加载 API
 #include <algorithm>
+#include <string> // std::string：拼接素材文件的绝对路径
 
 // 析构：统一在这里释放纹理。
 // release() 是幂等的，即使 GameDev::shutdown() 已经提前调用过也安全。
@@ -20,9 +22,41 @@ void Coin::release()
     }
 }
 
-// 程序化创建金币纹理：流程与 Player::load 相同，只是尺寸和颜色不同
+// 加载金币纹理，分两级策略：
+//   1. 首选——从 exe 同目录的 assets/coin.png 加载图片精灵（SDL3_image 解码）
+//   2. 回退——程序化生成 24x24 黄色方块（素材缺失也不至于崩，游戏照常可玩）
 bool Coin::load(SDL_Renderer* renderer)
 {
+    // SDL_GetBasePath() 返回可执行文件所在目录的绝对路径（结尾自带路径分隔符）。
+    // 用它拼素材路径，无论从哪个工作目录启动游戏，都能找到 exe 旁边的 assets/。
+    // 注意版本差异：SDL2 中该函数返回需要 SDL_free 释放的 char*；SDL3 改为返回
+    // const char*，字符串由 SDL 内部缓存持有，调用方既不能释放也不能修改其内容
+    const char* basePath = SDL_GetBasePath();
+
+    // 只有成功拿到基路径才尝试读文件；拿不到就跳过图片加载直接走回退
+    if (basePath != nullptr)
+    {
+        // 拼出素材完整路径：<exe目录>/assets/coin.png
+        // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
+        std::string spritePath = std::string(basePath) + "assets/coin.png";
+
+        // IMG_LoadTexture 是 SDL3_image 的 API：读文件 -> 解码 -> 一步创建 GPU 纹理
+        m_texture = IMG_LoadTexture(renderer, spritePath.c_str());
+    }
+
+    // 图片加载成功：首选路径达成，直接返回成功
+    if (m_texture != nullptr)
+    {
+        return true;
+    }
+
+    // 走到这里说明图片没加载成功（文件缺失/解码失败/拿不到基路径）：
+    // 先用 SDL_LogWarn 输出具体原因，再回退到程序化纹理——素材缺失也不至于崩
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                "加载金币精灵失败（%s），回退到程序化纹理", SDL_GetError());
+
+    // ============== 以下为回退路径：程序化生成 24x24 黄色方块 ==============
+
     // 1. 创建一张 24x24 的内存表面（Surface 是 CPU 侧的像素数据）
     SDL_Surface* surface = SDL_CreateSurface(
         static_cast<int>(kSize),   // 表面宽度取整为 24 像素
