@@ -44,6 +44,11 @@ private:
 
     SDL_Window* m_window = nullptr;
     SDL_Renderer* m_renderer = nullptr;
+
+    // 背景纹理：铺底的最底层画面。加载失败时为 nullptr，render 阶段会跳过，
+    // 露出清屏深蓝色兜底（背景不是游戏必需品，加载失败不阻塞启动）
+    SDL_Texture* m_background = nullptr;
+
     bool m_running = false;
     float m_deltaTime = 0.0f;
     Uint64 m_lastTime = 0;

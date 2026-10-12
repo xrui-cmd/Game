@@ -1,5 +1,7 @@
 #include "../inc/GameDev.h"
 #include "../inc/Rect.h"
+#include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载 assets/background.png 背景图
+#include <string> // std::string：拼接背景素材的绝对路径
 
 
 // GameDev 离开作用域时自动释放 SDL 资源。
@@ -48,6 +50,24 @@ GameError GameDev::initialize()
         // 纹理创建失败：用 SDL_LogError 输出原因，格式串里用 %s 拼接 SDL_GetError
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
         return GameError::RenderingFailed;
+    }
+
+    // 加载背景图（可选资源）：拼出 <exe目录>/assets/background.png 交给 SDL3_image 解码。
+    // 背景不是游戏必需品——加载失败只记录警告并继续；渲染阶段会整块跳过背景，
+    // 露出清屏深蓝色兜底，玩法完全不受影响
+    const char* basePath = SDL_GetBasePath();
+    if (basePath != nullptr)
+    {
+        // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
+        std::string bgPath = std::string(basePath) + "assets/background.png";
+        // IMG_LoadTexture：读文件 -> 解码 PNG -> 一步创建 GPU 纹理
+        m_background = IMG_LoadTexture(m_renderer, bgPath.c_str());
+    }
+    // 无论失败原因是"拿不到基路径"还是"图片读取失败"，都统一走这条警告
+    if (m_background == nullptr)
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
     }
 
     // 查询窗口实际尺寸并缓存到成员：金币出生和后续边界计算都基于它
@@ -216,6 +236,17 @@ GameError GameDev::render()
         return GameError::RenderingFailed;
     }
 
+    // 背景作为最底层画面绘制：目标矩形 = 窗口实际尺寸（m_width/m_height 由
+    // SDL_GetWindowSize 查询而来），保持尺寸无关——无论窗口多大，背景总是铺满。
+    // 纹理缺失（加载失败）时整块跳过，清屏的深蓝色即为兜底背景
+    if (m_background != nullptr)
+    {
+        // srcRect 传 nullptr 表示使用整张背景纹理
+        const SDL_FRect bgDst{0.0f, 0.0f,
+                              static_cast<float>(m_width), static_cast<float>(m_height)};
+        SDL_RenderTexture(m_renderer, m_background, nullptr, &bgDst);
+    }
+
     m_player.render(m_renderer);
 
     // 遍历绘制所有金币；数量少，直接循环即可（金币画在玩家之后）
@@ -313,6 +344,13 @@ void GameDev::shutdown()
     // 纹理由 renderer 创建并在其内部持有引用；若 renderer 先被销毁，
     // 之后再销毁纹理会构成"销毁后使用"的未定义行为（可能崩溃或泄漏驱动资源）。
     m_player.release(); // 提前释放玩家纹理；release 幂等，之后析构再调一次也安全
+
+    // 背景纹理同样必须先于 renderer 释放（理由与玩家纹理相同）；判空后销毁并置空
+    if (m_background != nullptr)
+    {
+        SDL_DestroyTexture(m_background); // 释放背景图占用的显存
+        m_background = nullptr;           // 置空后即使重复调用也不会二次销毁
+    }
 
     // clear() 会析构所有 Coin 对象，每个 Coin 的析构内部会各自 release 纹理
     m_coins.clear();

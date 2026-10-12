@@ -2,11 +2,12 @@
 # GameDev 素材生成脚本（tools/generate_assets.ps1）
 # ============================================================
 # 作用：用 Windows PowerShell 5.1 自带（无需安装）的 System.Drawing 绘图库，
-#       程序化绘制游戏占位素材并保存为带透明通道的 PNG：
+#       程序化绘制游戏占位素材并保存为 PNG（精灵带透明通道，背景为不透明底图）：
 #         assets/player.png        50x50 玩家单帧精灵（绿色方块 + 描边 + 眼睛，回退素材）
 #         assets/coin.png          24x24 金币单帧精灵（金色圆 + 描边 + 高光，回退素材）
 #         assets/coin_sheet.png    144x24 金币旋转精灵表（6 帧横向排列，每帧 24x24）
 #         assets/player_sheet.png  100x50 玩家行走精灵表（2 帧横向排列，每帧 50x50）
+#         assets/background.png    1280x720 背景图（深蓝渐变 + 细微网格 + 星点）
 #
 # 设计原则：
 #   1. 不依赖任何第三方工具或素材文件，开箱即可重新生成占位素材
@@ -368,7 +369,90 @@ $psG.Dispose()
 $psBmp.Dispose()
 
 # ============================================================
-# 5) 生成后自检：重新读盘校验全部 PNG 的尺寸与逻辑一致
+# 5) 背景图 background.png：1280x720 深蓝星空风（渐变 + 网格 + 星点）
+# ============================================================
+# 定位：铺满窗口的最底层画布。配色刻意低对比、低饱和，
+#       保证玩家/金币/HUD 叠在背景之上依然清晰醒目
+$bgWidth = 1280   # 背景宽，与游戏初始窗口宽一致（绘制时按窗口实际尺寸拉伸）
+$bgHeight = 720   # 背景高，与游戏初始窗口高一致
+
+# 创建背景画布（背景是不透明的，不需要透明通道）
+$bgBmp = New-Canvas -width $bgWidth -height $bgHeight
+
+# 获取背景的 Graphics 绘图对象
+$bgG = [System.Drawing.Graphics]::FromImage($bgBmp)
+
+# 1) 纵向渐变底色：顶部深藏蓝 -> 底部稍亮钢蓝，给画面一点"天幕"层次
+#    外接矩形：铺满整张画布
+$bgRect = New-Object System.Drawing.Rectangle(0, 0, $bgWidth, $bgHeight)
+
+# 渐变顶部颜色（先算成变量，避免 New-Object 参数里内联复杂表达式）
+$bgTopColor = [System.Drawing.Color]::FromArgb(255, 12, 18, 34)
+
+# 渐变底部颜色：比顶部稍亮一档，形成自然过渡
+$bgBottomColor = [System.Drawing.Color]::FromArgb(255, 24, 34, 58)
+
+# 线性渐变画刷：角度 90 表示从上到下渐变
+$bgGradient = New-Object System.Drawing.Drawing2D.LinearGradientBrush($bgRect, $bgTopColor, $bgBottomColor, 90)
+
+# 用渐变铺满整张背景（不透明，直接覆盖）
+$bgG.FillRectangle($bgGradient, $bgRect)
+
+# 2) 细微网格：每 64 像素一条淡蓝细线（alpha 只有 28，凑近看才明显），
+#    给空旷的深蓝底一点"坐标纸"的纹理感
+$bgGridPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(28, 120, 160, 220), 1)
+
+# 竖线族：x 从 0 到 1279，步长 64
+for ($gx = 0; $gx -lt $bgWidth; $gx += 64) {
+    # 在 x = gx 处从顶到底画一条 1 像素竖线
+    $bgG.DrawLine($bgGridPen, $gx, 0, $gx, $bgHeight)
+}
+
+# 横线族：y 从 0 到 719，步长 64
+for ($gy = 0; $gy -lt $bgHeight; $gy += 64) {
+    # 在 y = gy 处从左到右画一条 1 像素横线
+    $bgG.DrawLine($bgGridPen, 0, $gy, $bgWidth, $gy)
+}
+
+# 3) 星点：固定种子的伪随机数撒点。
+#    固定种子是幂等的关键——每次运行都得到完全相同的位置序列
+$bgRng = New-Object System.Random(20261012)
+
+# 星点画刷：半透明淡蓝白（alpha 85），淡淡的、不抢戏
+$bgStarBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(85, 200, 220, 255))
+
+# 一共撒 160 颗小星
+for ($i = 0; $i -lt 160; $i++) {
+    # 星点左上角横坐标：取 [0, 1280) 的随机整数
+    $starX = $bgRng.Next(0, $bgWidth)
+    # 星点左上角纵坐标：取 [0, 720) 的随机整数
+    $starY = $bgRng.Next(0, $bgHeight)
+    # 星点直径：随机取 1 或 2 像素，小到不会喧宾夺主
+    $starD = $bgRng.Next(1, 3)
+    # 画一颗圆形小星（1~2 像素的点用圆形画刷边缘更柔和）
+    $bgG.FillEllipse($bgStarBrush, $starX, $starY, $starD, $starD)
+}
+
+# 保存背景图到 assets/background.png（内部先删旧文件，保证幂等）
+Save-Png -bitmap $bgBmp -path (Join-Path $assetsDir "background.png")
+
+# 释放渐变画刷
+$bgGradient.Dispose()
+
+# 释放网格画笔
+$bgGridPen.Dispose()
+
+# 释放星点画刷
+$bgStarBrush.Dispose()
+
+# 释放 Graphics 绘图对象
+$bgG.Dispose()
+
+# 释放背景位图本身
+$bgBmp.Dispose()
+
+# ============================================================
+# 6) 生成后自检：重新读盘校验全部 PNG 的尺寸与逻辑一致
 # ============================================================
 # 校验玩家精灵必须为 50x50（与 Player 的 m_width/m_height 对应）
 Assert-PngSize -path (Join-Path $assetsDir "player.png") -expectedWidth 50 -expectedHeight 50
@@ -381,6 +465,9 @@ Assert-PngSize -path (Join-Path $assetsDir "coin_sheet.png") -expectedWidth 144 
 
 # 校验玩家行走精灵表必须为 100x50（2 帧 x 每帧 50 宽，与 Player 的 kFrameCount 对应）
 Assert-PngSize -path (Join-Path $assetsDir "player_sheet.png") -expectedWidth 100 -expectedHeight 50
+
+# 校验背景图必须为 1280x720（与窗口初始尺寸一致；绘制时按窗口实际尺寸拉伸）
+Assert-PngSize -path (Join-Path $assetsDir "background.png") -expectedWidth 1280 -expectedHeight 720
 
 # 全部完成提示
 Write-Host "全部素材生成并校验完成。"
