@@ -119,11 +119,26 @@ void GameDev::processEvents()
         {
             m_running = false;
         }
+        // 结束状态下按 R 重开：用"按键按下"事件而不是每帧轮询键盘状态，
+        // 天然保证按一次只触发一次，长按不会反复重开
+        else if (event.type == SDL_EVENT_KEY_DOWN &&
+                 event.key.scancode == SDL_SCANCODE_R &&
+                 m_state == GameState::GameOver)
+        {
+            restart(); // 重置整局数据并切回 Playing
+        }
     }
 }
 
 void GameDev::update()
 {
+    // 只有 Playing 状态才推进游戏逻辑：
+    // GameOver 之后玩家停止移动、倒计时不再走、金币也不再刷新
+    if (m_state != GameState::Playing)
+    {
+        return;
+    }
+
     const bool* keyboard = SDL_GetKeyboardState(nullptr);
     m_player.update(m_deltaTime, keyboard);
 
@@ -147,6 +162,45 @@ void GameDev::update()
             coin.respawn(winW, winH, playerRect);
         }
     }
+
+    // 倒计时按真实流逝时间递减（delta 单位是秒，与 30 秒常量同量纲）
+    m_timeLeft -= m_deltaTime;
+
+    // 时间耗尽：进入 GameOver 状态
+    if (m_timeLeft <= 0.0f)
+    {
+        m_timeLeft = 0.0f;             // 夹到 0，避免 HUD 显示 -0.1 这类负数
+        m_state = GameState::GameOver; // 冻结世界，等待玩家按 R 重开
+    }
+}
+
+// 重开一局：把整局相关的数据全部恢复到初始状态
+void GameDev::restart()
+{
+    // 分数清零，倒计时回到满值
+    m_score = 0;
+    m_timeLeft = kRoundSeconds;
+
+    // 查询窗口尺寸：玩家归位和金币重生都需要完整范围
+    int winW = 0;
+    int winH = 0;
+    SDL_GetWindowSize(m_window, &winW, &winH);
+
+    // 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半
+    m_player.reset(winW / 2.0f - m_player.width() / 2.0f,
+                   winH / 2.0f - m_player.height() / 2.0f);
+
+    // 玩家矩形取一次，作为所有金币重生的避让区域
+    const SDL_FRect playerRect = m_player.rect();
+
+    // 所有金币重新随机位置，避免重开后还停在上一局的位置
+    for (Coin& coin : m_coins)
+    {
+        coin.respawn(winW, winH, playerRect);
+    }
+
+    // 最后切回 Playing，新一局正式开始
+    m_state = GameState::Playing;
 }
 
 GameError GameDev::render()
@@ -173,6 +227,10 @@ GameError GameDev::render()
         coin.render(m_renderer); // 每个金币把自身纹理画到当前位置
     }
 
+    // 游戏世界画完后再叠加 HUD 文字（分数/倒计时/结束界面）。
+    // HUD 绘制失败不影响主流程，最终由 RenderPresent 统一兜底判定
+    renderHud();
+
 
     // 将本帧绘制结果提交到窗口。
     if (!SDL_RenderPresent(m_renderer))
@@ -183,6 +241,71 @@ GameError GameDev::render()
 
 
     return GameError::None;
+}
+
+// 绘制 HUD 文字。使用 SDL3 内置的 SDL_RenderDebugText* 系列 API：
+// 每个字符天生是 8x8 的等宽方形点阵，因此文字的像素宽度 = 8 * 字符数
+void GameDev::renderHud()
+{
+    // 查询渲染器输出尺寸（物理像素）。HUD 的右上角对齐等定位
+    // 都基于这个实际尺寸，而不是把 1280x720 硬编码进来
+    int outW = 0;
+    int outH = 0;
+    SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
+
+    // 开启 kHudScale 倍渲染缩放：8x8 字模直接绘制太小，放大更易读。
+    // 缩放后绘制坐标按"逻辑空间"解释：逻辑尺寸 = 输出尺寸 / kHudScale
+    SDL_SetRenderScale(m_renderer, kHudScale, kHudScale);
+
+    // 换算出逻辑空间宽高，供右上角对齐与水平居中计算
+    const float logicalW = static_cast<float>(outW) / kHudScale;
+    const float logicalH = static_cast<float>(outH) / kHudScale;
+
+    if (m_state == GameState::Playing)
+    {
+        // 左上角：当前分数（白色文字）
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        SDL_RenderDebugTextFormat(m_renderer, 10.0f, 10.0f, "Score: %d", m_score);
+
+        // 右上角：剩余时间（黄色文字）。%4.1f 让数字部分恒占 4 个字符，
+        // 于是整串 "Time: xx.x" 恒为 10 字符，宽度可精确算出
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
+        constexpr float timeTextW = 10.0f * 8.0f; // 10 字符 × 每字符 8 逻辑像素
+        SDL_RenderDebugTextFormat(m_renderer, logicalW - timeTextW - 10.0f, 10.0f,
+                                  "Time: %4.1f", m_timeLeft);
+    }
+    else
+    {
+        // GameOver 界面：三行文字全部水平居中、围绕窗口中心排布。
+        // 先算出每行文字宽度（8 逻辑像素/字符），再反推左起点实现居中
+
+        // 水平中心与垂直中心，三段文字共用的基准点
+        const float centerX = logicalW / 2.0f;
+        const float centerY = logicalH / 2.0f;
+
+        // 第一行：GAME OVER（白色）。"GAME OVER" 共 9 个字符
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        constexpr float overW = 9.0f * 8.0f; // 文字总宽（逻辑像素）
+        SDL_RenderDebugTextFormat(m_renderer, centerX - overW / 2.0f, centerY - 30.0f, "GAME OVER");
+
+        // 第二行：最终得分（黄色）。分数位数不定，先格式化到缓冲区，
+        // 用实际字符数算出宽度，才能正确地水平居中
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
+        char scoreText[32]; // 容纳 "Final Score: " + 最长数字，绰绰有余
+        SDL_snprintf(scoreText, sizeof(scoreText), "Final Score: %d", m_score);
+        const float scoreW = 8.0f * static_cast<float>(SDL_strlen(scoreText));
+        SDL_RenderDebugText(m_renderer, centerX - scoreW / 2.0f, centerY, scoreText);
+
+        // 第三行：重开提示（白色）。"Press R to Restart" 共 17 个字符
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        constexpr float restartW = 17.0f * 8.0f; // 文字总宽（逻辑像素）
+        SDL_RenderDebugTextFormat(m_renderer, centerX - restartW / 2.0f, centerY + 30.0f,
+                                  "Press R to Restart");
+    }
+
+    // 关键收尾：恢复默认缩放 (1,1)。
+    // 否则下一帧的游戏世界（玩家/金币）也会被放大成 2 倍并错位
+    SDL_SetRenderScale(m_renderer, 1.0f, 1.0f);
 }
 
 void GameDev::shutdown()
