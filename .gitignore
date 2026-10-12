@@ -1,0 +1,15 @@
+# GameDev 学习项目 · Git 忽略规则
+# 注意：vendor/SDL-main 是随项目内嵌的 SDL3 源码，需要纳入版本控制，
+# 以下规则均已确认不会误伤 vendor 目录内容。
+
+# 构建输出（CMake 构建目录位于 out/ 下）
+/out/
+
+# Visual Studio 状态目录与用户文件
+/.vs/
+*.user
+
+# 编译中间产物残留（根目录 / 源码目录）
+*.obj
+*.pdb
+*.ilk
