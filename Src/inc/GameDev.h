@@ -8,8 +8,10 @@
 #include <SDL3/SDL.h>
 #include <iostream>
 #include <windows.h>
+#include <vector>
 #include "ErrorCode.h"
 #include "Player.h"
+#include "Coin.h"
 
 
 class GameDev
@@ -34,6 +36,11 @@ private:
     float m_deltaTime = 0.0f;
     Uint64 m_lastTime = 0;
     Player m_player;
+
+    // 场上同时存在的金币集合；数量固定为 kCoinCount 个
+    std::vector<Coin> m_coins;
+    static constexpr int kCoinCount = 5; // 金币数量（学习项目先用固定小数量）
+    int m_score = 0;                     // 已收集的金币总数（跨帧累计）
 };
 
 #endif // !__GAMEDEV_H__

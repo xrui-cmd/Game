@@ -20,6 +20,20 @@ public:
     float width() const { return m_width; }       // 供外部查询方块宽高
     float height() const { return m_height; }
 
+    // 返回玩家方块当前的轴对齐矩形，用于和其他实体做 AABB 碰撞检测
+    SDL_FRect rect() const
+    {
+        // 用当前位置和固定的宽高拼出一个 SDL_FRect 返回（副本，外部修改不影响玩家）
+        return SDL_FRect{ m_x, m_y, m_width, m_height };
+    }
+
+    // 把玩家左上角瞬间移动到 (x, y)：重开游戏时用来归位到窗口中心
+    void reset(float x, float y)
+    {
+        m_x = x; // 直接覆盖 x 坐标，不经过速度/时间累积
+        m_y = y; // 直接覆盖 y 坐标，保证重开后位置确定
+    }
+
 private:
     void release();                               // 释放纹理
 

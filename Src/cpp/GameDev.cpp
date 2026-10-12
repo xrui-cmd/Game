@@ -1,4 +1,5 @@
 #include "../inc/GameDev.h"
+#include "../inc/Rect.h"
 
 
 // GameDev 离开作用域时自动释放 SDL 资源。
@@ -47,6 +48,32 @@ GameError GameDev::initialize()
         OutputDebugStringA(SDL_GetError());
         OutputDebugStringA("\n");
         return GameError::RenderingFailed;
+    }
+
+    // 查询窗口尺寸：金币出生需要知道可放置范围（不硬编码 1280x720）
+    int winW = 0;
+    int winH = 0;
+    SDL_GetWindowSize(m_window, &winW, &winH);
+
+    // 预创建全部金币对象；resize 按 kCoinCount 构造对象，此时纹理还是空的
+    m_coins.resize(kCoinCount);
+
+    // 玩家当前矩形：金币出生点尽量避开玩家所站的位置
+    const SDL_FRect playerRect = m_player.rect();
+
+    for (Coin& coin : m_coins)
+    {
+        // 为每个金币程序化创建黄色纹理，任一失败都视为渲染初始化失败
+        if (!coin.load(m_renderer))
+        {
+            OutputDebugStringA("创建金币纹理失败：");
+            OutputDebugStringA(SDL_GetError());
+            OutputDebugStringA("\n");
+            return GameError::RenderingFailed;
+        }
+
+        // 立即给一个随机出生点，避免所有金币叠在 (0,0)
+        coin.respawn(winW, winH, playerRect);
     }
 
     // 所有资源初始化成功后，游戏才可以进入主循环。
@@ -99,6 +126,27 @@ void GameDev::update()
 {
     const bool* keyboard = SDL_GetKeyboardState(nullptr);
     m_player.update(m_deltaTime, keyboard);
+
+    // 玩家矩形只取一次：本帧所有金币都对它做碰撞检测
+    const SDL_FRect playerRect = m_player.rect();
+
+    // 查询窗口尺寸，供金币重生时限定随机范围（跟随窗口实际大小）
+    int winW = 0;
+    int winH = 0;
+    SDL_GetWindowSize(m_window, &winW, &winH);
+
+    // 逐个检测金币与玩家是否重叠：重叠即视为"收集成功"
+    for (Coin& coin : m_coins)
+    {
+        // AABB 相交检测；返回 true 说明玩家和这枚金币碰到了
+        if (rectsOverlap(playerRect, coin.rect()))
+        {
+            m_score += 1; // 每枚金币计 1 分，累加到总分里
+
+            // 立刻把这枚金币传送到新的随机位置，实现"无限收集"的循环
+            coin.respawn(winW, winH, playerRect);
+        }
+    }
 }
 
 GameError GameDev::render()
@@ -118,6 +166,12 @@ GameError GameDev::render()
     }
 
     m_player.render(m_renderer);
+
+    // 遍历绘制所有金币；数量少，直接循环即可（金币画在玩家之后）
+    for (const Coin& coin : m_coins)
+    {
+        coin.render(m_renderer); // 每个金币把自身纹理画到当前位置
+    }
 
 
     // 将本帧绘制结果提交到窗口。
