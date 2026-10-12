@@ -13,3 +13,9 @@
 *.obj
 *.pdb
 *.ilk
+
+# 测试构建产物（tests/：CMake 构建目录、产物输出目录、cl 直编可执行文件；
+# *.obj / *.pdb / *.ilk 已由上方全局规则覆盖，不重复添加）
+/tests/build/
+/tests/bin/
+/tests/*.exe
