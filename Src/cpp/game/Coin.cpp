@@ -43,4 +43,10 @@ void Coin::respawn(int winW, int winH, const SDL_FRect& avoidRect)
     }
     // 若 kMaxTries 次都恰好落在玩家身上（概率极低），也接受最后一次结果：
     // 设计目标是「尽量避开」而非「绝对避开」，避免极端情况下的死循环
+
+    // 瞬移类操作的插值收尾（重点）：金币重生是「瞬间换位」，必须把插值
+    // 快照对齐到新落点。否则渲染会从上一位置向新位置「拉丝」——一帧内
+    // 划过整个屏幕的拖影。setPosition 内部已做同样处理，respawn 直接写
+    // m_x/m_y，所以这里要显式调用
+    snapshotPreviousPosition();
 }

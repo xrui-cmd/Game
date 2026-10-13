@@ -35,6 +35,10 @@ void Player::setSpeed(float speed)
 // 50x50 方块、300 像素/秒、边界 clamp、移动才播动画、静止清零归位第 1 帧
 void Player::update(const UpdateContext& ctx)
 {
+    // 第一行固定动作：快照「本步开始前的位置」作为渲染插值起点。
+    // 覆写 update 会跳过 Entity::update，这条调用必须自己补上
+    snapshotPreviousPosition();
+
     // 本帧是否有移动输入：任一方向键按下即视为「要走动」，用于驱动行走动画
     bool isMoving = false;
 

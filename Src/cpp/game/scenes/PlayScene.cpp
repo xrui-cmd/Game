@@ -165,13 +165,22 @@ void PlayScene::handleEvent(const SDL_Event& event)
 }
 
 // 每帧更新：只有 Playing 状态才推进游戏逻辑。
-// Paused（暂停）与 GameOver（结束）都直接返回：玩家停止移动、
-// 倒计时不再走、金币也不再刷新——暂停由此天然实现了「世界与计时冻结」
+// Paused（暂停）与 GameOver（结束）都冻结玩家、倒计时与金币——暂停由此
+// 天然实现了「世界与计时冻结」
 void PlayScene::update(const UpdateContext& ctx)
 {
-    // 非 Playing 状态直接返回：世界冻结
+    // 非 Playing 状态：世界冻结。
     if (m_state != PlayState::Playing)
     {
+        // 冻结期间的插值自查（重要）：把各实体的插值快照对齐到当前位置。
+        // 若不对齐，最后一次 update 留下的 prev->cur 区间会随渲染帧的
+        // alpha 波动来回插值，暂停画面上会出现亚像素级漂移/抖动；
+        // 对齐后 prev==cur，无论 alpha 取何值，渲染位置恒等于当前位置
+        m_player.snapshotPreviousPosition(); // 玩家：prev=cur
+        for (Coin& coin : m_coins)
+        {
+            coin.snapshotPreviousPosition(); // 金币：逐枚对齐
+        }
         return;
     }
 
@@ -246,8 +255,10 @@ void PlayScene::restart()
 }
 
 // 每帧渲染：清屏 -> 背景 -> 玩家 -> 金币 -> HUD。
-// 不调用 SDL_RenderPresent（提交由应用外壳统一负责）
-void PlayScene::render()
+// 不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
+// alpha 是插值系数，原样传给各实体——它们据此在上一固定步位置与当前
+// 固定步位置之间平滑绘制
+void PlayScene::render(float alpha)
 {
     // 设置清屏颜色。深蓝是背景图缺失时的兜底底色
     if (!SDL_SetRenderDrawColor(m_renderer, 20, 30, 50, 255))
@@ -278,13 +289,14 @@ void PlayScene::render()
         SDL_RenderTexture(m_renderer, m_background, nullptr, &bgDst);
     }
 
-    // 玩家先画、金币后画（金币叠在玩家上的观感与改造前一致）
-    m_player.render(m_renderer);
+    // 玩家先画、金币后画（金币叠在玩家上的观感与改造前一致）。
+    // 两者都按插值位置绘制：逻辑 120Hz 的离散位移在渲染帧上平滑呈现
+    m_player.render(m_renderer, alpha);
 
     // 遍历绘制所有金币；数量少，直接循环即可
     for (const Coin& coin : m_coins)
     {
-        coin.render(m_renderer); // 每个金币把自身纹理画到当前位置
+        coin.render(m_renderer, alpha); // 每个金币按插值位置画到屏幕上
     }
 
     // 游戏世界画完后再叠加 HUD 文字（分数/倒计时/暂停叠层/结束界面）

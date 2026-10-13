@@ -49,11 +49,12 @@ public:
     // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M 回主菜单
     void handleEvent(const SDL_Event& event) override;
 
-    // 每帧更新：仅 Playing 状态推进移动/碰撞/倒计时（Paused/GameOver 冻结）
+    // 每帧更新：仅 Playing 状态推进移动/碰撞/倒计时（Paused/GameOver 冻结）。
+    // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移
     void update(const UpdateContext& ctx) override;
 
-    // 每帧渲染：清屏、背景、实体、HUD
-    void render() override;
+    // 每帧渲染：清屏、背景、实体、HUD。alpha 是插值系数，原样转发给实体
+    void render(float alpha) override;
 
 private:
     // 重开一局：重置分数、倒计时、玩家位置与全部金币

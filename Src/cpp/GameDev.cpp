@@ -61,6 +61,21 @@ GameError GameDev::initialize()
         return GameError::RendererCreationFailed;
     }
 
+    // 垂直同步：按配置启用/禁用（vsync=1 开启 / 0 关闭，默认 1）。
+    // 两种取值都显式设置，不依赖 SDL 创建渲染器时的默认值——行为只由配置决定。
+    // 开启后：渲染提交与显示器刷新对齐（画面无撕裂、CPU 占用低）；
+    // 关闭后：帧率不设上限，便于观察固定步长在无 vsync 下的表现
+    const int vsync = m_config.getInt("vsync", kDefaultVsync);
+    // 配置归一化：非 0 一律映射到 SDL 的「开启」(1)，避免把非法值透传给 SDL
+    const int vsyncMode = (vsync != 0) ? 1 : SDL_RENDERER_VSYNC_DISABLED;
+
+    // 设置失败（驱动不支持等）只警告不致命：没有 vsync 游戏照常运行
+    if (!SDL_SetRenderVSync(m_renderer, vsyncMode))
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "设置垂直同步失败（%s），继续运行", SDL_GetError());
+    }
+
     // 场景管理器绑定 renderer 与配置：之后每次切换，新场景的 onEnter
     // 都能立即拿到它们加载纹理资源、读取配置数值
     m_sceneManager = std::make_unique<SceneManager>(m_renderer, m_config);
@@ -81,24 +96,35 @@ GameError GameDev::run()
 
     while (m_running)
     {
-        // 1. 先算本帧 delta，让 update() 能用到正确的值
-        Uint64 curTime = SDL_GetPerformanceCounter();
-        m_deltaTime = (curTime - m_lastTime) / static_cast<float>(SDL_GetPerformanceFrequency());
+        // 1. 先算本渲染帧的真实间隔（秒）：性能计数器差值 / 频率。
+        //    这是「真实时间」的唯一来源，逻辑步数由它累加而来
+        const Uint64 curTime = SDL_GetPerformanceCounter();
+        float frameDelta = (curTime - m_lastTime) / static_cast<float>(SDL_GetPerformanceFrequency());
         m_lastTime = curTime;
 
-        // 2. 处理输入：QUIT 在应用层消化，其余事件转发给当前场景
+        // 钳制上限（防死亡螺旋第一道防线）：断点调试/系统休眠/拖动窗口
+        // 会让间隔膨胀到几秒，不钳制的话累加器暴涨、单帧要补上千步，
+        // 「补步越慢 -> 间隔越大 -> 补步更多」的雪球就此滚起来
+        if (frameDelta > kMaxFrameDelta)
+        {
+            frameDelta = kMaxFrameDelta; // 超出部分直接丢弃，按 0.25 秒处理
+        }
+
+        // 2. 处理输入：QUIT 在应用层消化，其余事件转发给当前场景。
+        //    事件按「渲染帧」粒度处理，本帧的所有固定步共享同一份键盘快照
         processEvents();
 
-        // 3. 更新与绘制当前场景（内部由 SceneManager 转发）
-        update();
+        // 3. 固定步长补步：把本帧时间余额换成一个或多个固定步的 update
+        update(frameDelta);
 
+        // 4. 插值渲染：用余额换算 alpha，在两次固定步位置之间平滑绘制
         const GameError result = render();
         if (result != GameError::None)
         {
             return result; // 提交画面失败属于致命错误：立刻退出主循环
         }
 
-        // 4. 帧末统一结算场景切换：
+        // 5. 帧末统一结算场景切换：
         //    此时场景的一切回调都已返回，析构旧场景不会踩到自身的调用栈
         m_sceneManager->applyPendingChange();
     }
@@ -126,29 +152,65 @@ void GameDev::processEvents()
     }
 }
 
-void GameDev::update()
+void GameDev::update(float frameDelta)
 {
-    // 每帧查询窗口实际尺寸：视口尺寸是玩家移动边界与金币重生范围的计算基准
-    // （窗口一旦变化，本帧逻辑立即跟随，与改造前行为一致）
-    int width = 0;
-    int height = 0;
-    SDL_GetWindowSize(m_window, &width, &height);
+    // 1) 把本渲染帧的真实时间存进累加器
+    m_accumulator += frameDelta;
 
-    // 装配本帧的「世界上下文」：一次构造，转发给当前场景，
-    // 再由场景分发给场上实体（玩家与全部金币共享同一份快照）
-    const UpdateContext ctx{
-        m_deltaTime,                   // 距上一帧的真实流逝秒数（动画/倒计时基准）
-        SDL_GetKeyboardState(nullptr), // SDL 键盘状态数组（WASD 轮询用）
-        static_cast<float>(width),     // 视口宽：移动边界 / 重生范围的计算基准
-        static_cast<float>(height)     // 视口高：同上
-    };
-    m_sceneManager->update(ctx);
+    // 2) 攒够一个固定步长才推进逻辑。高刷屏幕上可能连续几帧都不足一步
+    //    （此时只做插值渲染），低帧率下一帧可能连续补多步
+    if (m_accumulator >= kFixedDelta)
+    {
+        // 每渲染帧只查一次窗口尺寸：本帧的所有固定步共享同一视口快照。
+        // 视口尺寸是玩家移动边界与金币重生范围的计算基准（沿用原行为：
+        // 窗口一变化，本帧逻辑立即跟随）
+        int width = 0;
+        int height = 0;
+
+        // 查询窗口实际尺寸（整数像素）
+        SDL_GetWindowSize(m_window, &width, &height);
+
+        // 装配固定步的「世界上下文」：一次构造，本帧所有固定步复用。
+        // deltaTime 恒为 kFixedDelta（固定步长，与真实帧率无关）
+        const UpdateContext fixedCtx{
+            kFixedDelta,                   // 固定步长（秒）：逻辑与计时的唯一时间基准
+            SDL_GetKeyboardState(nullptr), // SDL 键盘状态数组（事件已在帧首统一刷新）
+            static_cast<float>(width),     // 视口宽：移动边界 / 重生范围的计算基准
+            static_cast<float>(height)     // 视口高：同上
+        };
+
+        // 3) 固定步循环：每转一圈消耗一步余额，直到不足一步或达到上限
+        int steps = 0; // 本帧已补步数（用于上限判断）
+        while (m_accumulator >= kFixedDelta && steps < kMaxStepsPerFrame)
+        {
+            // 转发给当前场景：每步都恰好推进 kFixedDelta 的逻辑时间
+            m_sceneManager->update(fixedCtx);
+            m_accumulator -= kFixedDelta; // 消耗一步的时间余额
+            ++steps;                      // 计数 +1，逼近单帧补步上限
+        }
+
+        // 4) 达补步上限且仍有余量：丢弃剩余余额（防死亡螺旋第二道防线）。
+        //    正常情况（frameDelta 已被钳制在 0.25s）余额不会超出上限；
+        //    这里是浮点边界与未来调整的兜底，保证欠账绝不留到下一帧
+        if (steps >= kMaxStepsPerFrame && m_accumulator >= kFixedDelta)
+        {
+            m_accumulator = 0.0f; // 清零：不让补不完的时间滚雪球
+        }
+    }
 }
 
 GameError GameDev::render()
 {
+    // 插值系数 alpha：帧末余额换算成「距下一个固定步的进度」，范围 [0,1)。
+    // 固定步循环结束后余额必然小于 kFixedDelta，所以自然落在区间内：
+    //   alpha = 0   显示上一固定步的位置
+    //   alpha -> 1  显示当前固定步的位置
+    // 场景用它在「上一固定步位置 <-> 当前固定步位置」之间线性插值，
+    // 让渲染帧率与逻辑步率不一致时画面依旧平滑
+    const float alpha = m_accumulator / kFixedDelta;
+
     // 绘制当前场景（清屏/背景/实体/HUD 都由场景自己完成）
-    m_sceneManager->render();
+    m_sceneManager->render(alpha);
 
     // 将本帧绘制结果提交到窗口（提交动作由外壳统一负责）
     if (!SDL_RenderPresent(m_renderer))

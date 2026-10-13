@@ -69,8 +69,9 @@ void MenuScene::handleEvent(const SDL_Event& event)
 }
 
 // 每帧渲染：清屏 -> 背景 -> 标题与提示文字。
-// 不调用 SDL_RenderPresent（提交由应用外壳统一负责）
-void MenuScene::render()
+// 不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
+// 菜单是静态界面，没有可插值实体，alpha 参数不使用
+void MenuScene::render(float /*alpha*/)
 {
     // 设置清屏颜色。深蓝是背景图缺失时的兜底底色（与对局场景一致）
     if (!SDL_SetRenderDrawColor(m_renderer, 20, 30, 50, 255))

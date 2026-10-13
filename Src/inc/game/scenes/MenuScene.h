@@ -31,8 +31,9 @@ public:
     // 事件：按 Enter 请求进入对局
     void handleEvent(const SDL_Event& event) override;
 
-    // 渲染：背景 + 标题 + 提示文字（无更新逻辑，不覆写 update）
-    void render() override;
+    // 渲染：背景 + 标题 + 提示文字（无更新逻辑，不覆写 update）。
+    // 菜单是纯静态界面，没有可插值的实体，alpha 参数忽略
+    void render(float alpha) override;
 
 private:
     static constexpr float kTitleScale = 5.0f; // 标题文字放大倍数（大号观感）
