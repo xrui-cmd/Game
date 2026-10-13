@@ -13,7 +13,8 @@
 // 职责：
 //   1. 资源：在 onEnter 加载背景图（可选，失败兜底）、玩家与金币纹理；
 //      析构时释放背景纹理（玩家/金币纹理由各自 Entity 析构兜底）
-//   2. 玩法：WASD 移动、金币碰撞计分、30 秒倒计时、R 重开、M 回主菜单
+//   2. 玩法：WASD 移动、金币碰撞计分、30 秒倒计时、ESC 暂停/恢复、
+//      R 重开、M 回主菜单
 //   3. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
@@ -22,14 +23,16 @@
 //
 // 状态机（PlayState）：
 //   Playing  ：接受输入、倒计时递减、检测金币碰撞
+//   Paused   ：世界与倒计时冻结，ESC 恢复、M 回主菜单
 //   GameOver ：世界冻结，等待玩家按 R 重开或按 M 回主菜单
 // ============================================================
 
-// 对局状态机：用枚举而不是布尔标志，之后扩展「暂停」等状态更直观
+// 对局状态机：用枚举而不是布尔标志，扩展「暂停」等状态后依然直观
 enum class PlayState
 {
     Playing,  // 正在游戏：接受输入、倒计时递减、检测金币碰撞
-    GameOver  // 本局结束：世界冻结，等待玩家按 R 重开
+    Paused,   // 暂停：世界与倒计时冻结，ESC 恢复、M 回主菜单
+    GameOver  // 本局结束：世界冻结，等待玩家按 R 重开或按 M 回主菜单
 };
 
 class PlayScene : public Scene
@@ -41,10 +44,10 @@ public:
     // 进入场景：保存 renderer、加载全部纹理、布置玩家与金币
     void onEnter(SDL_Renderer* renderer) override;
 
-    // 事件：GameOver 下按 R 重开、按 M 回主菜单
+    // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M 回主菜单
     void handleEvent(const SDL_Event& event) override;
 
-    // 每帧更新：Playing 状态下推进移动/碰撞/倒计时
+    // 每帧更新：仅 Playing 状态推进移动/碰撞/倒计时（Paused/GameOver 冻结）
     void update(const UpdateContext& ctx) override;
 
     // 每帧渲染：清屏、背景、实体、HUD
@@ -54,13 +57,14 @@ private:
     // 重开一局：重置分数、倒计时、玩家位置与全部金币
     void restart();
 
-    // 绘制 HUD 文字（分数、倒计时、结束界面）
+    // 绘制 HUD 文字（分数、倒计时、暂停叠层、结束界面）
     void renderHud();
 
 private:
-    static constexpr float kRoundSeconds = 30.0f; // 每局总时长（秒）
-    static constexpr float kHudScale = 2.0f;      // HUD 文字放大倍数（8x8 字模太小）
-    static constexpr int kCoinCount = 5;          // 场上金币数量（学习项目固定小数量）
+    static constexpr float kRoundSeconds = 30.0f;   // 每局总时长（秒）
+    static constexpr float kHudScale = 2.0f;        // HUD 文字放大倍数（8x8 字模太小）
+    static constexpr float kPauseTitleScale = 4.0f; // 暂停标题 (PAUSED) 放大倍数
+    static constexpr int kCoinCount = 5;            // 场上金币数量（学习项目固定小数量）
 
     SDL_Renderer* m_renderer = nullptr; // onEnter 保存的渲染器（只借用，不持有所有权）
 

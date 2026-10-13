@@ -87,7 +87,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer)
     }
 }
 
-// 事件处理：GameOver 下按 R 重开、按 M 回主菜单。
+// 事件处理：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M 回主菜单。
 // 用「按键按下」事件而不是每帧轮询键盘状态，天然保证按一次只触发一次
 void PlayScene::handleEvent(const SDL_Event& event)
 {
@@ -97,21 +97,44 @@ void PlayScene::handleEvent(const SDL_Event& event)
         return;
     }
 
+    // ESC：在 Playing 与 Paused 之间切换（GameOver 下不响应）
+    if (event.key.scancode == SDL_SCANCODE_ESCAPE)
+    {
+        if (m_state == PlayState::Playing)
+        {
+            // 进入暂停：世界与倒计时从此冻结（update 对非 Playing 直接返回）
+            m_state = PlayState::Paused;
+            // 冒烟观测点：确认暂停触发（自动化测试据此断言）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "对局暂停（ESC 恢复，M 回菜单）");
+        }
+        else if (m_state == PlayState::Paused)
+        {
+            // 从暂停处继续：玩家/金币/倒计时的状态原样保留，继续推进
+            m_state = PlayState::Playing;
+            // 冒烟观测点：确认恢复触发（自动化测试据此断言）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "对局恢复");
+        }
+        return; // ESC 已处理：直接返回，避免落入下面的按键分支
+    }
+
     // GameOver 下按 R：重置整局数据并切回 Playing
     if (event.key.scancode == SDL_SCANCODE_R && m_state == PlayState::GameOver)
     {
         restart(); // 重开一局
     }
 
-    // GameOver 下按 M：回主菜单（请求帧末切换，避免在自身回调里析构自己）
-    if (event.key.scancode == SDL_SCANCODE_M && m_state == PlayState::GameOver)
+    // Paused 与 GameOver 下按 M：回主菜单（Playing 下不响应）。
+    // 请求只登记，帧末由 SceneManager 结算，避免在自身回调里析构自己
+    if (event.key.scancode == SDL_SCANCODE_M &&
+        (m_state == PlayState::Paused || m_state == PlayState::GameOver))
     {
         m_sceneManager->requestScene(std::make_unique<MenuScene>());
     }
 }
 
-// 每帧更新：只有 Playing 状态才推进游戏逻辑：
-// GameOver 之后玩家停止移动、倒计时不再走、金币也不再刷新
+// 每帧更新：只有 Playing 状态才推进游戏逻辑。
+// Paused（暂停）与 GameOver（结束）都直接返回：玩家停止移动、
+// 倒计时不再走、金币也不再刷新——暂停由此天然实现了「世界与计时冻结」
 void PlayScene::update(const UpdateContext& ctx)
 {
     // 非 Playing 状态直接返回：世界冻结
@@ -232,12 +255,12 @@ void PlayScene::render()
         coin.render(m_renderer); // 每个金币把自身纹理画到当前位置
     }
 
-    // 游戏世界画完后再叠加 HUD 文字（分数/倒计时/结束界面）
+    // 游戏世界画完后再叠加 HUD 文字（分数/倒计时/暂停叠层/结束界面）
     renderHud();
 }
 
-// 绘制 HUD 文字。统一走 DebugText 封装：传入屏幕像素坐标，
-// 内部完成「缩放 -> 逻辑坐标换算 -> 绘制 -> 恢复缩放」。
+// 绘制 HUD 文字（分数、倒计时、暂停叠层、结束界面）。统一走 DebugText 封装：
+// 传入屏幕像素坐标，内部完成「缩放 -> 逻辑坐标换算 -> 绘制 -> 恢复缩放」。
 // 使用 SDL3 内置调试字体：每个字符天生是 8x8 的等宽方形点阵
 void PlayScene::renderHud()
 {
@@ -251,7 +274,9 @@ void PlayScene::renderHud()
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    if (m_state == PlayState::Playing)
+    // Playing 与 Paused 都显示分数/倒计时：
+    // 暂停时保留完整 HUD，玩家能看清冻结时刻的分数与剩余时间
+    if (m_state == PlayState::Playing || m_state == PlayState::Paused)
     {
         // 左上角：当前分数（白色文字）。
         // 旧版逻辑坐标 (10, 10) × 2 倍缩放 = 屏幕 (20, 20)，观感不变
@@ -266,12 +291,35 @@ void PlayScene::renderHud()
         DebugText::drawFormat(m_renderer, kHudScale, screenW - timeTextW - 20.0f, 20.0f,
                               "Time: %4.1f", m_timeLeft);
     }
-    else
+
+    if (m_state == PlayState::Paused)
     {
-        // GameOver 界面：三行文字全部水平居中、围绕窗口中心排布。
+        // 暂停叠层：大号 PAUSED + 两条操作提示。
+        // 世界画面保持冻结在叠层之下（update 不推进，render 每帧重画同一画面）
+
+        // 水平中心：叠层文字共用的对齐基准
+        const float screenCenterX = screenW / 2.0f;
+
+        // 大号 PAUSED（黄色，kPauseTitleScale 倍缩放，强调暂停状态）
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
+        DebugText::drawCentered(m_renderer, kPauseTitleScale, screenCenterX, screenH * 0.42f,
+                                "PAUSED");
+
+        // 恢复提示（白色，常规 HUD 尺寸）
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH * 0.56f,
+                                "Press ESC to Resume");
+
+        // 回菜单提示（白色，常规 HUD 尺寸）
+        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH * 0.66f,
+                                "Press M for Menu");
+    }
+    else if (m_state == PlayState::GameOver)
+    {
+        // GameOver 界面：四行文字全部水平居中、围绕窗口中心排布。
         // 纵向间距沿用旧版：30 逻辑像素 × 2 倍缩放 = 60 屏幕像素
 
-        // 水平中心：三行文字共用的对齐基准（垂直位置逐行下移）
+        // 水平中心：四行文字共用的对齐基准（垂直位置逐行下移）
         const float screenCenterX = screenW / 2.0f;
 
         // 第一行：GAME OVER（白色）。"GAME OVER" 共 9 个字符

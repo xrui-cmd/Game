@@ -115,5 +115,5 @@ void MenuScene::render()
 
     // 第三行：操作说明（白色小字）
     DebugText::drawCentered(m_renderer, kHintScale, screenW / 2.0f, screenH * 0.68f,
-                            "WASD Move");
+                            "WASD Move / ESC Pause");
 }
