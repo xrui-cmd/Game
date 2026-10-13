@@ -373,7 +373,7 @@ void PlayScene::update(const UpdateContext& ctx)
         // AABB 相交检测；返回 true 说明玩家和这枚金币碰到了
         if (rectsOverlap(playerRect, coin.rect()))
         {
-            // ---- 连击判定（本例的中心规则；替代旧「每枚金币 +1」）----
+            // ---- 连击判定（本工序的核心规则；替代旧「每枚金币 +1」）----
             // 距上次收集不超过 combo_window 秒（m_comboTimer 仍 >0）时
             // 连击 +1，否则连击从 1 重新起算；本枚金币的得分 = 当前连击数。
             // 连吃依次 +1、+2、+3...：密集收集的收益递增，
@@ -717,10 +717,11 @@ void PlayScene::renderHud()
     }
     else if (m_state == PlayState::GameOver)
     {
-        // GameOver 界面：四行文字全部水平居中、围绕窗口中心排布。
+        // GameOver 界面：各行文字全部水平居中、围绕窗口中心排布
+        // （常规为四行；破纪录时在「最终分数」下方多一行「新纪录！」）。
         // 标题行用大字号（kBigPtSize），行距据此重新排布
 
-        // 水平中心：四行文字共用的对齐基准（垂直位置逐行下移）
+        // 水平中心：各行文字共用的对齐基准（垂直位置逐行下移）
         const float screenCenterX = screenW / 2.0f;
 
         // 第一行：游戏结束（白色大号标题）
