@@ -1,0 +1,3 @@
+[submodule "libs/GameEngine"]
+	path = libs/GameEngine
+	url = D:/GameProjcet/GameEngine

@@ -82,6 +82,16 @@ if(MSVC)
     target_compile_options(SDL3_mixer-shared PRIVATE /utf-8)
 endif()
 
+# 加入独立引擎仓库（libs/GameEngine 子模块）：引擎层（Rect/Config/Entity/Font/
+# SceneManager/AudioSystem 等）已从本仓库抽离为独立 git 仓库，经 git 子模块接入。
+# include 约定不变："engine/xxx.h" 由 GameEngine target 以 PUBLIC include 目录
+# （libs/GameEngine/include）导出，游戏侧业务代码零改动。
+# 未初始化子模块时给出明确指引；引擎自身的 CMake 会在缺少 SDL target 时报错提示
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/GameEngine/CMakeLists.txt")
+    message(FATAL_ERROR "引擎子模块未就绪：请先执行 git submodule update --init --recursive")
+endif()
+add_subdirectory(libs/GameEngine)
+
 # 创建我们的游戏程序
 file(GLOB_RECURSE GAMEDEV_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/Src/cpp/*.cpp"
@@ -98,24 +108,30 @@ add_executable(GameDev
     ${GAMEDEV_HEADERS}
 )
 
-# 头文件搜索路径统一指向 Src/inc：engine/game 分层后，源文件里一律写
-# "相对 Src/inc" 的 include（如 "engine/Rect.h"、"game/Player.h"、"GameDev.h"），
-# 不再出现 "../inc/..." 这类随文件深度变化的脆弱相对路径。
-# GLOB_RECURSE 本身会递归子目录，engine/game 下的源文件自动纳入构建，无需另改规则。
+# 头文件搜索路径统一指向 Src/inc：源文件里一律写「相对 include 根」的 include
+# （如 "GameDev.h"、"game/Player.h"），不出现 "../inc/..." 这类随文件深度变化的脆弱相对路径。
+# engine/ 层头文件已随独立引擎仓库移出本目录：由链接的 GameEngine target 以 PUBLIC
+# include 目录（libs/GameEngine/include）导出，"engine/Rect.h" 等写法保持不变，
+# 游戏侧业务代码零改动。GLOB_RECURSE 本身会递归子目录，game/ 下的源文件自动纳入构建。
 target_include_directories(GameDev PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src/inc)
 
 # 要求 MSVC 按 UTF-8 读取源码，避免中文教学注释和错误信息受系统代码页影响
 target_compile_options(GameDev PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 
-# 链接 SDL3、SDL3_image、SDL3_ttf 与 SDL3_mixer。
+# 链接 SDL3、SDL3_image、SDL3_ttf、SDL3_mixer 与独立引擎库 GameEngine。
 # SDL3_image 提供 IMG_LoadTexture 等图片文件加载 API；
 # SDL3_ttf 提供 TTF_OpenFont / TTF_RenderText_Blended 等字体与文字渲染 API；
-# SDL3_mixer 提供 MIX_Init / MIX_LoadAudio / MIX_PlayTrack 等音效加载与播放 API
+# SDL3_mixer 提供 MIX_Init / MIX_LoadAudio / MIX_PlayTrack 等音效加载与播放 API。
+# 四个 SDL 组件保持直接链接：外壳（GameDev.cpp）仍直接调用 TTF_Init 等 API，
+# 它们的链接关系不因引擎抽取而变化；GameEngine 提供引擎层实现
+# （Config/Entity/Font/SceneManager/AudioSystem 等），以 PUBLIC include 传递
+# "engine/xxx.h" 头目录，静态库在链接期汇入 GameDev.exe
 target_link_libraries(GameDev
     PRIVATE SDL3::SDL3
     PRIVATE SDL3_image::SDL3_image
     PRIVATE SDL3_ttf::SDL3_ttf
     PRIVATE SDL3_mixer::SDL3_mixer
+    PRIVATE GameEngine
 )
 
 # 运行时把 SDL3.dll、SDL3_image.dll、SDL3_ttf.dll 与 SDL3_mixer.dll

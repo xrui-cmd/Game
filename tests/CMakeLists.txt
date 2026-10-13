@@ -62,16 +62,17 @@ endif()
 
 add_executable(config_parse_test
     config_parse_test.cpp
-    ../Src/cpp/engine/Config.cpp
+    ../libs/GameEngine/src/Config.cpp
 )
 
 if (MSVC)
     target_compile_options(config_parse_test PRIVATE /utf-8)
 endif()
 
-# 头文件搜索路径：Config.h 位于 Src/inc，SDL 头位于 vendor/SDL-main/include
+# 头文件搜索路径：Config.h 位于独立引擎仓库（libs/GameEngine/include/engine/，
+# 按 "engine/Config.h" 引用），SDL 头位于 vendor/SDL-main/include
 target_include_directories(config_parse_test PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
 
 # 链接主工程构建出的 SDL3 导入库（提供 SDL_LoadFile / SDL_LogWarn 等符号）

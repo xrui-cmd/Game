@@ -1,7 +1,7 @@
 // ============================================================================
 //  config_parse_test.cpp — Config 配置解析器单元测试
 //
-//  被测对象 : Src/inc/engine/Config.h + Src/cpp/engine/Config.cpp
+//  被测对象 : libs/GameEngine/include/engine/Config.h + libs/GameEngine/src/Config.cpp
 //  覆盖场景 : 正常键值 / 注释行 / 空行 / 坏行 / 缺键默认 / 非法值默认 /
 //             文件缺失 / 空白与 CRLF / 重复键覆盖 / UTF-8 BOM
 //
@@ -97,7 +97,7 @@ int main()
 #endif
 
     std::printf("==============================================================\n");
-    std::printf(" Config 配置解析器单元测试 —— Src/inc/engine/Config.h\n");
+    std::printf(" Config 配置解析器单元测试 —— libs/GameEngine/include/engine/Config.h\n");
     std::printf(" 说明: 故意触发的缺键/非法值警告会打印在下方，属于预期输出\n");
     std::printf("==============================================================\n");
 
