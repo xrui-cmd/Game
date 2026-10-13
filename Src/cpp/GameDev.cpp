@@ -1,5 +1,5 @@
 #include "GameDev.h"
-#include "game/scenes/PlayScene.h" // 初始场景：对局（本笔保持「开机即玩」）
+#include "game/scenes/MenuScene.h" // 初始场景：主菜单（Enter 进入对局）
 #include <memory>                  // std::make_unique：构造场景管理器与场景
 
 // GameDev 离开作用域时自动释放 SDL 资源。
@@ -46,8 +46,8 @@ GameError GameDev::initialize()
     // 都能立即拿到它加载纹理资源
     m_sceneManager = std::make_unique<SceneManager>(m_renderer);
 
-    // 初始场景：直接进入对局（本笔保持「开机即玩」的既有体验）
-    m_sceneManager->requestScene(std::make_unique<PlayScene>());
+    // 初始场景：主菜单（按 Enter 进入对局；从菜单开局 = 每次全新一局）
+    m_sceneManager->requestScene(std::make_unique<MenuScene>());
     // 立即结算一次：主循环开始前当前场景就位，避免第一帧空转
     m_sceneManager->applyPendingChange();
 

@@ -1,8 +1,11 @@
 #include "game/scenes/PlayScene.h"
-#include "engine/DebugText.h"     // DebugText：HUD 文字的缩放封装
-#include "engine/Rect.h"          // rectsOverlap：金币碰撞的 AABB 判定
-#include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载 assets/background.png 背景图
-#include <string>                 // std::string：拼接背景素材的绝对路径
+#include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
+#include "engine/DebugText.h"      // DebugText：HUD 文字的缩放封装
+#include "engine/Rect.h"           // rectsOverlap：金币碰撞的 AABB 判定
+#include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
+#include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
+#include <memory>                  // std::make_unique：构造 MenuScene
+#include <string>                  // std::string：拼接背景素材的绝对路径
 
 // 析构：释放背景纹理。
 // 关键时机：SceneManager 先 onExit + 析构旧场景、后销毁 renderer，
@@ -84,7 +87,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer)
     }
 }
 
-// 事件处理：GameOver 下按 R 重开。
+// 事件处理：GameOver 下按 R 重开、按 M 回主菜单。
 // 用「按键按下」事件而不是每帧轮询键盘状态，天然保证按一次只触发一次
 void PlayScene::handleEvent(const SDL_Event& event)
 {
@@ -98,6 +101,12 @@ void PlayScene::handleEvent(const SDL_Event& event)
     if (event.key.scancode == SDL_SCANCODE_R && m_state == PlayState::GameOver)
     {
         restart(); // 重开一局
+    }
+
+    // GameOver 下按 M：回主菜单（请求帧末切换，避免在自身回调里析构自己）
+    if (event.key.scancode == SDL_SCANCODE_M && m_state == PlayState::GameOver)
+    {
+        m_sceneManager->requestScene(std::make_unique<MenuScene>());
     }
 }
 
@@ -281,5 +290,10 @@ void PlayScene::renderHud()
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
         DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH / 2.0f + 60.0f,
                                 "Press R to Restart");
+
+        // 第四行：回菜单提示（白色）。行距与上一行保持一致
+        // （30 逻辑像素 × 2 倍缩放 = 60 屏幕像素）
+        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH / 2.0f + 120.0f,
+                                "Press M for Menu");
     }
 }
