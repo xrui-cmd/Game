@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>             // SDL_Window / SDL_Renderer / SDL_Event：外壳的基础类型
 #include <memory>                 // std::unique_ptr：SceneManager 的所有权管理
 #include "ErrorCode.h"            // GameError：初始化/渲染失败的返回码
+#include "engine/AudioSystem.h"   // AudioSystem：音效系统的所有权持有者（成员类型）
 #include "engine/Config.h"        // Config：启动时加载的配置数据（成员类型）
 #include "engine/SceneManager.h"  // SceneManager：当前场景的管理与转发
 
@@ -48,7 +49,8 @@
 //   最坏结果是游戏逻辑降速运行（慢动作），绝不会滚雪球卡死。
 //
 // 场景切换由 SceneManager 延迟结算；shutdown 时先 clear() 场景
-// （纹理先于 renderer 释放），再按 Renderer -> Window -> SDL_Quit 逆序销毁
+// （纹理先于 renderer 释放），再按依赖逆序释放：音效系统（先于 SDL_Quit，
+// 其内部要关闭音频设备）-> Renderer -> Window -> SDL_Quit
 // ============================================================
 
 class GameDev
@@ -84,10 +86,16 @@ private:
 
     Config m_config; // 配置数据：initialize() 加载后只读；生命周期覆盖整个应用
 
+    // 音效系统：所有权在本类，生命周期覆盖全部场景（场景只借用其指针）。
+    // initialize() 里初始化；shutdown() 里在场景之后、renderer 之前销毁。
+    // 任何环境下失败都只降级不中止（详见 AudioSystem.h 的失败降级契约）
+    AudioSystem m_audio;
+
     SDL_Window* m_window = nullptr;     // 窗口：主循环尺寸查询用（本类创建/销毁）
     SDL_Renderer* m_renderer = nullptr; // 渲染器：依赖窗口，创建顺序在窗口之后
 
-    // 场景管理器：在 renderer 创建成功后构造（场景 onEnter 需要 renderer）
+    // 场景管理器：在 renderer 创建成功后构造（场景 onEnter 需要 renderer
+    // 与音效系统的注入引用，两者构造就绪后才可创建）
     std::unique_ptr<SceneManager> m_sceneManager;
 
     bool m_running = false; // 主循环开关：收到 QUIT 事件置 false

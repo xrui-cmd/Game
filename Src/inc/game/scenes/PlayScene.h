@@ -1,11 +1,12 @@
 #ifndef __PLAYSCENE_H__
 #define __PLAYSCENE_H__
 
-#include "engine/Scene.h" // Scene：场景基类
-#include "engine/Font.h"  // Font：TTF 字体资源（HUD/叠层文字，支持中文）
-#include "game/Player.h"  // Player：玩家实体
-#include "game/Coin.h"    // Coin：金币实体
-#include <vector>         // std::vector：金币集合
+#include "engine/Scene.h"       // Scene：场景基类
+#include "engine/AudioSystem.h" // AudioSystem：音效系统（收币/结束/暂停触发播放）
+#include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字，支持中文）
+#include "game/Player.h"        // Player：玩家实体
+#include "game/Coin.h"          // Coin：金币实体
+#include <vector>               // std::vector：金币集合
 
 // ============================================================
 // PlayScene：对局场景（原 GameDev 的全部玩法逻辑迁入）
@@ -16,9 +17,11 @@
 //      析构时释放背景纹理（玩家/金币纹理由各自 Entity 析构兜底）
 //   2. 玩法：WASD 移动、金币碰撞计分、倒计时、ESC 暂停/恢复、
 //      R 重开、M 回主菜单
-//   3. 配置：onEnter 时从注入的 Config 读取对局时长、金币数量、
+//   3. 音效：收币播 coin、倒计时归零播 gameover、ESC 暂停/恢复播 pause
+//      （经 onEnter 注入的 AudioSystem；降级环境下为安全空操作）
+//   4. 配置：onEnter 时从注入的 Config 读取对局时长、金币数量、
 //      玩家速度与动画节奏；缺键/坏值自动回退内置默认值
-//   4. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层（含 FPS/帧时间显示，
+//   5. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层（含 FPS/帧时间显示，
 //      左下角常显，F3 切换显隐——学习项目默认打开便于观察渲染表现）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
@@ -45,8 +48,9 @@ public:
     PlayScene() = default; // 成员默认值即初始局面，无需自定义构造
     ~PlayScene() override;  // 析构释放背景纹理（此时 renderer 尚在，安全）
 
-    // 进入场景：保存 renderer、读取配置、加载全部纹理、布置玩家与金币
-    void onEnter(SDL_Renderer* renderer, const Config& config) override;
+    // 进入场景：保存 renderer 与音效系统、读取配置、加载全部纹理、
+    // 布置玩家与金币
+    void onEnter(SDL_Renderer* renderer, const Config& config, AudioSystem& audio) override;
 
     // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M
     // 回主菜单、F3 切换 FPS 显示（任何状态都响应）
@@ -84,6 +88,10 @@ private:
     static constexpr float kFpsScale = 2.0f;
 
     SDL_Renderer* m_renderer = nullptr; // onEnter 保存的渲染器（只借用，不持有所有权）
+
+    // onEnter 注入的音效系统指针（所有权在 GameDev，受管理期间必然非空）。
+    // 对局用它在三处触发：收币（update）、结束（update）、暂停/恢复（handleEvent）
+    AudioSystem* m_audio = nullptr;
 
     // 由 renderer 反查的窗口指针：玩法边界/金币重生需要窗口整数尺寸
     // （与渲染基元无关的「逻辑尺寸」沿用窗口坐标系，保持改造前的数值）

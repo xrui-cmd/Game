@@ -87,9 +87,14 @@ GameError GameDev::initialize()
                     "设置垂直同步失败（%s），继续运行", SDL_GetError());
     }
 
-    // 场景管理器绑定 renderer 与配置：之后每次切换，新场景的 onEnter
-    // 都能立即拿到它们加载纹理资源、读取配置数值
-    m_sceneManager = std::make_unique<SceneManager>(m_renderer, m_config);
+    // 初始化音效系统（可选增强）：MIX_Init + 打开默认播放设备 + 预加载
+    // 四个 WAV。任何环节失败（如系统无音频设备）都只在内部警告一次并
+    // 整体降级——游戏静默运行，不因此中止启动，因此返回值刻意不判断
+    m_audio.initialize();
+
+    // 场景管理器绑定 renderer、配置与音效系统：之后每次切换，新场景的
+    // onEnter 都能立即拿到它们加载纹理资源、读取配置数值、触发播放
+    m_sceneManager = std::make_unique<SceneManager>(m_renderer, m_config, m_audio);
 
     // 初始场景：主菜单（按 Enter 进入对局；从菜单开局 = 每次全新一局）
     m_sceneManager->requestScene(std::make_unique<MenuScene>());
@@ -247,7 +252,13 @@ void GameDev::shutdown()
         m_sceneManager.reset();  // 管理器本体也随之销毁
     }
 
-    // 关键顺序②：按依赖关系的逆序释放：Renderer 依赖 Window。
+    // 关键顺序②：音效系统在场景之后（没有场景还会触发播放）、renderer
+    // 之前（先于 SDL_Quit）释放：destroy() 内部关闭音频设备并退出 SDL
+    // 音频子系统，与 GameDev::initialize 里的 initialize() 互为逆序。
+    // 音效不依赖窗口/渲染器，放在这里即「消费方先释放、提供方后释放」
+    m_audio.destroy();
+
+    // 关键顺序③：按依赖关系的逆序释放：Renderer 依赖 Window。
     if (m_renderer != nullptr)
     {
         SDL_DestroyRenderer(m_renderer);

@@ -22,17 +22,21 @@ PlayScene::~PlayScene()
     }
 }
 
-// 进入场景：保存 renderer、读取配置、加载资源、布置初始局面。
+// 进入场景：保存 renderer 与音效系统、读取配置、加载资源、布置初始局面。
 // 每次进入都是新构造的 PlayScene 对象 => 天然是「全新一局」
-void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
+void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSystem& audio)
 {
     // 1) 保存 renderer：后续每帧渲染、资源加载都用它（只借用，不负责销毁）
     m_renderer = renderer;
 
-    // 2) 由 renderer 反查窗口：玩法边界/金币重生需要窗口整数尺寸
+    // 2) 保存音效系统指针：收币/结束/暂停三处事件用它触发播放。
+    //    所有权在 GameDev，受 SceneManager 管理期间必然非空（与 Config 同一管线）
+    m_audio = &audio;
+
+    // 3) 由 renderer 反查窗口：玩法边界/金币重生需要窗口整数尺寸
     m_window = SDL_GetRenderWindow(renderer);
 
-    // 3) 读取本场景相关的配置项。getFloat/getInt 在缺键或值非法时会记录
+    // 4) 读取本场景相关的配置项。getFloat/getInt 在缺键或值非法时会记录
     //    警告并回退到内置默认值（与改造前的常量逐一相同），因此没有
     //    config/game.ini 时行为与改造前完全一致：
     //      round_seconds       本局时长（秒）
@@ -61,7 +65,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
 
-    // 4) 加载背景图（可选资源）：拼出 <exe目录>/assets/background.png 交给 SDL3_image 解码。
+    // 5) 加载背景图（可选资源）：拼出 <exe目录>/assets/background.png 交给 SDL3_image 解码。
     //    背景不是游戏必需品——加载失败只记录警告并继续；渲染阶段会整块跳过背景，
     //    露出清屏深蓝色兜底，玩法完全不受影响
     const char* basePath = SDL_GetBasePath();
@@ -79,7 +83,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
                     "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
     }
 
-    // 5) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
+    // 6) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
     //    路径拼装模式与背景图一致：以 exe 所在目录为基准。
     //    HUD 与标题各加载一份（字号不同）；Font::load 内部会记录失败警告，
     //    失败后对应文字安全跳过，玩法完全不受影响
@@ -92,7 +96,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
         m_bigFont.load(fontPath, kBigPtSize); // 暂停/结束标题
     }
 
-    // 5) 玩家纹理：三级回退（精灵表 -> 单帧图 -> 程序化纯色）在 Entity 内完成，
+    // 7) 玩家纹理：三级回退（精灵表 -> 单帧图 -> 程序化纯色）在 Entity 内完成，
     //    这里失败只可能是最后的程序化兜底也失败（内存不足等极端情况）
     if (!m_player.load(m_renderer))
     {
@@ -100,7 +104,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
-    // 6) 注入玩家配置：速度、加减速与行走动画节奏。
+    // 8) 注入玩家配置：速度、加减速与行走动画节奏。
     //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
     //    配置值晚一步落定才能覆盖它（setFrameTime 对非正值会忽略并警告；
     //    setMotion 对负值整组忽略，0 合法）
@@ -108,15 +112,15 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
     m_player.setMotion(playerAccel, playerFriction);
     m_player.setFrameTime(playerAnimInterval);
 
-    // 7) 查询窗口实际尺寸并缓存：金币出生和后续边界计算都基于它
+    // 9) 查询窗口实际尺寸并缓存：金币出生和后续边界计算都基于它
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
-    // 8) 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
+    // 10) 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
     //    每次进入 PlayScene 都从这里开始 => 与「按 R 重开」的初始状态一致
     m_player.reset(m_width / 2.0f - m_player.width() / 2.0f,
                    m_height / 2.0f - m_player.height() / 2.0f);
 
-    // 9) 预创建全部金币对象；resize 按配置数量（默认 5）构造对象，此时纹理还是空的
+    // 11) 预创建全部金币对象；resize 按配置数量（默认 5）构造对象，此时纹理还是空的
     m_coins.resize(static_cast<size_t>(coinCount));
 
     // 玩家当前矩形：金币出生点尽量避开玩家所站的位置
@@ -155,6 +159,8 @@ void PlayScene::handleEvent(const SDL_Event& event)
         {
             // 进入暂停：世界与倒计时从此冻结（update 对非 Playing 直接返回）
             m_state = PlayState::Paused;
+            // 播放暂停轻音（pause）：与恢复共用同一个音效，切换动作的听觉确认
+            m_audio->play(SoundId::Pause);
             // 冒烟观测点：确认暂停触发（自动化测试据此断言）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "对局暂停（ESC 恢复，M 回菜单）");
         }
@@ -162,6 +168,8 @@ void PlayScene::handleEvent(const SDL_Event& event)
         {
             // 从暂停处继续：玩家/金币/倒计时的状态原样保留，继续推进
             m_state = PlayState::Playing;
+            // 播放恢复轻音（同样是 pause 音效：暂停/恢复切换共用）
+            m_audio->play(SoundId::Pause);
             // 冒烟观测点：确认恢复触发（自动化测试据此断言）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "对局恢复");
         }
@@ -235,6 +243,10 @@ void PlayScene::update(const UpdateContext& ctx)
         {
             m_score += 1; // 每枚金币计 1 分，累加到总分里
 
+            // 播放收币短促「叮」（coin）：每次收集都触发；
+            // 同一音效连续触发时轨道从头重播，连收多枚时的听感自然衔接
+            m_audio->play(SoundId::Coin);
+
             // 立刻把这枚金币传送到新的随机位置（随机范围跟随窗口实际尺寸）
             coin.respawn(m_width, m_height, playerRect);
         }
@@ -248,6 +260,9 @@ void PlayScene::update(const UpdateContext& ctx)
     {
         m_timeLeft = 0.0f;             // 夹到 0，避免 HUD 显示 -0.1 这类负数
         m_state = PlayState::GameOver; // 冻结世界，等待玩家按 R 重开
+        // 播放结束下行音（gameover）：进入结束状态的唯一入口在这一处，
+        // 音效天然与状态切换一一对应（R 重开不会重复触发）
+        m_audio->play(SoundId::GameOver);
         // 冒烟观测点：日志标记本局结束（自动化测试据此确认 GameOver 已到达）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "倒计时归零，本局结束");
     }

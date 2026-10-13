@@ -18,17 +18,21 @@ MenuScene::~MenuScene()
     }
 }
 
-// 进入场景：保存 renderer、加载背景图。
+// 进入场景：保存 renderer 与音效系统、加载背景图。
 // config 由 SceneManager 注入，本阶段菜单没有可配置项，参数暂不使用
-void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/)
+void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/, AudioSystem& audio)
 {
     // 1) 保存 renderer：后续渲染与资源加载都用它（只借用，不负责销毁）
     m_renderer = renderer;
 
+    // 2) 保存音效系统指针：按 Enter 开始时用它播 start 音效。
+    //    所有权在 GameDev，受 SceneManager 管理期间必然非空（同一管线的 Config 亦然）
+    m_audio = &audio;
+
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Menu");
 
-    // 2) 加载背景图（可选资源，与对局共用同一张 background.png）：
+    // 3) 加载背景图（可选资源，与对局共用同一张 background.png）：
     //    拼出 <exe目录>/assets/background.png 交给 SDL3_image 解码；
     //    加载失败只记录警告并继续，渲染时跳过背景露出深蓝色兜底
     const char* basePath = SDL_GetBasePath();
@@ -46,7 +50,7 @@ void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/)
                     "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
     }
 
-    // 3) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
+    // 4) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
     //    路径拼装模式与背景图一致：以 exe 所在目录为基准。
     //    标题与提示各加载一份（字号不同）；Font::load 内部会记录失败警告，
     //    失败后对应文字安全跳过，菜单仍可进入对局，不阻塞游戏流程
@@ -74,6 +78,11 @@ void MenuScene::handleEvent(const SDL_Event& event)
     if (event.key.scancode == SDL_SCANCODE_RETURN ||
         event.key.scancode == SDL_SCANCODE_KP_ENTER)
     {
+        // 播放下发确认音（start，上扬音）：先给耳朵一个"开局"信号，
+        // 场景切换本身由帧末结算，听觉与画面各走各的时序互不阻塞。
+        // play 在音效系统降级时是安全空操作（只记日志），不影响下面的切换
+        m_audio->play(SoundId::Start);
+
         // 请求切换到对局场景：只登记，帧末由 SceneManager 统一结算。
         // 每次按 Enter 都构造一个新的 PlayScene —— 「每次进入 = 全新一局」
         m_sceneManager->requestScene(std::make_unique<PlayScene>());
