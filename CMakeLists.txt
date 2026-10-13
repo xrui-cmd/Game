@@ -36,6 +36,12 @@ add_executable(GameDev
     ${GAMEDEV_HEADERS}
 )
 
+# 头文件搜索路径统一指向 Src/inc：engine/game 分层后，源文件里一律写
+# "相对 Src/inc" 的 include（如 "engine/Rect.h"、"game/Player.h"、"GameDev.h"），
+# 不再出现 "../inc/..." 这类随文件深度变化的脆弱相对路径。
+# GLOB_RECURSE 本身会递归子目录，engine/game 下的源文件自动纳入构建，无需另改规则。
+target_include_directories(GameDev PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src/inc)
+
 # 要求 MSVC 按 UTF-8 读取源码，避免中文教学注释和错误信息受系统代码页影响
 target_compile_options(GameDev PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 

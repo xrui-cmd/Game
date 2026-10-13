@@ -2,7 +2,7 @@
 rem ============================================================
 rem  AABB 碰撞单元测试 —— 一键编译并运行（便捷脚本，可选）
 rem
-rem  用法：
+rem  用法:
 rem    直接双击本文件；或在任意终端中执行 tests\build_and_run.bat
 rem
 rem  内容：定位 Visual Studio -> vcvars64 -> cl 直编 -> 运行测试

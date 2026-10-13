@@ -1,5 +1,5 @@
-#include "../inc/Coin.h"
-#include "../inc/Rect.h"
+#include "game/Coin.h"
+#include "engine/Rect.h"
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：SDL3_image 提供的图片文件加载 API
 #include <algorithm>
 #include <string> // std::string：拼接素材文件的绝对路径

@@ -1,7 +1,7 @@
 // ============================================================================
 //  rect_collision_test.cpp — AABB（轴对齐包围盒）碰撞判定单元测试
 //
-//  被测函数 : Src/inc/Rect.h :: rectsOverlap(const SDL_FRect&, const SDL_FRect&)
+//  被测函数 : Src/inc/engine/Rect.h :: rectsOverlap(const SDL_FRect&, const SDL_FRect&)
 //  项目约定 : 矩形边界"刚好贴合"不算碰撞（edge touch -> false）
 //
 //  ── 编译与运行（推荐：VS 开发者命令行 / vcvars64 环境） ──────────────────
@@ -25,7 +25,7 @@
 // ============================================================================
 
 #include <SDL3/SDL_rect.h>      // SDL_FRect
-#include "../Src/inc/Rect.h"    // 被测函数 rectsOverlap
+#include "../Src/inc/engine/Rect.h"    // 被测函数 rectsOverlap
 
 #include <cstdio>
 #include <cstdlib>
@@ -95,7 +95,7 @@ int main()
 #endif
 
     std::printf("==============================================================\n");
-    std::printf(" AABB 碰撞判定单元测试 —— rectsOverlap（Src/inc/Rect.h）\n");
+    std::printf(" AABB 碰撞判定单元测试 —— rectsOverlap（Src/inc/engine/Rect.h）\n");
     std::printf(" 判定约定: 边界刚好贴合不算碰撞（touch -> false）\n");
     std::printf(" 随机性质测试: 10000 组，每值范围 0.00~200.00，固定种子 20261012\n");
     std::printf("==============================================================\n");

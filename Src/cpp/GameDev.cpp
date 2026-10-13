@@ -1,5 +1,5 @@
-#include "../inc/GameDev.h"
-#include "../inc/Rect.h"
+#include "GameDev.h"
+#include "engine/Rect.h"
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载 assets/background.png 背景图
 #include <string> // std::string：拼接背景素材的绝对路径
 

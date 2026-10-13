@@ -1,4 +1,4 @@
-#include "../inc/Player.h"
+#include "game/Player.h"
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：SDL3_image 提供的图片文件加载 API
 #include <algorithm>
 #include <string> // std::string：拼接素材文件的绝对路径

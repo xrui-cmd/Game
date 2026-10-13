@@ -8,8 +8,8 @@
 #include <SDL3/SDL.h>
 #include <vector>
 #include "ErrorCode.h"
-#include "Player.h"
-#include "Coin.h"
+#include "game/Player.h"
+#include "game/Coin.h"
 
 
 // 游戏状态机：把"进行中"和"本局结束"两个阶段显式区分开。
