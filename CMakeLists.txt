@@ -33,12 +33,41 @@ set(SDLTTF_PLUTOSVG OFF)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 # 依赖静态化：SDL3_ttf 在构建 vendored freetype/harfbuzz 前会先把
 # BUILD_SHARED_LIBS 置 OFF（内部实现），两个依赖因此静态链入 SDL3_ttf.dll。
-# 运行时只需要 SDL3.dll、SDL3_image.dll、SDL3_ttf.dll 三个动态库
+# 加上 SDL3_mixer（见下），运行时一共需要四个动态库：
+# SDL3.dll、SDL3_image.dll、SDL3_ttf.dll、SDL3_mixer.dll
 add_subdirectory(vendor/SDL3_ttf EXCLUDE_FROM_ALL)
 
-# 定向处理两个 vendored 依赖的 MSVC 编译警告，保证工程构建输出零警告：
-#   - /utf-8：freetype/harfbuzz 源码里的版权注释含非 ASCII 字符，MSVC 默认
-#     按系统代码页读取会报 C4819；按 UTF-8 读从根上消除（与 GameDev 目标一致）；
+# 加入 SDL3_mixer：负责音效文件的加载与播放
+# （MIX_Init / MIX_CreateMixerDevice / MIX_LoadAudio / MIX_PlayTrack）。
+# 本项目只需要 WAV——它是 SDL_mixer 自带的内置解码器（src/decoder_wav.c），
+# 不依赖任何第三方源码（明确不需要从 external/ 补取任何子模块）。
+# 因此把其余编解码器全部显式关闭——与上面 SDL3_image 只开 PNG、SDL3_ttf
+# 关闭 plutosvg 同一思路：不牵入用不到的大型依赖：
+#   - OGG/FLAC 需要同时补取 libogg/libflac；Opus 还要 opus+opusfile；
+#   - MOD 需要 libxmp；MIDI 会牵入 timidity（FluidSynth 需系统库）；
+#   - MP3 有 dr_mp3 内嵌实现，但本项目没有 MP3 素材，同样关掉省开销。
+# 关闭后真正参与编译的只有 WAV，以及始终内置的 RAW/SINEWAVE
+# 两个「内存音源」解码器（源码无第三方依赖）；其余 decoder_*.c 因缺少
+# 对应的 DECODER_* 宏而整体编译为空，不会引入任何外部头文件
+set(SDLMIXER_AIFF OFF)              # 关闭 AIFF（内置实现，用不到）
+set(SDLMIXER_VOC OFF)               # 关闭 VOC（内置实现，用不到）
+set(SDLMIXER_AU OFF)                # 关闭 AU（内置实现，用不到）
+set(SDLMIXER_FLAC OFF)              # 关闭 FLAC（否则补取 libflac/libogg 源码）
+set(SDLMIXER_GME OFF)               # 关闭 GME 游戏音乐格式（否则补取 libgme）
+set(SDLMIXER_MOD OFF)               # 关闭 MOD 模块音乐（否则补取 libxmp）
+set(SDLMIXER_MP3 OFF)               # 关闭 MP3（dr_mp3/mpg123 均不需要）
+set(SDLMIXER_MIDI OFF)              # 关闭 MIDI（避免 timidity/FluidSynth）
+set(SDLMIXER_OPUS OFF)              # 关闭 Opus（否则补取 opus + opusfile）
+set(SDLMIXER_VORBIS_STB OFF)        # 关闭 stb_vorbis 版 Ogg Vorbis
+set(SDLMIXER_VORBIS_VORBISFILE OFF) # 关闭 libvorbisfile 版 Ogg Vorbis
+set(SDLMIXER_WAVPACK OFF)           # 关闭 WavPack（否则补取 wavpack 源码）
+# 唯一保留的编解码器：WAVE（默认即 ON，这里显式写出，表明是刻意选择而非默认残留）
+set(SDLMIXER_WAVE ON)
+add_subdirectory(vendor/SDL3_mixer EXCLUDE_FROM_ALL)
+
+# 定向处理 vendored 依赖的 MSVC 编译警告，保证工程构建输出零警告：
+#   - /utf-8：freetype/harfbuzz/SDL3_mixer 源码里的注释含非 ASCII 字符，
+#     MSVC 默认按系统代码页读取会报 C4819；按 UTF-8 读从根上消除（与 GameDev 一致）；
 #   - /wd4244 /wd4267 /wd4312：上游代码既有的 size_t/__int64 到窄整型/指针的
 #     转换，属上游代码遗留，与本项目无关，定向关闭（不影响其它警告）
 if(MSVC)
@@ -47,6 +76,10 @@ if(MSVC)
     # SDL_ttf 本体在 C 源码里内联包含 harfbuzz/harfbuzz.h（经 hb-style.h
     # 等头文件），同样按 UTF-8 读取以消除 C4819（与两个依赖一致的编码约定）
     target_compile_options(SDL3_ttf-shared PRIVATE /utf-8)
+    # SDL3_mixer 的源文件注释同样含非 ASCII 字符（如 decoder_aiff.c /
+    # decoder_au.c 的版权头）；即使这两个解码器已被关闭（编译为空壳），
+    # MSVC 预处理时仍会读取整个文件、照样报 C4819——同样从根上消除
+    target_compile_options(SDL3_mixer-shared PRIVATE /utf-8)
 endif()
 
 # 创建我们的游戏程序
@@ -74,16 +107,19 @@ target_include_directories(GameDev PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Src/inc)
 # 要求 MSVC 按 UTF-8 读取源码，避免中文教学注释和错误信息受系统代码页影响
 target_compile_options(GameDev PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/utf-8>)
 
-# 链接 SDL3、SDL3_image 与 SDL3_ttf。
+# 链接 SDL3、SDL3_image、SDL3_ttf 与 SDL3_mixer。
 # SDL3_image 提供 IMG_LoadTexture 等图片文件加载 API；
-# SDL3_ttf 提供 TTF_OpenFont / TTF_RenderText_Blended 等字体与文字渲染 API
+# SDL3_ttf 提供 TTF_OpenFont / TTF_RenderText_Blended 等字体与文字渲染 API；
+# SDL3_mixer 提供 MIX_Init / MIX_LoadAudio / MIX_PlayTrack 等音效加载与播放 API
 target_link_libraries(GameDev
     PRIVATE SDL3::SDL3
     PRIVATE SDL3_image::SDL3_image
     PRIVATE SDL3_ttf::SDL3_ttf
+    PRIVATE SDL3_mixer::SDL3_mixer
 )
 
-# 运行时把 SDL3.dll、SDL3_image.dll 与 SDL3_ttf.dll 自动复制到 GameDev.exe 所在目录
+# 运行时把 SDL3.dll、SDL3_image.dll、SDL3_ttf.dll 与 SDL3_mixer.dll
+# 自动复制到 GameDev.exe 所在目录
 add_custom_command(TARGET GameDev POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:SDL3::SDL3>
@@ -93,6 +129,9 @@ add_custom_command(TARGET GameDev POST_BUILD
     $<TARGET_FILE_DIR:GameDev>
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
     $<TARGET_FILE:SDL3_ttf::SDL3_ttf>
+    $<TARGET_FILE_DIR:GameDev>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    $<TARGET_FILE:SDL3_mixer::SDL3_mixer>
     $<TARGET_FILE_DIR:GameDev>
 )
 
