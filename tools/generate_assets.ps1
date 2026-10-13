@@ -10,7 +10,7 @@
 #         assets/background.png    1280x720 背景图（深蓝渐变 + 细微网格 + 星点）
 #         assets/enemy.png         32x32 敌人单帧精灵（红紫小怪 + 怒目，回退素材）
 #         assets/enemy_sheet.png   64x32 敌人逼近精灵表（2 帧横向排列，每帧 32x32）
-#         assets/sounds/*.wav      音效（收币/开始/结束/暂停/命中，16-bit PCM 单声道）
+#         assets/sounds/*.wav      音效（收币/开始/结束/暂停/命中/破纪录，16-bit PCM 单声道）
 #
 # 设计原则：
 #   1. 不依赖任何第三方工具或素材文件，开箱即可重新生成占位素材
@@ -564,7 +564,7 @@ $esG.Dispose()
 $esBmp.Dispose()
 
 # ============================================================
-# 7) 音效 WAV：assets/sounds/ 五个 16-bit PCM 单声道 44.1kHz 音效
+# 7) 音效 WAV：assets/sounds/ 六个 16-bit PCM 单声道 44.1kHz 音效
 # ============================================================
 # 与 PNG 系素材不同，音效不用绘图库，而是「程序化合成正弦波 + 手写
 # RIFF/WAV 文件头」：
@@ -901,6 +901,17 @@ $hitSamples = New-SineSamples -segments @(
 ) -amplitude 0.9 -decayTime 0.06
 Save-Wav16Mono -samples $hitSamples -path (Join-Path $soundsDir "hit.wav") -sampleRate $wavSampleRate
 
+# ---- 7.6 破纪录音 record.wav：上行三连音琶音 ----
+# C5(523.25Hz) -> E5(659.25Hz) -> G5(783.99Hz) 大三和弦琶音，每段 0.1s、
+# 共约 0.3s：音高逐级上行，与结束音 gameover.wav 的三连下行形成鲜明对比，
+# 传递"达成新纪录"的明亮情绪；衰减放慢（0.15s）让三个音都清晰可辨
+$recordSamples = New-SineSamples -segments @(
+    @{ StartHz = 523.25; EndHz = 523.25; Seconds = 0.1 },
+    @{ StartHz = 659.25; EndHz = 659.25; Seconds = 0.1 },
+    @{ StartHz = 783.99; EndHz = 783.99; Seconds = 0.1 }
+) -amplitude 0.8 -decayTime 0.15
+Save-Wav16Mono -samples $recordSamples -path (Join-Path $soundsDir "record.wav") -sampleRate $wavSampleRate
+
 # ============================================================
 # 8) 生成后自检：重新读盘校验全部 PNG 的尺寸与 WAV 的头与时长
 # ============================================================
@@ -941,6 +952,9 @@ Assert-Wav16Mono -path (Join-Path $soundsDir "pause.wav") -expectedSeconds 0.08
 
 # 校验命中音：约 150ms（6615 个样本，恰好 0.15s）
 Assert-Wav16Mono -path (Join-Path $soundsDir "hit.wav") -expectedSeconds 0.15
+
+# 校验破纪录音：约 300ms（三段各 4410 个样本，合计恰好 0.3s）
+Assert-Wav16Mono -path (Join-Path $soundsDir "record.wav") -expectedSeconds 0.3
 
 # 全部完成提示
 Write-Host "全部素材生成并校验完成。"

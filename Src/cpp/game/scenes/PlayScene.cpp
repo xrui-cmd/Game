@@ -1,5 +1,6 @@
 #include "game/scenes/PlayScene.h"
 #include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
+#include "game/SaveData.h"         // SaveData：最高分存档（读取/写盘）
 #include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
 #include "engine/Rect.h"           // rectsOverlap：金币碰撞的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
@@ -30,7 +31,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 1) 保存 renderer：后续每帧渲染、资源加载都用它（只借用，不负责销毁）
     m_renderer = renderer;
 
-    // 2) 保存音效系统指针：收币/结束/暂停/被撞四处事件用它触发播放。
+    // 2) 保存音效系统指针：收币/结束/暂停/被撞/破纪录五类事件用它触发播放。
     //    所有权在 GameDev，受 SceneManager 管理期间必然非空（与 Config 同一管线）
     m_audio = &audio;
 
@@ -89,6 +90,12 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 生成时刻表从「首只出现时间」开始计：倒计时到点即生成第一只；
     // R 重开会用同一初值复位（见 restart）
     m_enemyNextSpawnTime = m_enemyFirstSpawn;
+
+    // 4.5) 读取最高分存档（game/SaveData）：存档缺失（首次运行）/损坏时
+    //      内部已警告并返回 0——与 Config 同一降级纪律，外部文件异常不是
+    //      游戏问题，继续运行。此值不随 R 重开重置：跨局展示与比较始终
+    //      使用最新纪录（破纪录时在 GameOver 入口更新并写盘）
+    m_highScore = SaveData::loadHighScore();
 
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
@@ -407,6 +414,29 @@ void PlayScene::update(const UpdateContext& ctx)
         m_audio->play(SoundId::GameOver);
         // 冒烟观测点：日志标记本局结束（自动化测试据此确认 GameOver 已到达）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "倒计时归零，本局结束");
+
+        // ---- 破纪录判定与存档（仅完整对局结束时结算）----
+        // 「完整对局」= 倒计时自然归零，且这是 GameOver 的唯一入口；
+        // 暂停中按 M 中途退出不经过这里，因此天然满足「中途退出不计」。
+        // 每局至多结算一次：GameOver 后 update 提前返回、R 重开进入的是
+        // 下一局的新分数，不会重复比较或重复写盘
+        if (m_score > m_highScore)
+        {
+            m_highScore = m_score; // 内存立即更新：HUD 与结束界面展示新纪录
+            m_isNewRecord = true;  // 标记本局破纪录（GameOver 显示「新纪录！」）
+
+            // 立即写盘（而不是退出时统一保存）：即使随后进程被强杀/崩溃，
+            // 新纪录也不会丢。写盘失败由 SaveData 内部警告——内存里仍按
+            // 新纪录展示，只是下次启动会回退到旧值，游戏流程不受影响
+            SaveData::saveHighScore(m_highScore);
+
+            // 破纪录专用音效（record，上行琶音）：与结束下行音形成对比，
+            // 在「本局结束」的听感上叠一层「刷新纪录」的奖励反馈
+            m_audio->play(SoundId::Record);
+
+            // 冒烟观测点：自动化测试据此断言破纪录分支触发
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "新纪录！最高分更新为 %d", m_highScore);
+        }
     }
 }
 
@@ -416,6 +446,10 @@ void PlayScene::restart()
     // 分数清零，倒计时回到满值（局时长用 onEnter 时读到的配置值）
     m_score = 0;
     m_timeLeft = m_roundSeconds;
+
+    // 新纪录标记只属于刚结束的那一局：新一局从「未破纪录」状态开始。
+    // m_highScore 刻意保留——刚写入的最新纪录继续参与下一局的比较
+    m_isNewRecord = false;
 
     // 刷新窗口实际尺寸缓存：重开时窗口可能已被调整过大小
     SDL_GetWindowSize(m_window, &m_width, &m_height);
@@ -600,6 +634,13 @@ void PlayScene::renderHud()
         SDL_snprintf(timeText, sizeof(timeText), "时间: %.1f", m_timeLeft);
         const SDL_FPoint timeSize = m_hudFont.measure(timeText); // 实测文本尺寸
         m_hudFont.draw(m_renderer, timeText, screenW - timeSize.x - 20.0f, 20.0f);
+
+        // 顶部中央：历史最高分（金色）。与左上分数、右上时间同一条水平线，
+        // 三块各占一区互不重叠；drawCentered 实测宽度居中，窗口缩放后依然居中
+        SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
+        char highScoreText[32]; // 容纳 "最高分: " + 最长数字，绰绰有余
+        SDL_snprintf(highScoreText, sizeof(highScoreText), "最高分: %d", m_highScore);
+        m_hudFont.drawCentered(m_renderer, highScoreText, screenW / 2.0f, 20.0f);
     }
 
     if (m_state == PlayState::Paused)
@@ -642,12 +683,24 @@ void PlayScene::renderHud()
         SDL_snprintf(scoreText, sizeof(scoreText), "最终分数: %d", m_score);
         m_hudFont.drawCentered(m_renderer, scoreText, screenCenterX, screenH / 2.0f - 10.0f);
 
-        // 第三行：重开提示（白色）
+        // 新纪录标记：本局得分刷新历史最高分时，在「最终分数」正下方
+        // 显示一行金色「新纪录！」（无新纪录时不显示、不占位）。
+        // 布局处理：显示时把下方两行整体下移 45px（一个行距），
+        // 保证三行互不重叠；不显示时保持改造前的原布局
+        const float recordShift = m_isNewRecord ? 45.0f : 0.0f; // 下方提示行的下移量
+        if (m_isNewRecord)
+        {
+            // 金色：与最终分数（黄色）拉开层次，突出"纪录"的荣誉感
+            SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
+            m_hudFont.drawCentered(m_renderer, "新纪录！", screenCenterX, screenH / 2.0f + 45.0f);
+        }
+
+        // 第三行：重开提示（白色）。破纪录时按 recordShift 下移
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 60.0f);
+        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 60.0f + recordShift);
 
         // 第四行：回菜单提示（白色）。行距与上一行保持一致
-        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 120.0f);
+        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 120.0f + recordShift);
     }
 }
 

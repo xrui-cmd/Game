@@ -1,5 +1,6 @@
 #include "game/scenes/MenuScene.h"
 #include "game/scenes/PlayScene.h" // PlayScene：Enter 后要切换过去的对局场景
+#include "game/SaveData.h"         // SaveData：读取历史最高分（菜单注脚展示）
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
 #include <memory>                  // std::make_unique：构造 PlayScene
@@ -52,16 +53,22 @@ void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/, AudioS
 
     // 4) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
     //    路径拼装模式与背景图一致：以 exe 所在目录为基准。
-    //    标题与提示各加载一份（字号不同）；Font::load 内部会记录失败警告，
+    //    标题/提示/小字各加载一份（字号不同）；Font::load 内部会记录失败警告，
     //    失败后对应文字安全跳过，菜单仍可进入对局，不阻塞游戏流程
     if (basePath != nullptr)
     {
         // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
         const std::string fontPath = std::string(basePath) + "assets/fonts/SmileySans-Oblique.ttf";
-        // 两个字号彼此独立：一份加载失败不影响另一份
+        // 三个字号彼此独立：一份加载失败不影响其它份
         m_titleFont.load(fontPath, kTitlePtSize); // 大号标题
         m_hintFont.load(fontPath, kHintPtSize);   // 提示文字
+        m_smallFont.load(fontPath, kSmallPtSize); // 历史最高分注脚（小字）
     }
+
+    // 5) 读取历史最高分（game/SaveData）：缺失（首次运行）/损坏时内部
+    //    已警告并按 0 处理——菜单永远能显示出一个合法数值。
+    //    每次进入菜单都重新读取：从对局返回后展示的就是最新纪录
+    m_highScore = SaveData::loadHighScore();
 }
 
 // 事件处理：按 Enter 开始游戏。
@@ -137,4 +144,11 @@ void MenuScene::render(float /*alpha*/)
 
     // 第三行：操作说明（白色，与上一行同字号）
     m_hintFont.drawCentered(m_renderer, "WASD 移动 / ESC 暂停", screenW / 2.0f, screenH * 0.68f);
+
+    // 第四行：历史最高分小字（金色注脚）。放在操作说明下方、更小的字号，
+    // 数值位数不定，先格式化到缓冲区，由 drawCentered 实测宽度实现居中
+    SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
+    char highScoreText[32]; // 容纳 "历史最高: " + 最长数字，绰绰有余
+    SDL_snprintf(highScoreText, sizeof(highScoreText), "历史最高: %d", m_highScore);
+    m_smallFont.drawCentered(m_renderer, highScoreText, screenW / 2.0f, screenH * 0.80f);
 }
