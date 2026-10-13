@@ -8,6 +8,9 @@
 #         assets/coin_sheet.png    144x24 金币旋转精灵表（6 帧横向排列，每帧 24x24）
 #         assets/player_sheet.png  100x50 玩家行走精灵表（2 帧横向排列，每帧 50x50）
 #         assets/background.png    1280x720 背景图（深蓝渐变 + 细微网格 + 星点）
+#         assets/enemy.png         32x32 敌人单帧精灵（红紫小怪 + 怒目，回退素材）
+#         assets/enemy_sheet.png   64x32 敌人逼近精灵表（2 帧横向排列，每帧 32x32）
+#         assets/sounds/*.wav      音效（收币/开始/结束/暂停/命中，16-bit PCM 单声道）
 #
 # 设计原则：
 #   1. 不依赖任何第三方工具或素材文件，开箱即可重新生成占位素材
@@ -452,7 +455,116 @@ $bgG.Dispose()
 $bgBmp.Dispose()
 
 # ============================================================
-# 6) 音效 WAV：assets/sounds/ 四个 16-bit PCM 单声道 44.1kHz 音效
+# 6) 敌人精灵 enemy_sheet.png / enemy.png：2 帧横向排列，每帧 32x32
+# ============================================================
+# 原理：帧 1 为「圆身 + 怒目」的站姿；帧 2 身体顶部下压 2 像素、眼睛随之下移，
+#       两帧交替形成「蠕动逼近」的动画。配色采用红紫色系——与玩家绿、金币黄
+#       形成强对比，一眼可辨威胁；enemy.png 直接从精灵表裁出第 1 帧，
+#       作为三级回退的「单帧素材」（与 player.png / coin.png 的角色相同）
+$enemyFrameCount = 2  # 总帧数，必须与 Enemy 代码里的 kFrameCount 一致
+$enemyFrameSize = 32  # 单帧边长，必须与 Enemy 的 kSize 一致
+
+# 创建整张精灵表画布：宽 = 2 帧 x 32 = 64，高 = 32
+$esBmp = New-Canvas -width ($enemyFrameCount * $enemyFrameSize) -height $enemyFrameSize
+
+# 获取精灵表的 Graphics 绘图对象
+$esG = [System.Drawing.Graphics]::FromImage($esBmp)
+
+# 打开抗锯齿：圆身与眼睛的边缘平滑
+$esG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+# 背景清成完全透明
+$esG.Clear([System.Drawing.Color]::Transparent)
+
+# 身体填充画刷：红紫色（R=186, G=64, B=148）——小怪主体色
+$esBodyBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 186, 64, 148))
+
+# 描边画笔：深紫红（R=110, G=24, B=82），2 像素宽，勾出轮廓提升辨识度
+$esOutlinePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 110, 24, 82), 2)
+
+# 眼白画刷：纯白（与玩家眼睛同材质，风格统一）
+$esEyeBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+
+# 瞳孔画刷：近黑的深紫灰（R=33, G=22, B=30），比纯黑更贴合红紫色系
+$esPupilBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 33, 22, 30))
+
+# 眉毛画笔：深紫黑（R=60, G=12, B=44），2 像素宽——"怒目"的关键笔画
+$esBrowPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 60, 12, 44), 2)
+
+# 逐帧绘制：第 f 帧在整张表中的横向起点 = f * 32
+for ($f = 0; $f -lt $enemyFrameCount; $f++) {
+    # 本帧横向起点（帧内所有绘制坐标都要加上它才落到正确帧上）
+    $esBaseX = $f * $enemyFrameSize
+
+    # 身体纵向偏移：帧 1 为 0（站姿），帧 2 为 2 像素（顶部下压形成蠕动感）
+    $esOffsetY = $f * 2
+
+    # 身体椭圆顶边 y：帧 1 为 3；帧 2 下压 2 像素
+    $esBodyTop = 3 + $esOffsetY
+    # 身体高度：帧 1 为 26；帧 2 顶部下压多少、高度就减多少（底边恒在 y=29 贴住不悬空）
+    $esBodyH = 26 - $esOffsetY
+
+    # 身体左边界 x：帧起点 + 帧内 3 像素透明边距。
+    # 注意：PS 5.1 的 New-Object 裸类型带括号语法不允许参数里内联 +/- 运算
+    #（会被误解析成成员访问并抛 op_Addition 错误），所以先算好再传入
+    $esBodyLeft = $esBaseX + 3
+
+    # 身体外接矩形：左右各留 3 像素透明边，圆心接近帧中心
+    $esBodyRect = New-Object System.Drawing.Rectangle($esBodyLeft, $esBodyTop, 26, $esBodyH)
+    # 填充圆身（红紫椭圆形主体）
+    $esG.FillEllipse($esBodyBrush, $esBodyRect)
+    # 描边：沿同一外接矩形画深紫红圆环，强化轮廓
+    $esG.DrawEllipse($esOutlinePen, $esBodyRect)
+
+    # 左眼白：随身体同步下移 $esOffsetY 像素（外接矩形 (6,12,8,8)）
+    $esG.FillEllipse($esEyeBrush, $esBaseX + 6, 12 + $esOffsetY, 8, 8)
+    # 右眼白：与左眼关于帧中线对称（外接矩形 (18,12,8,8)）
+    $esG.FillEllipse($esEyeBrush, $esBaseX + 18, 12 + $esOffsetY, 8, 8)
+    # 左瞳孔：偏内下的小圆，像死死盯住猎物
+    $esG.FillEllipse($esPupilBrush, $esBaseX + 8, 15 + $esOffsetY, 4, 4)
+    # 右瞳孔：与左瞳孔对称
+    $esG.FillEllipse($esPupilBrush, $esBaseX + 20, 15 + $esOffsetY, 4, 4)
+
+    # 左眉：从外上 (5,9) 斜向内下 (14,12)——倒八字"怒眉"的左半边
+    $esG.DrawLine($esBrowPen, $esBaseX + 5, 9 + $esOffsetY, $esBaseX + 14, 12 + $esOffsetY)
+    # 右眉：从外上 (27,9) 斜向内下 (18,12)，与左眉镜像，构成愤怒表情
+    $esG.DrawLine($esBrowPen, $esBaseX + 27, 9 + $esOffsetY, $esBaseX + 18, 12 + $esOffsetY)
+}
+
+# 保存敌人精灵表到 assets/enemy_sheet.png（内部先删旧文件，保证幂等）
+Save-Png -bitmap $esBmp -path (Join-Path $assetsDir "enemy_sheet.png")
+
+# 从精灵表裁出第 1 帧另存为单帧素材 enemy.png：
+# 与 player.png / coin.png 同一角色——精灵表加载失败时的次选回退
+$esSingle = $esBmp.Clone((New-Object System.Drawing.Rectangle(0, 0, $enemyFrameSize, $enemyFrameSize)), [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+# 保存单帧素材（Clone 出的位图与精灵表完全独立，保存后单独释放）
+Save-Png -bitmap $esSingle -path (Join-Path $assetsDir "enemy.png")
+# 释放单帧克隆位图
+$esSingle.Dispose()
+
+# 释放身体填充画刷
+$esBodyBrush.Dispose()
+
+# 释放描边画笔
+$esOutlinePen.Dispose()
+
+# 释放眼白画刷
+$esEyeBrush.Dispose()
+
+# 释放瞳孔画刷
+$esPupilBrush.Dispose()
+
+# 释放眉毛画笔
+$esBrowPen.Dispose()
+
+# 释放 Graphics 绘图对象
+$esG.Dispose()
+
+# 释放精灵表位图本身
+$esBmp.Dispose()
+
+# ============================================================
+# 7) 音效 WAV：assets/sounds/ 五个 16-bit PCM 单声道 44.1kHz 音效
 # ============================================================
 # 与 PNG 系素材不同，音效不用绘图库，而是「程序化合成正弦波 + 手写
 # RIFF/WAV 文件头」：
@@ -746,7 +858,7 @@ function Assert-Wav16Mono {
     Write-Host "WAV 校验通过: $path（PCM/单声道/16bit/${sampleRate}Hz，时长 $([Math]::Round($seconds, 3))s）"
 }
 
-# ---- 6.1 收币音 coin.wav：「叮」----
+# ---- 7.1 收币音 coin.wav：「叮」----
 # 双段正弦：880Hz 一段 -> 1320Hz 一段（频率升高让"叮"更亮），约 100ms；
 # decayTime 取 0.035s 快速衰减，模拟金属币短促碰响的余韵
 $coinSamples = New-SineSamples -segments @(
@@ -756,7 +868,7 @@ $coinSamples = New-SineSamples -segments @(
 # 写盘：16-bit PCM 单声道 44.1kHz
 Save-Wav16Mono -samples $coinSamples -path (Join-Path $soundsDir "coin.wav") -sampleRate $wavSampleRate
 
-# ---- 6.2 开始音 start.wav：短促上扬 ----
+# ---- 7.2 开始音 start.wav：短促上扬 ----
 # 单一线性滑音 600Hz -> 900Hz（上行约六度），约 120ms；
 # 衰减放慢（0.25s）保持"确认/出发"的明亮听感
 $startSamples = New-SineSamples -segments @(
@@ -764,7 +876,7 @@ $startSamples = New-SineSamples -segments @(
 ) -amplitude 0.8 -decayTime 0.25
 Save-Wav16Mono -samples $startSamples -path (Join-Path $soundsDir "start.wav") -sampleRate $wavSampleRate
 
-# ---- 6.3 结束音 gameover.wav：三连下行 ----
+# ---- 7.3 结束音 gameover.wav：三连下行 ----
 # 440Hz -> 330Hz -> 220Hz 三段，每段 0.2s，共 0.6s；
 # 音高逐级下降传达"结束"；衰减放慢（0.5s）让三个音保持清晰可辨
 $gameoverSamples = New-SineSamples -segments @(
@@ -774,15 +886,23 @@ $gameoverSamples = New-SineSamples -segments @(
 ) -amplitude 0.8 -decayTime 0.5
 Save-Wav16Mono -samples $gameoverSamples -path (Join-Path $soundsDir "gameover.wav") -sampleRate $wavSampleRate
 
-# ---- 6.4 暂停音 pause.wav：轻短提示 ----
+# ---- 7.4 暂停音 pause.wav：轻短提示 ----
 # 660Hz 恒频约 80ms；振幅压低到 0.55——暂停/恢复是轻动作，音效不应抢戏
 $pauseSamples = New-SineSamples -segments @(
     @{ StartHz = 660.0; EndHz = 660.0; Seconds = 0.08 }
 ) -amplitude 0.55 -decayTime 0.05
 Save-Wav16Mono -samples $pauseSamples -path (Join-Path $soundsDir "pause.wav") -sampleRate $wavSampleRate
 
+# ---- 7.5 命中音 hit.wav：低频下行「闷响」----
+# 160Hz -> 70Hz 单段滑音约 150ms：低频下坠模拟被撞的闷响；
+# 振幅拉高（0.9）突出冲击感，搭配较快的衰减（0.06s）保持"短促一下"的打击听感
+$hitSamples = New-SineSamples -segments @(
+    @{ StartHz = 160.0; EndHz = 70.0; Seconds = 0.15 }
+) -amplitude 0.9 -decayTime 0.06
+Save-Wav16Mono -samples $hitSamples -path (Join-Path $soundsDir "hit.wav") -sampleRate $wavSampleRate
+
 # ============================================================
-# 7) 生成后自检：重新读盘校验全部 PNG 的尺寸与 WAV 的头与时长
+# 8) 生成后自检：重新读盘校验全部 PNG 的尺寸与 WAV 的头与时长
 # ============================================================
 # 校验玩家精灵必须为 50x50（与 Player 的 m_width/m_height 对应）
 Assert-PngSize -path (Join-Path $assetsDir "player.png") -expectedWidth 50 -expectedHeight 50
@@ -795,6 +915,12 @@ Assert-PngSize -path (Join-Path $assetsDir "coin_sheet.png") -expectedWidth 144 
 
 # 校验玩家行走精灵表必须为 100x50（2 帧 x 每帧 50 宽，与 Player 的 kFrameCount 对应）
 Assert-PngSize -path (Join-Path $assetsDir "player_sheet.png") -expectedWidth 100 -expectedHeight 50
+
+# 校验敌人单帧精灵必须为 32x32（与 Enemy 的 kSize 对应）
+Assert-PngSize -path (Join-Path $assetsDir "enemy.png") -expectedWidth 32 -expectedHeight 32
+
+# 校验敌人逼近精灵表必须为 64x32（2 帧 x 每帧 32 宽，与 Enemy 的 kFrameCount/kSize 对应）
+Assert-PngSize -path (Join-Path $assetsDir "enemy_sheet.png") -expectedWidth 64 -expectedHeight 32
 
 # 校验背景图必须为 1280x720（与窗口初始尺寸一致；绘制时按窗口实际尺寸拉伸）
 Assert-PngSize -path (Join-Path $assetsDir "background.png") -expectedWidth 1280 -expectedHeight 720
@@ -812,6 +938,9 @@ Assert-Wav16Mono -path (Join-Path $soundsDir "gameover.wav") -expectedSeconds 0.
 
 # 校验暂停音：约 80ms（3528 个样本，恰好 0.08s）
 Assert-Wav16Mono -path (Join-Path $soundsDir "pause.wav") -expectedSeconds 0.08
+
+# 校验命中音：约 150ms（6615 个样本，恰好 0.15s）
+Assert-Wav16Mono -path (Join-Path $soundsDir "hit.wav") -expectedSeconds 0.15
 
 # 全部完成提示
 Write-Host "全部素材生成并校验完成。"

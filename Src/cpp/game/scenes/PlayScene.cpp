@@ -4,14 +4,15 @@
 #include "engine/Rect.h"           // rectsOverlap：金币碰撞的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
-#include <algorithm>               // std::max：金币数量下限保护
+#include <algorithm>               // std::max：金币数量下限保护、无敌计时夹取
+#include <cmath>                   // std::fmod：无敌闪烁的相位取模
 #include <memory>                  // std::make_unique：构造 MenuScene
 #include <string>                  // std::string：拼接素材与字体的绝对路径
 
 // 析构：释放背景纹理。
 // 关键时机：SceneManager 先 onExit + 析构旧场景、后销毁 renderer，
 // 因此这里释放纹理时 renderer 尚在，安全；
-// 玩家/金币的纹理由各自 Entity 的析构函数兜底释放
+// 玩家/金币/敌人的纹理由各自 Entity 的析构函数兜底释放
 PlayScene::~PlayScene()
 {
     // 只有纹理确实存在时才销毁，避免对空指针调用 SDL_DestroyTexture
@@ -29,7 +30,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 1) 保存 renderer：后续每帧渲染、资源加载都用它（只借用，不负责销毁）
     m_renderer = renderer;
 
-    // 2) 保存音效系统指针：收币/结束/暂停三处事件用它触发播放。
+    // 2) 保存音效系统指针：收币/结束/暂停/被撞四处事件用它触发播放。
     //    所有权在 GameDev，受 SceneManager 管理期间必然非空（与 Config 同一管线）
     m_audio = &audio;
 
@@ -46,6 +47,9 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      player_friction     玩家摩擦减速度（像素/秒²）
     //      player_anim_interval 玩家行走动画每帧时长（秒）
     //      coin_anim_interval  金币旋转动画每帧时长（秒）
+    //      enemy_speed         敌人基础移动速度（像素/秒）
+    //      enemy_first_spawn   第 1 只敌人的出现时间（局内秒）
+    //      enemy_hit_penalty   被敌人撞中的时间惩罚（秒）
     m_roundSeconds = config.getFloat("round_seconds", kDefaultRoundSeconds);
     m_timeLeft = m_roundSeconds; // 首局倒计时从满值开始（与按 R 重开保持一致）
 
@@ -61,6 +65,18 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     const float playerAnimInterval =
         config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
     const float coinAnimInterval = config.getFloat("coin_anim_interval", Coin::kDefaultFrameTime);
+
+    // 丁阶段：敌人配置。语义：
+    //   enemy_speed       基础移动速度（像素/秒）——追击速度的起点
+    //   enemy_first_spawn 第 1 只敌人的出现时间（局内秒）
+    //   enemy_hit_penalty 被撞中的时间惩罚（秒）
+    m_enemySpeed = config.getFloat("enemy_speed", kDefaultEnemySpeed);
+    m_enemyFirstSpawn = config.getFloat("enemy_first_spawn", kDefaultEnemyFirstSpawn);
+    m_enemyHitPenalty = config.getFloat("enemy_hit_penalty", kDefaultEnemyHitPenalty);
+
+    // 生成时刻表从「首只出现时间」开始计：倒计时到点即生成第一只；
+    // R 重开会用同一初值复位（见 restart）
+    m_enemyNextSpawnTime = m_enemyFirstSpawn;
 
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
@@ -140,6 +156,21 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         // 立即给一个随机出生点，避免所有金币叠在 (0,0)
         coin.respawn(m_width, m_height, playerRect);
     }
+
+    // 12) 丁阶段：预创建敌人对象池并加载纹理。resize 按数量构造对象
+    //     （本阶段固定 1 只；后续扩展为配置驱动的多只对象池），此时纹理为空。
+    //     敌人的出生位置在「局内第 enemy_first_spawn 秒」由 update 决定；
+    //     未生成的敌人不更新、不渲染、不参与碰撞（见各处的 m_enemySpawned 门控）
+    m_enemies.resize(1);
+
+    for (Enemy& enemy : m_enemies)
+    {
+        // 为每个敌人创建纹理（三级回退），失败只记录不中断（同金币的处理）
+        if (!enemy.load(m_renderer))
+        {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建敌人纹理失败：%s", SDL_GetError());
+        }
+    }
 }
 
 // 事件处理：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M 回主菜单。
@@ -202,8 +233,8 @@ void PlayScene::handleEvent(const SDL_Event& event)
 }
 
 // 每帧更新：只有 Playing 状态才推进游戏逻辑。
-// Paused（暂停）与 GameOver（结束）都冻结玩家、倒计时与金币——暂停由此
-// 天然实现了「世界与计时冻结」
+// Paused（暂停）与 GameOver（结束）都冻结玩家、敌人、倒计时与金币——暂停
+// 由此天然实现了「世界与计时冻结」（敌人 update 的统一门控就在本函数开头）
 void PlayScene::update(const UpdateContext& ctx)
 {
     // 非 Playing 状态：世界冻结。
@@ -218,6 +249,14 @@ void PlayScene::update(const UpdateContext& ctx)
         {
             coin.snapshotPreviousPosition(); // 金币：逐枚对齐
         }
+        // 敌人同款对齐（含尚未生成的空对象，统一处理更稳妥）：
+        // 这正是「暂停/GameOver 时敌人静止」的实现——敌人的 update 只在
+        // 下面的 Playing 分支被调用，冻结期间无人修改 m_x/m_y；这里再对齐
+        // 快照，渲染插值即恒等于当前位置，画面完全不漂移
+        for (Enemy& enemy : m_enemies)
+        {
+            enemy.snapshotPreviousPosition(); // 敌人：逐个对齐
+        }
         return;
     }
 
@@ -228,8 +267,44 @@ void PlayScene::update(const UpdateContext& ctx)
     // 玩家使用上下文更新：内部按 ctx.keyboard 移动、按 ctx.viewport* 做边界 clamp
     m_player.update(ctx);
 
-    // 玩家矩形只取一次：本帧所有金币都对它做碰撞检测
+    // 玩家矩形只取一次：本帧所有金币/敌人的碰撞检测与敌人追踪都共用它
     const SDL_FRect playerRect = m_player.rect();
+
+    // 丁阶段（无敌计时）：递减剩余无敌时间并夹到 0。
+    // 被撞中的瞬间会在下面的碰撞分支重置为满值；暂停/结束时本函数提前
+    // 返回，计时自然冻结——恢复后无敌不会「凭空流逝」
+    if (m_playerInvincibleLeft > 0.0f)
+    {
+        m_playerInvincibleLeft = std::max(m_playerInvincibleLeft - ctx.deltaTime, 0.0f);
+    }
+
+    // 丁阶段（敌人出现）：局内秒数累计 + 到点生成。
+    // m_enemyElapsed 只在 Playing 递增（暂停/结束不涨，难度节奏与游戏时间一致），
+    // R 重开时清零（见 restart）。本阶段固定 1 只；出生点距玩家至少约 300px，
+    // 由 Enemy::spawn 内部保证
+    m_enemyElapsed += ctx.deltaTime;
+    if (m_enemySpawned < 1 && m_enemyElapsed >= m_enemyNextSpawnTime)
+    {
+        // 激活对象池中的下一个敌人：随机出生点尽量远离玩家（当前矩形）
+        Enemy& enemy = m_enemies[static_cast<size_t>(m_enemySpawned)];
+        enemy.spawn(m_width, m_height, playerRect);
+        ++m_enemySpawned; // 计数 +1：这只从此刻起参与追踪/碰撞/渲染
+
+        // 冒烟观测点：敌人出现日志（自动化测试据此断言生成时机）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "敌人出现（第 %d 只）", m_enemySpawned);
+    }
+
+    // 丁阶段（敌人追踪）：每个已生成的敌人注入「本步目标 + 本步速度」后更新。
+    // 「场景注入、实体执行」的分工让难度规则完全留在本层：
+    // 目标 = 玩家矩形中心（Enemy::setTarget 内部取中心），
+    // 速度 = 基础速度（难度曲线扩展时在此按局内秒数换算）
+    for (int i = 0; i < m_enemySpawned; ++i)
+    {
+        Enemy& enemy = m_enemies[static_cast<size_t>(i)];
+        enemy.setTarget(playerRect);       // 注入追踪目标（玩家矩形 → 中心点）
+        enemy.setChaseSpeed(m_enemySpeed); // 注入本步速度（本阶段：恒定基础速度）
+        enemy.update(ctx);                 // 执行：朝目标直线移动 + 播逼近动画
+    }
 
     // 逐个检测金币与玩家是否重叠：重叠即视为「收集成功」
     for (Coin& coin : m_coins)
@@ -249,6 +324,48 @@ void PlayScene::update(const UpdateContext& ctx)
 
             // 立刻把这枚金币传送到新的随机位置（随机范围跟随窗口实际尺寸）
             coin.respawn(m_width, m_height, playerRect);
+        }
+    }
+
+    // 丁阶段（敌人碰撞）：仅玩家非无敌时检测（无敌期跳过碰撞 = 保护窗口）。
+    // 命中结算：扣时间、敌人沿远离玩家方向击退 150px、玩家进入 0.8s 无敌、
+    // 播放 hit 音效；时间归零统一由下文倒计时之后的 GameOver 入口处理
+    if (m_playerInvincibleLeft <= 0.0f)
+    {
+        for (int i = 0; i < m_enemySpawned; ++i)
+        {
+            Enemy& enemy = m_enemies[static_cast<size_t>(i)];
+
+            // AABB 相交检测；返回 false 说明玩家和这只敌人还没碰上
+            if (!rectsOverlap(playerRect, enemy.rect()))
+            {
+                continue; // 未碰上：检查下一个（用 continue 而非 break——每只独立判定）
+            }
+
+            // ---- 命中结算（同一步内至多触发一次：结算后玩家立即可无敌）----
+
+            // 1) 扣除时间：沿用「时间耗尽 → GameOver」的既有语义——
+            //    这里只扣，归零检查统一放在倒计时递减之后（GameOver 唯一入口）
+            m_timeLeft -= m_enemyHitPenalty;
+
+            // 冒烟观测点：被撞日志（自动化测试据此断言扣时发生）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "被敌人击中，扣 %g 秒", static_cast<double>(m_enemyHitPenalty));
+
+            // 2) 打击音效（低频「闷响」）：与渲染闪烁共同构成「被撞」反馈
+            m_audio->play(SoundId::Hit);
+
+            // 3) 玩家无敌：碰撞检测从下一步起跳过；渲染上每 0.1s 显/隐交替
+            m_playerInvincibleLeft = kPlayerInvincibleSeconds;
+
+            // 4) 敌人击退：沿「玩家中心 -> 敌人中心」方向瞬移 150px 并 clamp 视口。
+            //    knockback 是瞬移类操作，内部已快照 prev=cur 防止插值拉丝
+            const float playerCenterX = playerRect.x + playerRect.w * 0.5f;
+            const float playerCenterY = playerRect.y + playerRect.h * 0.5f;
+            enemy.knockback(playerCenterX, playerCenterY,
+                            static_cast<float>(m_width), static_cast<float>(m_height));
+
+            break; // 玩家已进入无敌：同一步内的其余敌人不再判定
         }
     }
 
@@ -291,6 +408,13 @@ void PlayScene::restart()
         coin.respawn(m_width, m_height, playerRect);
     }
 
+    // 丁阶段：敌人与难度计时全部复位——已生成的敌人「收回池中」
+    //（m_enemySpawned 归零后不再更新/渲染/碰撞），生成时刻表回到首只时间
+    m_enemyElapsed = 0.0f;                        // 局内秒数清零：难度节奏重新起算
+    m_enemySpawned = 0;                           // 已生成数清零：对象池全部回收
+    m_enemyNextSpawnTime = m_enemyFirstSpawn;     // 首只敌人重新按配置时间出现
+    m_playerInvincibleLeft = 0.0f;                // 新一局从非无敌开始
+
     // 最后切回 Playing，新一局正式开始
     m_state = PlayState::Playing;
 
@@ -298,7 +422,7 @@ void PlayScene::restart()
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "重开一局");
 }
 
-// 每帧渲染：清屏 -> 背景 -> 玩家 -> 金币 -> HUD。
+// 每帧渲染：清屏 -> 背景 -> 玩家 -> 敌人 -> 金币 -> HUD。
 // 不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
 // alpha 是插值系数，原样传给各实体——它们据此在上一固定步位置与当前
 // 固定步位置之间平滑绘制
@@ -336,11 +460,27 @@ void PlayScene::render(float alpha)
         SDL_RenderTexture(m_renderer, m_background, nullptr, &bgDst);
     }
 
-    // 玩家先画、金币后画（金币叠在玩家上的观感与改造前一致）。
-    // 两者都按插值位置绘制：逻辑 120Hz 的离散位移在渲染帧上平滑呈现
-    m_player.render(m_renderer, alpha);
+    // 玩家按插值位置绘制；无敌期间每 0.1 秒显/隐交替（闪烁提示保护中）。
+    // 相位判定：剩余无敌时间对「两倍半周期」取模，模值小于半周期时显示——
+    // 随剩余时间递减自然交替。暂停/结束时剩余值冻结，相位一并冻结，
+    // 画面保持静止（与「暂停=完全冻结」的承诺一致）
+    const bool playerVisible =
+        m_playerInvincibleLeft <= 0.0f ||
+        std::fmod(m_playerInvincibleLeft, kPlayerBlinkHalfPeriod * 2.0f) < kPlayerBlinkHalfPeriod;
+    if (playerVisible)
+    {
+        m_player.render(m_renderer, alpha);
+    }
 
-    // 遍历绘制所有金币；数量少，直接循环即可
+    // 丁阶段：绘制已生成的敌人（未生成的保持不可见——门控与 update 一致）。
+    // 与玩家/金币同样按插值位置绘制，逻辑步的离散位移平滑呈现
+    for (int i = 0; i < m_enemySpawned; ++i)
+    {
+        m_enemies[static_cast<size_t>(i)].render(m_renderer, alpha);
+    }
+
+    // 遍历绘制所有金币；数量少，直接循环即可（金币压在玩家与敌人之上，
+    // 拾取目标永远清晰可辨）
     for (const Coin& coin : m_coins)
     {
         coin.render(m_renderer, alpha); // 每个金币按插值位置画到屏幕上
@@ -445,9 +585,11 @@ void PlayScene::renderHud()
         // 水平中心：叠层文字共用的对齐基准
         const float screenCenterX = screenW / 2.0f;
 
-        // 大号「暂停」（黄色，kBigPtSize 字号，强调暂停状态）
+        // 大号「暂停」（黄色，kBigPtSize 字号，强调暂停状态）。
+        // 纵向位置取 0.30 屏高而非 0.38：玩家通常停在窗口中心附近，
+        // 标题上移一段后与玩家精灵保持明显间隙，暂停画面更整洁
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        m_bigFont.drawCentered(m_renderer, "暂停", screenCenterX, screenH * 0.38f);
+        m_bigFont.drawCentered(m_renderer, "暂停", screenCenterX, screenH * 0.30f);
 
         // 恢复提示（白色，常规 HUD 字号）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);

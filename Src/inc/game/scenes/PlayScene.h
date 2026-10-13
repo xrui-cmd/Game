@@ -2,26 +2,27 @@
 #define __PLAYSCENE_H__
 
 #include "engine/Scene.h"       // Scene：场景基类
-#include "engine/AudioSystem.h" // AudioSystem：音效系统（收币/结束/暂停触发播放）
+#include "engine/AudioSystem.h" // AudioSystem：音效系统（收币/结束/暂停/被撞触发播放）
 #include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字，支持中文）
 #include "game/Player.h"        // Player：玩家实体
 #include "game/Coin.h"          // Coin：金币实体
-#include <vector>               // std::vector：金币集合
+#include "game/Enemy.h"         // Enemy：追击敌人的实体
+#include <vector>               // std::vector：金币与敌人集合
 
 // ============================================================
 // PlayScene：对局场景（原 GameDev 的全部玩法逻辑迁入）
 // ============================================================
 //
 // 职责：
-//   1. 资源：在 onEnter 加载背景图（可选，失败兜底）、玩家与金币纹理；
-//      析构时释放背景纹理（玩家/金币纹理由各自 Entity 析构兜底）
+//   1. 资源：在 onEnter 加载背景图（可选，失败兜底）、玩家、金币与敌人纹理；
+//      析构时释放背景纹理（玩家/金币/敌人纹理由各自 Entity 析构兜底）
 //   2. 玩法：WASD 移动、金币碰撞计分、倒计时、ESC 暂停/恢复、
-//      R 重开、M 回主菜单
-//   3. 音效：收币播 coin、倒计时归零播 gameover、ESC 暂停/恢复播 pause
-//      （经 onEnter 注入的 AudioSystem；降级环境下为安全空操作）
+//      R 重开、M 回主菜单；敌人追踪玩家、碰撞扣时、击退与无敌保护
+//   3. 音效：收币播 coin、倒计时归零播 gameover、ESC 暂停/恢复播 pause、
+//      被敌人撞中播 hit（经 onEnter 注入的 AudioSystem；降级环境下为安全空操作）
 //   4. 配置：onEnter 时从注入的 Config 读取对局时长、金币数量、
-//      玩家速度与动画节奏；缺键/坏值自动回退内置默认值
-//   5. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层（含 FPS/帧时间显示，
+//      玩家速度与动画节奏、敌人速度与生成节奏；缺键/坏值自动回退内置默认值
+//   5. 渲染：背景 -> 玩家 -> 敌人 -> 金币 -> HUD 文字叠层（含 FPS/帧时间显示，
 //      左下角常显，F3 切换显隐——学习项目默认打开便于观察渲染表现）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
@@ -80,6 +81,19 @@ private:
     static constexpr float kDefaultRoundSeconds = 30.0f; // 默认每局总时长（秒）
     static constexpr int kDefaultCoinCount = 5;          // 默认场上金币数量
 
+    // 丁阶段（敌人）配置项缺省值：与 config/game.ini 的对应键取值一致，
+    // 配置文件缺失时敌人按「5 秒出现 · 110 像素/秒追来 · 撞中扣 5 秒」运行
+    static constexpr float kDefaultEnemySpeed = 110.0f;    // 敌人基础移动速度（像素/秒）
+    static constexpr float kDefaultEnemyFirstSpawn = 5.0f; // 第 1 只敌人的出现时间（局内秒）
+    static constexpr float kDefaultEnemyHitPenalty = 5.0f; // 被敌人撞中的时间惩罚（秒）
+
+    // 玩家被撞中后的无敌时长（秒）：期间跳过敌人碰撞检测、渲染每 0.1 秒闪烁。
+    // 固定玩法规则（不进配置文件）：0.8 秒足够拉开与击退后敌人的距离
+    static constexpr float kPlayerInvincibleSeconds = 0.8f;
+
+    // 无敌闪烁的「半周期」（秒）：显 / 隐各占 0.1 秒，即每 0.1 秒切换一次
+    static constexpr float kPlayerBlinkHalfPeriod = 0.1f;
+
     static constexpr float kHudPtSize = 32.0f; // HUD/提示文字字号（像素高，小数需求清晰）
     static constexpr float kBigPtSize = 64.0f; // 暂停/结束标题字号（大号观感）
 
@@ -105,9 +119,25 @@ private:
     Font m_hudFont; // HUD/提示文字（分数、时间、操作提示、GameOver 列表）
     Font m_bigFont; // 大号标题（暂停 / 游戏结束）
 
-    Player m_player;           // 玩家实体
-    std::vector<Coin> m_coins; // 场上同时存在的金币集合
-    int m_score = 0;           // 已收集的金币总数（跨帧累计）
+    Player m_player;              // 玩家实体
+    std::vector<Coin> m_coins;    // 场上同时存在的金币集合
+    std::vector<Enemy> m_enemies; // 敌人对象池（预创建；前 m_enemySpawned 个为已激活）
+    int m_score = 0;              // 已收集的金币总数（跨帧累计）
+
+    // ---- 丁阶段：敌人与难度曲线（配置 + 运行时状态） ----
+    // 下列配置在 onEnter 时读取（缺键自动回退内置默认值）；R 重开不重读配置，
+    // 只复位下面的运行时状态——保证整局沿用同一套调参
+    float m_enemySpeed = kDefaultEnemySpeed;           // 敌人基础速度（像素/秒）
+    float m_enemyFirstSpawn = kDefaultEnemyFirstSpawn; // 第 1 只敌人的出现时间（局内秒）
+    float m_enemyHitPenalty = kDefaultEnemyHitPenalty; // 被撞中的时间惩罚（秒）
+
+    float m_enemyElapsed = 0.0f;       // 局内已过秒数（仅 Playing 递增；难度计时基准）
+    float m_enemyNextSpawnTime = 0.0f; // 下一只敌人的出现时刻（局内秒；onEnter 设为首只时间）
+    int m_enemySpawned = 0;            // 本局已生成的敌人数（同时决定激活对象池的前几个）
+
+    // 玩家剩余无敌时间（秒；0 = 未处于无敌）；被撞中时重置为满值，
+    // 仅 Playing 状态递减——暂停/结束时冻结，闪烁相位随之冻结
+    float m_playerInvincibleLeft = 0.0f;
 
     // 本局总时长（秒）：onEnter 时由配置 round_seconds 覆盖默认值。
     // 按 R 重开时用它重置倒计时，保证整局时长一致
