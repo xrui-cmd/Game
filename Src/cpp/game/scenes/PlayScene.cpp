@@ -54,6 +54,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      enemy_spawn_interval 增援间隔（秒，第一只之后每过这么久 +1 只）
     //      enemy_max_count     场上敌人数量上限
     //      enemy_hit_penalty   被敌人撞中的时间惩罚（秒）
+    //      combo_window        连击窗口（秒）：收集间隔不超过它才算连吃
     m_roundSeconds = config.getFloat("round_seconds", kDefaultRoundSeconds);
     m_timeLeft = m_roundSeconds; // 首局倒计时从满值开始（与按 R 重开保持一致）
 
@@ -69,6 +70,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     const float playerAnimInterval =
         config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
     const float coinAnimInterval = config.getFloat("coin_anim_interval", Coin::kDefaultFrameTime);
+
+    // 连击窗口（秒）：两枚金币的收集间隔不超过它才算「连吃」，
+    // 本枚金币的得分 = 当前连击数（详见 update 的金币收集分支）。
+    // 【语义变更】旧版「每枚金币固定 +1」已被此连击制替代
+    m_comboWindow = config.getFloat("combo_window", kDefaultComboWindow);
 
     // 丁阶段：敌人与难度曲线配置。语义：
     //   enemy_speed          基础移动速度（像素/秒）——追击速度的起点
@@ -338,6 +344,25 @@ void PlayScene::update(const UpdateContext& ctx)
         enemy.update(ctx);               // 执行：朝目标直线移动 + 播逼近动画
     }
 
+    // 连击窗口倒计时：距上次收集超过 combo_window 秒后断连。
+    // 只在「窗口激活」时递减（0 表示已在窗口外，无事可做）；
+    // 归零时把连击数清 0——HUD 的「连击 xN」随之在下一帧消失
+    if (m_comboTimer > 0.0f)
+    {
+        m_comboTimer -= ctx.deltaTime; // 与倒计时同一时间基准（固定步长，暂停时冻结）
+        if (m_comboTimer <= 0.0f)
+        {
+            m_comboTimer = 0.0f; // 夹到 0：负数会让下一次收集的 >0 判定出现差错
+            if (m_comboCount >= 2)
+            {
+                // 冒烟观测点：自动化测试据此断言「超窗口断连」（xN 清零）
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "连击窗口到期，连击中断（x%d）", m_comboCount);
+            }
+            m_comboCount = 0; // 连击数清除：窗口外的下一次收集从 +1 重新起算
+        }
+    }
+
     // 逐个检测金币与玩家是否重叠：重叠即视为「收集成功」
     for (Coin& coin : m_coins)
     {
@@ -348,7 +373,18 @@ void PlayScene::update(const UpdateContext& ctx)
         // AABB 相交检测；返回 true 说明玩家和这枚金币碰到了
         if (rectsOverlap(playerRect, coin.rect()))
         {
-            m_score += 1; // 每枚金币计 1 分，累加到总分里
+            // ---- 连击判定（本例的中心规则；替代旧「每枚金币 +1」）----
+            // 距上次收集不超过 combo_window 秒（m_comboTimer 仍 >0）时
+            // 连击 +1，否则连击从 1 重新起算；本枚金币的得分 = 当前连击数。
+            // 连吃依次 +1、+2、+3...：密集收集的收益递增，
+            // 鼓励规划走位连续吃币，而不是慢慢单点收集
+            m_comboCount = (m_comboTimer > 0.0f) ? m_comboCount + 1 : 1;
+            m_score += m_comboCount;      // 累加本枚金币的连击得分
+            m_comboTimer = m_comboWindow; // 窗口重置：下一枚在窗口内收集即可续连
+
+            // 冒烟观测点：记录本次得分与连击数（自动化测试据此断言连击节奏）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "连击计分: +%d（连击 x%d）", m_comboCount, m_comboCount);
 
             // 播放收币短促「叮」（coin）：每次收集都触发；
             // 同一音效连续触发时轨道从头重播，连收多枚时的听感自然衔接
@@ -450,6 +486,10 @@ void PlayScene::restart()
     // 新纪录标记只属于刚结束的那一局：新一局从「未破纪录」状态开始。
     // m_highScore 刻意保留——刚写入的最新纪录继续参与下一局的比较
     m_isNewRecord = false;
+
+    // 连击状态复位：新一局从「无连击」开始（窗口计时一并清零）
+    m_comboCount = 0;
+    m_comboTimer = 0.0f;
 
     // 刷新窗口实际尺寸缓存：重开时窗口可能已被调整过大小
     SDL_GetWindowSize(m_window, &m_width, &m_height);
@@ -626,6 +666,17 @@ void PlayScene::renderHud()
         char scoreText[32]; // 容纳 "分数: " + 最长数字，绰绰有余
         SDL_snprintf(scoreText, sizeof(scoreText), "分数: %d", m_score);
         m_hudFont.draw(m_renderer, scoreText, 20.0f, 20.0f);
+
+        // 分数下方：连击数（橙色，>=2 才显示——单枚收集不值得单独提示；
+        // 断连后连击数清零，此行随下一帧渲染自动消失）。
+        // y=68 与分数行保持约一个行高的间隔，两行不重叠
+        if (m_comboCount >= 2)
+        {
+            SDL_SetRenderDrawColor(m_renderer, 255, 165, 0, 255);
+            char comboText[32]; // 容纳 "连击 x" + 最长数字，绰绰有余
+            SDL_snprintf(comboText, sizeof(comboText), "连击 x%d", m_comboCount);
+            m_hudFont.draw(m_renderer, comboText, 20.0f, 68.0f);
+        }
 
         // 右上角：剩余时间（黄色）。右对齐：先实测文本宽度再反推 x
         // （中文字体数字宽度不定，不能按字符数估算）
