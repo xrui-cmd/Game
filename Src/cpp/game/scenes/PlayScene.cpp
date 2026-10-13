@@ -155,6 +155,16 @@ void PlayScene::handleEvent(const SDL_Event& event)
         return; // ESC 已处理：直接返回，避免落入下面的按键分支
     }
 
+    // F3：切换左下角 FPS/帧时间显示（任何对局状态下都响应）。
+    // 放在 ESC 之后、其他分支之前：它不影响对局状态，只控制显示
+    if (event.key.scancode == SDL_SCANCODE_F3)
+    {
+        m_fpsVisible = !m_fpsVisible; // 开 <-> 关
+        // 冒烟观测点：日志确认切换实际发生（自动化测试据此断言）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "帧率显示: %s", m_fpsVisible ? "开" : "关");
+        return; // F3 已处理：直接返回，避免落入下面的按键分支
+    }
+
     // GameOver 下按 R：重置整局数据并切回 Playing
     if (event.key.scancode == SDL_SCANCODE_R && m_state == PlayState::GameOver)
     {
@@ -266,6 +276,9 @@ void PlayScene::restart()
 // 固定步位置之间平滑绘制
 void PlayScene::render(float alpha)
 {
+    // 采样本渲染帧的间隔并更新 FPS 平滑值（只统计，不影响绘制内容）
+    sampleFrameTime();
+
     // 设置清屏颜色。深蓝是背景图缺失时的兜底底色
     if (!SDL_SetRenderDrawColor(m_renderer, 20, 30, 50, 255))
     {
@@ -323,6 +336,33 @@ void PlayScene::renderHud()
     // 换成浮点别名：后续所有文字定位都用「屏幕像素」表达
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
+
+    // ---- 左下角：FPS / 帧时间（灰白色小字，F3 控制显隐）----
+    // 放在状态分支之前：无论 Playing/Paused/GameOver 都显示，方便对比
+    // 三种状态下渲染性能的差异（数值来自 EMA，会逐帧连续变化）
+    if (m_fpsVisible)
+    {
+        // 灰白色：不抢 Score/Time 的视觉焦点
+        SDL_SetRenderDrawColor(m_renderer, 180, 180, 180, 255);
+
+        // 左对齐 x=20（与 Score 同一条左边线）；文字高 = 8 逻辑像素 x
+        // kHudScale = 16 屏幕像素，再留 24 像素底边距 => y = 屏高 - 40
+        const float fpsY = screenH - 40.0f;
+
+        if (m_hasFrameSample)
+        {
+            // FPS 与帧时间同源换算（FPS = 1000 / 毫秒），两者必然自洽
+            const float fps = 1000.0f / m_smoothedFrameMs;
+            DebugText::drawFormat(m_renderer, kHudScale, 20.0f, fpsY,
+                                  "FPS: %.1f | %.1f ms", fps, m_smoothedFrameMs);
+        }
+        else
+        {
+            // 首帧还没有有效间隔：显示占位符，下一帧起给出真实数值
+            DebugText::drawFormat(m_renderer, kHudScale, 20.0f, fpsY,
+                                  "FPS: -- | -- ms");
+        }
+    }
 
     // Playing 与 Paused 都显示分数/倒计时：
     // 暂停时保留完整 HUD，玩家能看清冻结时刻的分数与剩余时间
@@ -394,4 +434,37 @@ void PlayScene::renderHud()
         DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH / 2.0f + 120.0f,
                                 "Press M for Menu");
     }
+}
+
+// 采样渲染帧间隔并做 EMA 平滑：FPS 显示的数据来源。
+// 与固定步长逻辑完全无关——它统计的是「渲染帧」的频率，
+// 因此放在 render 里（每渲染帧一次），而不是 update 里（每固定步一次）
+void PlayScene::sampleFrameTime()
+{
+    const Uint64 now = SDL_GetPerformanceCounter(); // 本帧时刻（性能计数器）
+
+    // 第一次调用没有「上一帧」可参照：只记录时刻，间隔从下一次开始算
+    if (m_lastFrameCounter != 0)
+    {
+        // 渲染帧间隔（毫秒）= 计数器差值 / 频率 x 1000
+        const float frameMs = static_cast<float>(now - m_lastFrameCounter) * 1000.0f /
+                              static_cast<float>(SDL_GetPerformanceFrequency());
+
+        if (!m_hasFrameSample)
+        {
+            // 首个有效间隔直接作为初值：避免从 0 缓慢爬升，显示假数字
+            m_smoothedFrameMs = frameMs;
+            m_hasFrameSample = true; // 之后所有采样都走 EMA 分支
+        }
+        else
+        {
+            // 指数滑动平均（EMA）：新值权重 0.05 —— 约等于最近 20 帧的
+            // 滑动窗口（60fps 下约 0.33 秒）。选它而非「固定 1 秒窗口」：
+            // 数字连续不跳变，且一行公式完成，无需时间桶与计数
+            constexpr float kEmaWeight = 0.05f;
+            m_smoothedFrameMs = m_smoothedFrameMs * (1.0f - kEmaWeight) + frameMs * kEmaWeight;
+        }
+    }
+
+    m_lastFrameCounter = now; // 记录本帧时刻，供下一次调用计算间隔
 }

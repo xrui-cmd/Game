@@ -17,7 +17,8 @@
 //      R 重开、M 回主菜单
 //   3. 配置：onEnter 时从注入的 Config 读取对局时长、金币数量、
 //      玩家速度与动画节奏；缺键/坏值自动回退内置默认值
-//   4. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层
+//   4. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层（含 FPS/帧时间显示，
+//      左下角常显，F3 切换显隐——学习项目默认打开便于观察渲染表现）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
 // 数据成员的默认值就是初始状态（分数 0、倒计时满值）；onEnter 里
@@ -46,7 +47,8 @@ public:
     // 进入场景：保存 renderer、读取配置、加载全部纹理、布置玩家与金币
     void onEnter(SDL_Renderer* renderer, const Config& config) override;
 
-    // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M 回主菜单
+    // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M
+    // 回主菜单、F3 切换 FPS 显示（任何状态都响应）
     void handleEvent(const SDL_Event& event) override;
 
     // 每帧更新：仅 Playing 状态推进移动/碰撞/倒计时（Paused/GameOver 冻结）。
@@ -60,8 +62,12 @@ private:
     // 重开一局：重置分数、倒计时、玩家位置与全部金币
     void restart();
 
-    // 绘制 HUD 文字（分数、倒计时、暂停叠层、结束界面）
+    // 绘制 HUD 文字（分数、倒计时、FPS、暂停叠层、结束界面）
     void renderHud();
+
+    // 采样本渲染帧的间隔时间并做 EMA 平滑（render 每帧开头调用）。
+    // FPS 反映的是渲染性能，与固定步长逻辑无关，暂停时也照常采样
+    void sampleFrameTime();
 
 private:
     // 配置项缺省值：与改造前的硬编码常量逐一相同。
@@ -93,6 +99,17 @@ private:
     float m_timeLeft = kDefaultRoundSeconds; // 本局剩余秒数（仅 Playing 状态递减）
 
     PlayState m_state = PlayState::Playing; // 当前对局状态
+
+    // ---- FPS / 帧时间显示 ----
+    // 显示内容：左下角 "FPS: 59.9 | 16.7 ms"。数值来自渲染帧间隔的
+    // 指数滑动平均（EMA），只反映渲染表现，不参与任何玩法逻辑
+    bool m_fpsVisible = true;      // F3 切换显隐；默认显示（学习项目便于观察）
+    bool m_hasFrameSample = false; // 是否已采到首个有效帧间隔（首帧无间隔可测）
+    float m_smoothedFrameMs = 0.0f;  // 帧间隔 EMA（毫秒）；FPS = 1000 / 该值
+
+    // 上次 render 的时刻（性能计数器读数）：两次读数之差即渲染帧间隔。
+    // 初值 0 表示「尚无参照」，第一次 render 只记录不计算
+    Uint64 m_lastFrameCounter = 0;
 
     // 窗口实际尺寸缓存（每次查询窗口后更新）：
     // 金币重生范围这类需要整数的场合直接用它
