@@ -48,7 +48,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      player_anim_interval 玩家行走动画每帧时长（秒）
     //      coin_anim_interval  金币旋转动画每帧时长（秒）
     //      enemy_speed         敌人基础移动速度（像素/秒）
+    //      enemy_speed_growth  敌人速度成长（像素/秒²，按局内秒数叠加）
     //      enemy_first_spawn   第 1 只敌人的出现时间（局内秒）
+    //      enemy_spawn_interval 增援间隔（秒，第一只之后每过这么久 +1 只）
+    //      enemy_max_count     场上敌人数量上限
     //      enemy_hit_penalty   被敌人撞中的时间惩罚（秒）
     m_roundSeconds = config.getFloat("round_seconds", kDefaultRoundSeconds);
     m_timeLeft = m_roundSeconds; // 首局倒计时从满值开始（与按 R 重开保持一致）
@@ -66,13 +69,22 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
     const float coinAnimInterval = config.getFloat("coin_anim_interval", Coin::kDefaultFrameTime);
 
-    // 丁阶段：敌人配置。语义：
-    //   enemy_speed       基础移动速度（像素/秒）——追击速度的起点
-    //   enemy_first_spawn 第 1 只敌人的出现时间（局内秒）
-    //   enemy_hit_penalty 被撞中的时间惩罚（秒）
+    // 丁阶段：敌人与难度曲线配置。语义：
+    //   enemy_speed          基础移动速度（像素/秒）——追击速度的起点
+    //   enemy_speed_growth   速度成长（像素/秒²）——每秒比前一秒快多少
+    //   enemy_first_spawn    第 1 只敌人的出现时间（局内秒）
+    //   enemy_spawn_interval 增援间隔（秒）——第一只之后，每过这么久多 1 只
+    //   enemy_max_count      数量上限——同时存在的敌人不超过它
+    //   enemy_hit_penalty    被撞中的时间惩罚（秒）
     m_enemySpeed = config.getFloat("enemy_speed", kDefaultEnemySpeed);
+    m_enemySpeedGrowth = config.getFloat("enemy_speed_growth", kDefaultEnemySpeedGrowth);
     m_enemyFirstSpawn = config.getFloat("enemy_first_spawn", kDefaultEnemyFirstSpawn);
+    m_enemySpawnInterval = config.getFloat("enemy_spawn_interval", kDefaultEnemySpawnInterval);
     m_enemyHitPenalty = config.getFloat("enemy_hit_penalty", kDefaultEnemyHitPenalty);
+
+    // 负数会经 static_cast 变成巨大的 size_t 引发异常（与金币同一防护），
+    // 所以先用 std::max 夹到 0 以上；0 只敌人（无敌人模式）是允许的合法配置
+    m_enemyMaxCount = std::max(0, config.getInt("enemy_max_count", kDefaultEnemyMaxCount));
 
     // 生成时刻表从「首只出现时间」开始计：倒计时到点即生成第一只；
     // R 重开会用同一初值复位（见 restart）
@@ -158,10 +170,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     }
 
     // 12) 丁阶段：预创建敌人对象池并加载纹理。resize 按数量构造对象
-    //     （本阶段固定 1 只；后续扩展为配置驱动的多只对象池），此时纹理为空。
-    //     敌人的出生位置在「局内第 enemy_first_spawn 秒」由 update 决定；
-    //     未生成的敌人不更新、不渲染、不参与碰撞（见各处的 m_enemySpawned 门控）
-    m_enemies.resize(1);
+    //     （数量 = enemy_max_count，默认 3；上限语义由「最多激活前 N 个」实现），
+    //     此时纹理为空。敌人的出生位置与时刻由 update 按难度曲线决定
+    //     （见「敌人出现」分支）；未生成的敌人不更新、不渲染、不参与碰撞
+    m_enemies.resize(static_cast<size_t>(m_enemyMaxCount));
 
     for (Enemy& enemy : m_enemies)
     {
@@ -278,32 +290,45 @@ void PlayScene::update(const UpdateContext& ctx)
         m_playerInvincibleLeft = std::max(m_playerInvincibleLeft - ctx.deltaTime, 0.0f);
     }
 
-    // 丁阶段（敌人出现）：局内秒数累计 + 到点生成。
+    // 丁阶段（敌人出现 / 增援节奏）：局内秒数累计 + 到点生成。
     // m_enemyElapsed 只在 Playing 递增（暂停/结束不涨，难度节奏与游戏时间一致），
-    // R 重开时清零（见 restart）。本阶段固定 1 只；出生点距玩家至少约 300px，
-    // 由 Enemy::spawn 内部保证
+    // R 重开时清零（见 restart）。节奏：局内第 enemy_first_spawn 秒出现第 1 只，
+    // 此后每 enemy_spawn_interval 秒 +1 只，最多 enemy_max_count 只；
+    // 出生点距玩家至少约 300px，由 Enemy::spawn 内部保证
     m_enemyElapsed += ctx.deltaTime;
-    if (m_enemySpawned < 1 && m_enemyElapsed >= m_enemyNextSpawnTime)
+    if (m_enemySpawned < m_enemyMaxCount && m_enemyElapsed >= m_enemyNextSpawnTime)
     {
         // 激活对象池中的下一个敌人：随机出生点尽量远离玩家（当前矩形）
         Enemy& enemy = m_enemies[static_cast<size_t>(m_enemySpawned)];
         enemy.spawn(m_width, m_height, playerRect);
         ++m_enemySpawned; // 计数 +1：这只从此刻起参与追踪/碰撞/渲染
 
-        // 冒烟观测点：敌人出现日志（自动化测试据此断言生成时机）
+        // 排定下一只的出现时刻：本只时刻 + 增援间隔。
+        // 固定步长（1/120s）保证一步至多跨过一个生成点，无需 while 循环；
+        // 即使把间隔配得极小，每步也至多激活一只，不会瞬间喷出整池敌人
+        m_enemyNextSpawnTime += m_enemySpawnInterval;
+
+        // 冒烟观测点：敌人出现日志（自动化测试据此断言首袭与增援节奏）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "敌人出现（第 %d 只）", m_enemySpawned);
     }
+
+    // 丁阶段（难度曲线·速度爬升）：本步追击速度 = 基础速度 + 每秒成长 x
+    // 局内已过秒数，并封顶 kEnemyMaxSpeed。封顶值 260 刻意低于玩家默认
+    // 速度 300——追兵再快也追不上全速逃跑的玩家，「可逃」是难度的设计红线；
+    // 默认参数下约 60 秒（110 + 2.5 x 60 = 260）到达上限，此后维持 260
+    const float enemySpeed =
+        std::min(m_enemySpeed + m_enemySpeedGrowth * m_enemyElapsed, kEnemyMaxSpeed);
 
     // 丁阶段（敌人追踪）：每个已生成的敌人注入「本步目标 + 本步速度」后更新。
     // 「场景注入、实体执行」的分工让难度规则完全留在本层：
     // 目标 = 玩家矩形中心（Enemy::setTarget 内部取中心），
-    // 速度 = 基础速度（难度曲线扩展时在此按局内秒数换算）
+    // 速度 = 上方按难度曲线算出的本步值
     for (int i = 0; i < m_enemySpawned; ++i)
     {
         Enemy& enemy = m_enemies[static_cast<size_t>(i)];
-        enemy.setTarget(playerRect);       // 注入追踪目标（玩家矩形 → 中心点）
-        enemy.setChaseSpeed(m_enemySpeed); // 注入本步速度（本阶段：恒定基础速度）
-        enemy.update(ctx);                 // 执行：朝目标直线移动 + 播逼近动画
+        enemy.setTarget(playerRect);     // 注入追踪目标（玩家矩形 → 中心点）
+        enemy.setChaseSpeed(enemySpeed); // 注入本步速度（难度曲线：随时间爬升）
+        enemy.update(ctx);               // 执行：朝目标直线移动 + 播逼近动画
     }
 
     // 逐个检测金币与玩家是否重叠：重叠即视为「收集成功」

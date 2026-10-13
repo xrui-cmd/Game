@@ -17,7 +17,8 @@
 //   1. 资源：在 onEnter 加载背景图（可选，失败兜底）、玩家、金币与敌人纹理；
 //      析构时释放背景纹理（玩家/金币/敌人纹理由各自 Entity 析构兜底）
 //   2. 玩法：WASD 移动、金币碰撞计分、倒计时、ESC 暂停/恢复、
-//      R 重开、M 回主菜单；敌人追踪玩家、碰撞扣时、击退与无敌保护
+//      R 重开、M 回主菜单；敌人按难度曲线出现并追踪玩家（速度随局内
+//      时间爬升、按间隔增援），碰撞扣时、击退与无敌保护
 //   3. 音效：收币播 coin、倒计时归零播 gameover、ESC 暂停/恢复播 pause、
 //      被敌人撞中播 hit（经 onEnter 注入的 AudioSystem；降级环境下为安全空操作）
 //   4. 配置：onEnter 时从注入的 Config 读取对局时长、金币数量、
@@ -27,10 +28,10 @@
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
 // 数据成员的默认值就是初始状态（分数 0、倒计时满值）；onEnter 里
-// 把玩家与金币布置到位即可，不需要额外的「重置场景」逻辑
+// 把玩家、金币与敌人对象池布置到位即可，不需要额外的「重置场景」逻辑
 //
 // 状态机（PlayState）：
-//   Playing  ：接受输入、倒计时递减、检测金币碰撞
+//   Playing  ：接受输入、倒计时递减、检测金币/敌人碰撞
 //   Paused   ：世界与倒计时冻结，ESC 恢复、M 回主菜单
 //   GameOver ：世界冻结，等待玩家按 R 重开或按 M 回主菜单
 // ============================================================
@@ -38,7 +39,7 @@
 // 对局状态机：用枚举而不是布尔标志，扩展「暂停」等状态后依然直观
 enum class PlayState
 {
-    Playing,  // 正在游戏：接受输入、倒计时递减、检测金币碰撞
+    Playing,  // 正在游戏：接受输入、倒计时递减、检测金币/敌人碰撞
     Paused,   // 暂停：世界与倒计时冻结，ESC 恢复、M 回主菜单
     GameOver  // 本局结束：世界冻结，等待玩家按 R 重开或按 M 回主菜单
 };
@@ -50,7 +51,7 @@ public:
     ~PlayScene() override;  // 析构释放背景纹理（此时 renderer 尚在，安全）
 
     // 进入场景：保存 renderer 与音效系统、读取配置、加载全部纹理、
-    // 布置玩家与金币
+    // 布置玩家、金币与敌人对象池
     void onEnter(SDL_Renderer* renderer, const Config& config, AudioSystem& audio) override;
 
     // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M
@@ -65,7 +66,7 @@ public:
     void render(float alpha) override;
 
 private:
-    // 重开一局：重置分数、倒计时、玩家位置与全部金币
+    // 重开一局：重置分数、倒计时、玩家位置、全部金币与敌人状态
     void restart();
 
     // 绘制 HUD 文字（分数、倒计时、FPS、暂停叠层、结束界面）
@@ -81,11 +82,20 @@ private:
     static constexpr float kDefaultRoundSeconds = 30.0f; // 默认每局总时长（秒）
     static constexpr int kDefaultCoinCount = 5;          // 默认场上金币数量
 
-    // 丁阶段（敌人）配置项缺省值：与 config/game.ini 的对应键取值一致，
-    // 配置文件缺失时敌人按「5 秒出现 · 110 像素/秒追来 · 撞中扣 5 秒」运行
-    static constexpr float kDefaultEnemySpeed = 110.0f;    // 敌人基础移动速度（像素/秒）
-    static constexpr float kDefaultEnemyFirstSpawn = 5.0f; // 第 1 只敌人的出现时间（局内秒）
-    static constexpr float kDefaultEnemyHitPenalty = 5.0f; // 被敌人撞中的时间惩罚（秒）
+    // 丁阶段（敌人/难度曲线）配置项缺省值：与 config/game.ini 的对应键取值一致，
+    // 配置文件缺失时敌人按「基础 110 像素/秒、每秒 +2.5、5 秒首袭、每 10 秒
+    // 增援、最多 3 只、撞中扣 5 秒」的完整难度曲线运行
+    static constexpr float kDefaultEnemySpeed = 110.0f;          // 敌人基础移动速度（像素/秒）
+    static constexpr float kDefaultEnemySpeedGrowth = 2.5f;      // 敌人速度成长（像素/秒²）
+    static constexpr float kDefaultEnemyFirstSpawn = 5.0f;       // 第 1 只敌人的出现时间（局内秒）
+    static constexpr float kDefaultEnemySpawnInterval = 10.0f;   // 增援间隔（秒）
+    static constexpr int kDefaultEnemyMaxCount = 3;              // 场上敌人数量上限
+    static constexpr float kDefaultEnemyHitPenalty = 5.0f;       // 被敌人撞中的时间惩罚（秒）
+
+    // 敌人速度上限（像素/秒）：不超过玩家默认速度 300，保证玩家永远可以甩开
+    // 追兵（「可逃」是难度曲线的设计红线——速度成长不能把玩家逼进死局）。
+    // 默认参数下约 60 秒到达上限，此后维持 260 不再增长
+    static constexpr float kEnemyMaxSpeed = 260.0f;
 
     // 玩家被撞中后的无敌时长（秒）：期间跳过敌人碰撞检测、渲染每 0.1 秒闪烁。
     // 固定玩法规则（不进配置文件）：0.8 秒足够拉开与击退后敌人的距离
@@ -104,7 +114,8 @@ private:
     SDL_Renderer* m_renderer = nullptr; // onEnter 保存的渲染器（只借用，不持有所有权）
 
     // onEnter 注入的音效系统指针（所有权在 GameDev，受管理期间必然非空）。
-    // 对局用它在三处触发：收币（update）、结束（update）、暂停/恢复（handleEvent）
+    // 对局用它在四处触发：收币（update）、被撞中（update）、结束（update）、
+    // 暂停/恢复（handleEvent）
     AudioSystem* m_audio = nullptr;
 
     // 由 renderer 反查的窗口指针：玩法边界/金币重生需要窗口整数尺寸
@@ -127,9 +138,12 @@ private:
     // ---- 丁阶段：敌人与难度曲线（配置 + 运行时状态） ----
     // 下列配置在 onEnter 时读取（缺键自动回退内置默认值）；R 重开不重读配置，
     // 只复位下面的运行时状态——保证整局沿用同一套调参
-    float m_enemySpeed = kDefaultEnemySpeed;           // 敌人基础速度（像素/秒）
-    float m_enemyFirstSpawn = kDefaultEnemyFirstSpawn; // 第 1 只敌人的出现时间（局内秒）
-    float m_enemyHitPenalty = kDefaultEnemyHitPenalty; // 被撞中的时间惩罚（秒）
+    float m_enemySpeed = kDefaultEnemySpeed;                   // 敌人基础速度（像素/秒）
+    float m_enemySpeedGrowth = kDefaultEnemySpeedGrowth;       // 速度成长（像素/秒²，按局内秒数叠加）
+    float m_enemyFirstSpawn = kDefaultEnemyFirstSpawn;         // 第 1 只敌人的出现时间（局内秒）
+    float m_enemySpawnInterval = kDefaultEnemySpawnInterval;   // 增援间隔（秒）
+    int m_enemyMaxCount = kDefaultEnemyMaxCount;               // 敌人数量上限（同时决定对象池大小）
+    float m_enemyHitPenalty = kDefaultEnemyHitPenalty;         // 被撞中的时间惩罚（秒）
 
     float m_enemyElapsed = 0.0f;       // 局内已过秒数（仅 Playing 递增；难度计时基准）
     float m_enemyNextSpawnTime = 0.0f; // 下一只敌人的出现时刻（局内秒；onEnter 设为首只时间）
