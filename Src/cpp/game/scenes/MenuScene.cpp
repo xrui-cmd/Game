@@ -1,10 +1,9 @@
 #include "game/scenes/MenuScene.h"
 #include "game/scenes/PlayScene.h" // PlayScene：Enter 后要切换过去的对局场景
-#include "engine/DebugText.h"      // DebugText：菜单文字的缩放封装
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
 #include <memory>                  // std::make_unique：构造 PlayScene
-#include <string>                  // std::string：拼接背景素材的绝对路径
+#include <string>                  // std::string：拼接素材与字体的绝对路径
 
 // 析构：释放背景纹理。
 // 关键时机与 PlayScene 相同：SceneManager 先析构旧场景、后销毁 renderer，
@@ -45,6 +44,19 @@ void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/)
     {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
+    }
+
+    // 3) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
+    //    路径拼装模式与背景图一致：以 exe 所在目录为基准。
+    //    标题与提示各加载一份（字号不同）；Font::load 内部会记录失败警告，
+    //    失败后对应文字安全跳过，菜单仍可进入对局，不阻塞游戏流程
+    if (basePath != nullptr)
+    {
+        // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
+        const std::string fontPath = std::string(basePath) + "assets/fonts/SmileySans-Oblique.ttf";
+        // 两个字号彼此独立：一份加载失败不影响另一份
+        m_titleFont.load(fontPath, kTitlePtSize); // 大号标题
+        m_hintFont.load(fontPath, kHintPtSize);   // 提示文字
     }
 }
 
@@ -105,17 +117,15 @@ void MenuScene::render(float /*alpha*/)
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    // 第一行：大号标题（金黄色，与金币呼应）
+    // 第一行：大号标题（金黄色，与金币呼应）。
+    // 保留英文 "COIN RUSH"：品牌名不翻译，中文信息由下面两行承载
     SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
-    DebugText::drawCentered(m_renderer, kTitleScale, screenW / 2.0f, screenH * 0.28f,
-                            "COIN RUSH");
+    m_titleFont.drawCentered(m_renderer, "COIN RUSH", screenW / 2.0f, screenH * 0.28f);
 
-    // 第二行：开始提示（白色）
+    // 第二行：开始提示（白色，UTF-8 中文文案由 TTF 字体渲染）
     SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-    DebugText::drawCentered(m_renderer, kHintScale, screenW / 2.0f, screenH * 0.55f,
-                            "Press ENTER to Start");
+    m_hintFont.drawCentered(m_renderer, "按 Enter 开始", screenW / 2.0f, screenH * 0.55f);
 
-    // 第三行：操作说明（白色小字）
-    DebugText::drawCentered(m_renderer, kHintScale, screenW / 2.0f, screenH * 0.68f,
-                            "WASD Move / ESC Pause");
+    // 第三行：操作说明（白色，与上一行同字号）
+    m_hintFont.drawCentered(m_renderer, "WASD 移动 / ESC 暂停", screenW / 2.0f, screenH * 0.68f);
 }

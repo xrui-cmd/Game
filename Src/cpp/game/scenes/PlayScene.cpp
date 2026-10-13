@@ -1,12 +1,12 @@
 #include "game/scenes/PlayScene.h"
 #include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
-#include "engine/DebugText.h"      // DebugText：HUD 文字的缩放封装
+#include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
 #include "engine/Rect.h"           // rectsOverlap：金币碰撞的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
 #include <algorithm>               // std::max：金币数量下限保护
 #include <memory>                  // std::make_unique：构造 MenuScene
-#include <string>                  // std::string：拼接背景素材的绝对路径
+#include <string>                  // std::string：拼接素材与字体的绝对路径
 
 // 析构：释放背景纹理。
 // 关键时机：SceneManager 先 onExit + 析构旧场景、后销毁 renderer，
@@ -77,6 +77,19 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
     {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
+    }
+
+    // 5) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
+    //    路径拼装模式与背景图一致：以 exe 所在目录为基准。
+    //    HUD 与标题各加载一份（字号不同）；Font::load 内部会记录失败警告，
+    //    失败后对应文字安全跳过，玩法完全不受影响
+    if (basePath != nullptr)
+    {
+        // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
+        const std::string fontPath = std::string(basePath) + "assets/fonts/SmileySans-Oblique.ttf";
+        // 两个字号彼此独立：一份加载失败不影响另一份
+        m_hudFont.load(fontPath, kHudPtSize); // HUD/提示文字
+        m_bigFont.load(fontPath, kBigPtSize); // 暂停/结束标题
     }
 
     // 5) 玩家纹理：三级回退（精灵表 -> 单帧图 -> 程序化纯色）在 Entity 内完成，
@@ -322,9 +335,10 @@ void PlayScene::render(float alpha)
     renderHud();
 }
 
-// 绘制 HUD 文字（分数、倒计时、暂停叠层、结束界面）。统一走 DebugText 封装：
-// 传入屏幕像素坐标，内部完成「缩放 -> 逻辑坐标换算 -> 绘制 -> 恢复缩放」。
-// 使用 SDL3 内置调试字体：每个字符天生是 8x8 的等宽方形点阵
+// 绘制 HUD 文字（分数、倒计时、暂停叠层、结束界面）。
+// 游戏文案统一走 Font（TTF 中文字体）：传入屏幕像素坐标，文字颜色由调用
+// 前的 SDL_SetRenderDrawColor 决定；左下角 FPS 调试行例外，仍用 DebugText
+// （SDL 内置调试字体，仅 ASCII，观感与改造前一致）
 void PlayScene::renderHud()
 {
     // 查询渲染器输出尺寸（物理像素）。HUD 的右上角对齐等定位
@@ -337,29 +351,54 @@ void PlayScene::renderHud()
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
+    // Paused / GameOver 叠层加半透明暗化遮罩：把游戏世界（背景/玩家/金币）
+    // 整体压暗，让叠层文字从画面中浮出来。绘制顺序：遮罩放在最前——
+    // 之后绘制的 FPS 行、分数/时间与叠层文字都压在遮罩之上，保持全亮
+    if (m_state == PlayState::Paused || m_state == PlayState::GameOver)
+    {
+        // 打开混合模式：颜色按 alpha 与画面混合（默认模式会直接覆盖）
+        if (!SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND))
+        {
+            // 设置失败只记录：遮罩退化为不透明填充也在可接受范围
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "设置混合模式失败：%s", SDL_GetError());
+        }
+        SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 140); // 半透明黑：保留世界轮廓
+
+        // 目标矩形传 nullptr：填充整个渲染目标（全屏遮罩）
+        if (!SDL_RenderFillRect(m_renderer, nullptr))
+        {
+            // 绘制失败只记录：遮罩是纯装饰，缺失不影响玩法
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "绘制遮罩失败：%s", SDL_GetError());
+        }
+
+        // 恢复默认混合模式：避免后续绘制（及下一帧世界绘制）被混合模式影响
+        SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE);
+    }
+
     // ---- 左下角：FPS / 帧时间（灰白色小字，F3 控制显隐）----
     // 放在状态分支之前：无论 Playing/Paused/GameOver 都显示，方便对比
-    // 三种状态下渲染性能的差异（数值来自 EMA，会逐帧连续变化）
+    // 三种状态下渲染性能的差异（数值来自 EMA，会逐帧连续变化）。
+    // 这行是调试信息而非游戏 UI 文案，保持 SDL 内置调试字体（ASCII）
     if (m_fpsVisible)
     {
-        // 灰白色：不抢 Score/Time 的视觉焦点
+        // 灰白色：不抢分数/时间的视觉焦点
         SDL_SetRenderDrawColor(m_renderer, 180, 180, 180, 255);
 
-        // 左对齐 x=20（与 Score 同一条左边线）；文字高 = 8 逻辑像素 x
-        // kHudScale = 16 屏幕像素，再留 24 像素底边距 => y = 屏高 - 40
+        // 左对齐 x=20（与分数行同一条左边线）；文字高 = 8 逻辑像素 x
+        // kFpsScale = 16 屏幕像素，再留 24 像素底边距 => y = 屏高 - 40
         const float fpsY = screenH - 40.0f;
 
         if (m_hasFrameSample)
         {
             // FPS 与帧时间同源换算（FPS = 1000 / 毫秒），两者必然自洽
             const float fps = 1000.0f / m_smoothedFrameMs;
-            DebugText::drawFormat(m_renderer, kHudScale, 20.0f, fpsY,
+            DebugText::drawFormat(m_renderer, kFpsScale, 20.0f, fpsY,
                                   "FPS: %.1f | %.1f ms", fps, m_smoothedFrameMs);
         }
         else
         {
             // 首帧还没有有效间隔：显示占位符，下一帧起给出真实数值
-            DebugText::drawFormat(m_renderer, kHudScale, 20.0f, fpsY,
+            DebugText::drawFormat(m_renderer, kFpsScale, 20.0f, fpsY,
                                   "FPS: -- | -- ms");
         }
     }
@@ -368,71 +407,65 @@ void PlayScene::renderHud()
     // 暂停时保留完整 HUD，玩家能看清冻结时刻的分数与剩余时间
     if (m_state == PlayState::Playing || m_state == PlayState::Paused)
     {
-        // 左上角：当前分数（白色文字）。
-        // 旧版逻辑坐标 (10, 10) × 2 倍缩放 = 屏幕 (20, 20)，观感不变
+        // 左上角：当前分数（白色）。位置沿用旧版屏幕坐标 (20, 20)
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        DebugText::drawFormat(m_renderer, kHudScale, 20.0f, 20.0f, "Score: %d", m_score);
+        char scoreText[32]; // 容纳 "分数: " + 最长数字，绰绰有余
+        SDL_snprintf(scoreText, sizeof(scoreText), "分数: %d", m_score);
+        m_hudFont.draw(m_renderer, scoreText, 20.0f, 20.0f);
 
-        // 右上角：剩余时间（黄色文字）。%4.1f 让数字部分恒占 4 个字符，
-        // 于是整串 "Time: xx.x" 恒为 10 字符，宽度可精确算出
+        // 右上角：剩余时间（黄色）。右对齐：先实测文本宽度再反推 x
+        // （中文字体数字宽度不定，不能按字符数估算）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        // 文字宽度：10 字符 × 每字符 8 逻辑像素 × 缩放倍数（换算到屏幕像素）
-        constexpr float timeTextW = 10.0f * 8.0f * kHudScale;
-        DebugText::drawFormat(m_renderer, kHudScale, screenW - timeTextW - 20.0f, 20.0f,
-                              "Time: %4.1f", m_timeLeft);
+        char timeText[32]; // 容纳 "时间: " + "xx.x"，绰绰有余
+        SDL_snprintf(timeText, sizeof(timeText), "时间: %.1f", m_timeLeft);
+        const SDL_FPoint timeSize = m_hudFont.measure(timeText); // 实测文本尺寸
+        m_hudFont.draw(m_renderer, timeText, screenW - timeSize.x - 20.0f, 20.0f);
     }
 
     if (m_state == PlayState::Paused)
     {
-        // 暂停叠层：大号 PAUSED + 两条操作提示。
+        // 暂停叠层：大号「暂停」+ 两条操作提示。
         // 世界画面保持冻结在叠层之下（update 不推进，render 每帧重画同一画面）
 
         // 水平中心：叠层文字共用的对齐基准
         const float screenCenterX = screenW / 2.0f;
 
-        // 大号 PAUSED（黄色，kPauseTitleScale 倍缩放，强调暂停状态）
+        // 大号「暂停」（黄色，kBigPtSize 字号，强调暂停状态）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        DebugText::drawCentered(m_renderer, kPauseTitleScale, screenCenterX, screenH * 0.42f,
-                                "PAUSED");
+        m_bigFont.drawCentered(m_renderer, "暂停", screenCenterX, screenH * 0.38f);
 
-        // 恢复提示（白色，常规 HUD 尺寸）
+        // 恢复提示（白色，常规 HUD 字号）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH * 0.56f,
-                                "Press ESC to Resume");
+        m_hudFont.drawCentered(m_renderer, "按 ESC 继续", screenCenterX, screenH * 0.56f);
 
-        // 回菜单提示（白色，常规 HUD 尺寸）
-        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH * 0.66f,
-                                "Press M for Menu");
+        // 回菜单提示（白色，常规 HUD 字号）
+        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH * 0.66f);
     }
     else if (m_state == PlayState::GameOver)
     {
         // GameOver 界面：四行文字全部水平居中、围绕窗口中心排布。
-        // 纵向间距沿用旧版：30 逻辑像素 × 2 倍缩放 = 60 屏幕像素
+        // 标题行用大字号（kBigPtSize），行距据此重新排布
 
         // 水平中心：四行文字共用的对齐基准（垂直位置逐行下移）
         const float screenCenterX = screenW / 2.0f;
 
-        // 第一行：GAME OVER（白色）。"GAME OVER" 共 9 个字符
+        // 第一行：游戏结束（白色大号标题）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH / 2.0f - 60.0f,
-                                "GAME OVER");
+        m_bigFont.drawCentered(m_renderer, "游戏结束", screenCenterX, screenH / 2.0f - 110.0f);
 
         // 第二行：最终得分（黄色）。分数位数不定，先格式化到缓冲区，
-        // 由 drawCentered 按实际字符数算宽度实现居中
+        // 由 drawCentered 实测宽度实现居中
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        char scoreText[32]; // 容纳 "Final Score: " + 最长数字，绰绰有余
-        SDL_snprintf(scoreText, sizeof(scoreText), "Final Score: %d", m_score);
-        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH / 2.0f, scoreText);
+        char scoreText[32]; // 容纳 "最终分数: " + 最长数字，绰绰有余
+        SDL_snprintf(scoreText, sizeof(scoreText), "最终分数: %d", m_score);
+        m_hudFont.drawCentered(m_renderer, scoreText, screenCenterX, screenH / 2.0f - 10.0f);
 
-        // 第三行：重开提示（白色）。"Press R to Restart" 共 17 个字符
+        // 第三行：重开提示（白色）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH / 2.0f + 60.0f,
-                                "Press R to Restart");
+        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 60.0f);
 
         // 第四行：回菜单提示（白色）。行距与上一行保持一致
-        // （30 逻辑像素 × 2 倍缩放 = 60 屏幕像素）
-        DebugText::drawCentered(m_renderer, kHudScale, screenCenterX, screenH / 2.0f + 120.0f,
-                                "Press M for Menu");
+        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 120.0f);
     }
 }
 

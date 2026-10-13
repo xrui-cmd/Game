@@ -1,7 +1,8 @@
 #include "GameDev.h"
-#include "game/scenes/MenuScene.h" // 初始场景：主菜单（Enter 进入对局）
-#include <memory>                  // std::make_unique：构造场景管理器与场景
-#include <string>                  // std::string：拼接配置文件的绝对路径
+#include "game/scenes/MenuScene.h"  // 初始场景：主菜单（Enter 进入对局）
+#include <SDL3_ttf/SDL_ttf.h>       // TTF_Init / TTF_Quit：SDL3_ttf 库级生命周期
+#include <memory>                   // std::make_unique：构造场景管理器与场景
+#include <string>                   // std::string：拼接配置文件的绝对路径
 
 // GameDev 离开作用域时自动释放 SDL 资源。
 // main() 不需要手动调用 shutdown()。
@@ -18,6 +19,15 @@ GameError GameDev::initialize()
         // SDL_LogError 由 SDL 统一处理输出（默认写入 stderr）
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "SDL 初始化失败：%s", SDL_GetError());
         return GameError::SdlInitFailed;
+    }
+
+    // 初始化 SDL3_ttf 库（字形栅格化/文本渲染的全局状态）。
+    // 它是引用计数的：这里成功调用一次，shutdown 时配对 TTF_Quit 一次。
+    // 失败不中止启动——UI 文本会整体降级为「安全跳过」（Font::load 失败并警告），
+    // 游戏逻辑照常可玩，符合本项目「资源缺失不崩」的一贯策略
+    if (!TTF_Init())
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "TTF 初始化失败：%s", SDL_GetError());
     }
 
     // 加载配置（可选步骤）：路径沿用 assets 的模式——以 exe 所在目录为基准，
@@ -38,9 +48,10 @@ GameError GameDev::initialize()
     const int windowWidth = m_config.getInt("window_width", kDefaultWindowWidth);
     const int windowHeight = m_config.getInt("window_height", kDefaultWindowHeight);
 
-    // 窗口由 GameDev 持有：主循环每帧查询它的尺寸装配视口信息
+    // 窗口由 GameDev 持有：主循环每帧查询它的尺寸装配视口信息。
+    // 标题用 UTF-8 中英混排（源码按 /utf-8 编译，SDL 接受 UTF-8 字符串）
     m_window = SDL_CreateWindow(
-        "GameDev",
+        "COIN RUSH 金币冲刺",
         windowWidth,
         windowHeight,
         0
@@ -248,6 +259,10 @@ void GameDev::shutdown()
         SDL_DestroyWindow(m_window);
         m_window = nullptr;
     }
+
+    // SDL3_ttf 的库级收尾：此时所有 Font 对象已随场景析构释放（TTF_CloseFont
+    // 均已完成），TTF_Quit 释放字体渲染的全局资源，与 initialize 的 TTF_Init 配对
+    TTF_Quit();
 
     SDL_Quit();
 }

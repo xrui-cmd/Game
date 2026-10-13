@@ -2,6 +2,7 @@
 #define __PLAYSCENE_H__
 
 #include "engine/Scene.h" // Scene：场景基类
+#include "engine/Font.h"  // Font：TTF 字体资源（HUD/叠层文字，支持中文）
 #include "game/Player.h"  // Player：玩家实体
 #include "game/Coin.h"    // Coin：金币实体
 #include <vector>         // std::vector：金币集合
@@ -75,8 +76,12 @@ private:
     static constexpr float kDefaultRoundSeconds = 30.0f; // 默认每局总时长（秒）
     static constexpr int kDefaultCoinCount = 5;          // 默认场上金币数量
 
-    static constexpr float kHudScale = 2.0f;        // HUD 文字放大倍数（8x8 字模太小）
-    static constexpr float kPauseTitleScale = 4.0f; // 暂停标题 (PAUSED) 放大倍数
+    static constexpr float kHudPtSize = 32.0f; // HUD/提示文字字号（像素高，小数需求清晰）
+    static constexpr float kBigPtSize = 64.0f; // 暂停/结束标题字号（大号观感）
+
+    // FPS 调试行专用：仍走 SDL 内置调试字体（8x8 点阵，仅 ASCII），
+    // 缩放 2 倍 => 16 屏幕像素高，与改造前的调试行观感完全一致
+    static constexpr float kFpsScale = 2.0f;
 
     SDL_Renderer* m_renderer = nullptr; // onEnter 保存的渲染器（只借用，不持有所有权）
 
@@ -87,6 +92,10 @@ private:
     // 背景纹理：加载失败时为 nullptr，render 阶段会跳过，
     // 露出清屏深蓝色兜底（背景不是游戏必需品，加载失败不阻塞启动）
     SDL_Texture* m_background = nullptr;
+
+    // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
+    Font m_hudFont; // HUD/提示文字（分数、时间、操作提示、GameOver 列表）
+    Font m_bigFont; // 大号标题（暂停 / 游戏结束）
 
     Player m_player;           // 玩家实体
     std::vector<Coin> m_coins; // 场上同时存在的金币集合
