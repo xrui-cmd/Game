@@ -38,6 +38,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
     //      round_seconds       本局时长（秒）
     //      coin_count          金币数量
     //      player_speed        玩家移动速度（像素/秒）
+    //      player_accel        玩家加速度（像素/秒²）
+    //      player_friction     玩家摩擦减速度（像素/秒²）
     //      player_anim_interval 玩家行走动画每帧时长（秒）
     //      coin_anim_interval  金币旋转动画每帧时长（秒）
     m_roundSeconds = config.getFloat("round_seconds", kDefaultRoundSeconds);
@@ -47,9 +49,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
     // 所以先用 std::max 夹到 0 以上；0 枚金币（空场）是允许的合法配置
     const int coinCount = std::max(0, config.getInt("coin_count", kDefaultCoinCount));
 
-    // 玩家与金币的动画节奏、玩家速度：先读出配置值（默认值与 Player/Coin
-    // 各自的默认常量一致），等到相应实体 load 完成后再注入（原因见下）
+    // 玩家与金币的动画节奏、玩家速度与加减速：先读出配置值（默认值与
+    // Player/Coin 各自的默认常量一致），等到相应实体 load 完成后再注入
     const float playerSpeed = config.getFloat("player_speed", Player::kDefaultSpeed);
+    const float playerAccel = config.getFloat("player_accel", Player::kDefaultAccel);
+    const float playerFriction = config.getFloat("player_friction", Player::kDefaultFriction);
     const float playerAnimInterval =
         config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
     const float coinAnimInterval = config.getFloat("coin_anim_interval", Coin::kDefaultFrameTime);
@@ -83,10 +87,12 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
-    // 6) 注入玩家配置：速度与行走动画节奏。
+    // 6) 注入玩家配置：速度、加减速与行走动画节奏。
     //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
-    //    配置值晚一步落定才能覆盖它（setFrameTime 对非正值会忽略并警告）
+    //    配置值晚一步落定才能覆盖它（setFrameTime 对非正值会忽略并警告；
+    //    setMotion 对负值整组忽略，0 合法）
     m_player.setSpeed(playerSpeed);
+    m_player.setMotion(playerAccel, playerFriction);
     m_player.setFrameTime(playerAnimInterval);
 
     // 7) 查询窗口实际尺寸并缓存：金币出生和后续边界计算都基于它
