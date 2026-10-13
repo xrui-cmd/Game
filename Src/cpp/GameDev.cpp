@@ -153,15 +153,22 @@ void GameDev::update()
         return;
     }
 
-    const bool* keyboard = SDL_GetKeyboardState(nullptr);
-
     // 每帧查询窗口实际尺寸并缓存：玩家边界、金币重生范围都基于它，
     // 窗口尺寸一旦变化，逻辑也能自动跟随
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
-    // 把窗口实际尺寸传给玩家：update 内部据此计算移动边界（不硬编码）
-    m_player.update(m_deltaTime, keyboard,
-                    static_cast<float>(m_width), static_cast<float>(m_height));
+    // 装配本帧的「世界上下文」：一次构造，玩家与全部金币共享。
+    // deltaTime 是本帧真实流逝秒数；keyboard 是 SDL 键盘状态数组；
+    // 视口宽高取自刚查询的窗口实际尺寸（窗口尺寸无关性保持不变）
+    const UpdateContext ctx{
+        m_deltaTime,                   // 距上一帧的真实流逝秒数（动画/倒计时基准）
+        SDL_GetKeyboardState(nullptr), // SDL 键盘状态数组（WASD 轮询用）
+        static_cast<float>(m_width),   // 视口宽：移动边界 / 重生范围的计算基准
+        static_cast<float>(m_height)   // 视口高
+    };
+
+    // 玩家使用上下文更新：内部按 ctx.keyboard 移动、按 ctx.viewport* 做边界 clamp
+    m_player.update(ctx);
 
     // 玩家矩形只取一次：本帧所有金币都对它做碰撞检测
     const SDL_FRect playerRect = m_player.rect();
@@ -169,8 +176,9 @@ void GameDev::update()
     // 逐个检测金币与玩家是否重叠：重叠即视为"收集成功"
     for (Coin& coin : m_coins)
     {
-        // 推进本枚金币的旋转动画（纯画面表现，不影响 24x24 碰撞盒）
-        coin.update(m_deltaTime);
+        // 推进本枚金币的旋转动画（纯画面表现，不影响 24x24 碰撞盒）。
+        // 走的是 Entity 默认 update：无条件累加动画时间轴，与改造前一致
+        coin.update(ctx);
 
         // AABB 相交检测；返回 true 说明玩家和这枚金币碰到了
         if (rectsOverlap(playerRect, coin.rect()))
