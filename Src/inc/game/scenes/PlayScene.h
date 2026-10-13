@@ -13,9 +13,11 @@
 // 职责：
 //   1. 资源：在 onEnter 加载背景图（可选，失败兜底）、玩家与金币纹理；
 //      析构时释放背景纹理（玩家/金币纹理由各自 Entity 析构兜底）
-//   2. 玩法：WASD 移动、金币碰撞计分、30 秒倒计时、ESC 暂停/恢复、
+//   2. 玩法：WASD 移动、金币碰撞计分、倒计时、ESC 暂停/恢复、
 //      R 重开、M 回主菜单
-//   3. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层
+//   3. 配置：onEnter 时从注入的 Config 读取对局时长、金币数量、
+//      玩家速度与动画节奏；缺键/坏值自动回退内置默认值
+//   4. 渲染：背景 -> 玩家 -> 金币 -> HUD 文字叠层
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
 // 数据成员的默认值就是初始状态（分数 0、倒计时满值）；onEnter 里
@@ -41,8 +43,8 @@ public:
     PlayScene() = default; // 成员默认值即初始局面，无需自定义构造
     ~PlayScene() override;  // 析构释放背景纹理（此时 renderer 尚在，安全）
 
-    // 进入场景：保存 renderer、加载全部纹理、布置玩家与金币
-    void onEnter(SDL_Renderer* renderer) override;
+    // 进入场景：保存 renderer、读取配置、加载全部纹理、布置玩家与金币
+    void onEnter(SDL_Renderer* renderer, const Config& config) override;
 
     // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M 回主菜单
     void handleEvent(const SDL_Event& event) override;
@@ -61,10 +63,13 @@ private:
     void renderHud();
 
 private:
-    static constexpr float kRoundSeconds = 30.0f;   // 每局总时长（秒）
+    // 配置项缺省值：与改造前的硬编码常量逐一相同。
+    // 配置文件缺失或对应键缺失时回退到它们，行为与改造前完全一致
+    static constexpr float kDefaultRoundSeconds = 30.0f; // 默认每局总时长（秒）
+    static constexpr int kDefaultCoinCount = 5;          // 默认场上金币数量
+
     static constexpr float kHudScale = 2.0f;        // HUD 文字放大倍数（8x8 字模太小）
     static constexpr float kPauseTitleScale = 4.0f; // 暂停标题 (PAUSED) 放大倍数
-    static constexpr int kCoinCount = 5;            // 场上金币数量（学习项目固定小数量）
 
     SDL_Renderer* m_renderer = nullptr; // onEnter 保存的渲染器（只借用，不持有所有权）
 
@@ -79,7 +84,12 @@ private:
     Player m_player;           // 玩家实体
     std::vector<Coin> m_coins; // 场上同时存在的金币集合
     int m_score = 0;           // 已收集的金币总数（跨帧累计）
-    float m_timeLeft = kRoundSeconds; // 本局剩余秒数（仅 Playing 状态递减）
+
+    // 本局总时长（秒）：onEnter 时由配置 round_seconds 覆盖默认值。
+    // 按 R 重开时用它重置倒计时，保证整局时长一致
+    float m_roundSeconds = kDefaultRoundSeconds;
+
+    float m_timeLeft = kDefaultRoundSeconds; // 本局剩余秒数（仅 Playing 状态递减）
 
     PlayState m_state = PlayState::Playing; // 当前对局状态
 

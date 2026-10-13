@@ -1,6 +1,7 @@
 #include "GameDev.h"
 #include "game/scenes/MenuScene.h" // 初始场景：主菜单（Enter 进入对局）
 #include <memory>                  // std::make_unique：构造场景管理器与场景
+#include <string>                  // std::string：拼接配置文件的绝对路径
 
 // GameDev 离开作用域时自动释放 SDL 资源。
 // main() 不需要手动调用 shutdown()。
@@ -19,11 +20,29 @@ GameError GameDev::initialize()
         return GameError::SdlInitFailed;
     }
 
+    // 加载配置（可选步骤）：路径沿用 assets 的模式——以 exe 所在目录为基准，
+    // 拼接 <exe目录>/config/game.ini。文件缺失/损坏都不致命：loadFromFile
+    // 已记录警告，getInt/getFloat 会各自回退内置默认值，游戏照常运行
+    const char* basePath = SDL_GetBasePath();
+    if (basePath != nullptr)
+    {
+        // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
+        const std::string configPath = std::string(basePath) + "config/game.ini";
+        // 返回值刻意不判断「失败即中止」：加载失败是允许的降级路径
+        m_config.loadFromFile(configPath);
+    }
+
+    // 窗口尺寸由配置决定（window_width / window_height，默认 1280x720）：
+    // 改配置后重启即生效。极端非法尺寸（如 0）由 SDL_CreateWindow 的
+    // 失败路径兜底，不会崩溃，只是初始化报错退出
+    const int windowWidth = m_config.getInt("window_width", kDefaultWindowWidth);
+    const int windowHeight = m_config.getInt("window_height", kDefaultWindowHeight);
+
     // 窗口由 GameDev 持有：主循环每帧查询它的尺寸装配视口信息
     m_window = SDL_CreateWindow(
         "GameDev",
-        1280,
-        720,
+        windowWidth,
+        windowHeight,
         0
     );
 
@@ -42,9 +61,9 @@ GameError GameDev::initialize()
         return GameError::RendererCreationFailed;
     }
 
-    // 场景管理器绑定 renderer：之后每次切换，新场景的 onEnter
-    // 都能立即拿到它加载纹理资源
-    m_sceneManager = std::make_unique<SceneManager>(m_renderer);
+    // 场景管理器绑定 renderer 与配置：之后每次切换，新场景的 onEnter
+    // 都能立即拿到它们加载纹理资源、读取配置数值
+    m_sceneManager = std::make_unique<SceneManager>(m_renderer, m_config);
 
     // 初始场景：主菜单（按 Enter 进入对局；从菜单开局 = 每次全新一局）
     m_sceneManager->requestScene(std::make_unique<MenuScene>());

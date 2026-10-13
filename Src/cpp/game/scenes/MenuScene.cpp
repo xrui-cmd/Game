@@ -19,8 +19,9 @@ MenuScene::~MenuScene()
     }
 }
 
-// 进入场景：保存 renderer、加载背景图
-void MenuScene::onEnter(SDL_Renderer* renderer)
+// 进入场景：保存 renderer、加载背景图。
+// config 由 SceneManager 注入，本阶段菜单没有可配置项，参数暂不使用
+void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/)
 {
     // 1) 保存 renderer：后续渲染与资源加载都用它（只借用，不负责销毁）
     m_renderer = renderer;

@@ -9,11 +9,26 @@ bool Player::load(SDL_Renderer* renderer)
     //   2. assets/player.png 单帧精灵（动画退化为静止）
     //   3. 程序化 50x50 绿色方块（素材缺失时兜底）
     return loadTextureWithFallback(renderer,
-                                   "assets/player_sheet.png",  // 首选：行走精灵表相对路径
-                                   "assets/player.png",        // 次选：单帧精灵相对路径
-                                   kFrameCount,                // 精灵表帧数：2 帧
-                                   kFrameTime,                 // 每帧时长：0.15 秒
-                                   SDL_Color{0, 255, 0, 255}); // 回退颜色：不透明绿色
+                                   "assets/player_sheet.png",      // 首选：行走精灵表相对路径
+                                   "assets/player.png",            // 次选：单帧精灵相对路径
+                                   kFrameCount,                    // 精灵表帧数：2 帧
+                                   kDefaultFrameTime,              // 每帧时长：默认 0.15 秒
+                                   SDL_Color{0, 255, 0, 255});     // 回退颜色：不透明绿色
+}
+
+// 设置移动速度：配置驱动的速度入口（对应 player_speed 配置项）
+void Player::setSpeed(float speed)
+{
+    // 负数速度会让 WASD 四方向整体反转，属于明显的配置错误：
+    // 记录警告并忽略，保留原速度继续游戏；0 允许（玩家静止，可能是有意为之）
+    if (speed < 0.0f)
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "玩家速度不能为负数（收到 %f），忽略该配置", speed);
+        return;
+    }
+
+    m_speed = speed; // 覆盖移动速度：下一次 update 的位移计算立即使用新值
 }
 
 // 覆写更新：移动 + 行走动画。与改造前行为完全一致：

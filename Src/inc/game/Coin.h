@@ -19,7 +19,8 @@
 //      首选 assets/coin_sheet.png 旋转精灵表（6 帧横向排列），持续播动画；
 //      次选 assets/coin.png 单帧静态精灵（旧版素材，动画退化为静止）；
 //      回退为程序化 24x24 黄色方块（素材缺失时兜底，保证游戏可运行）
-//   2. 动画节奏：6 帧循环、每帧 0.12 秒（约 8.3 帧/秒），与渲染帧率解耦
+//   2. 动画节奏：6 帧循环、默认每帧 0.12 秒（约 8.3 帧/秒，可由配置覆盖），
+//      与渲染帧率解耦
 //   3. 生命周期：load() 创建纹理 ——> update() 推进动画（继承基类默认）
 //      ——> render()/rect() 使用 ——> release() 释放（shutdown 与析构都会兜底）
 // ============================================================
@@ -27,6 +28,10 @@
 class Coin : public Entity
 {
 public:
+    // 配置项缺省值：与改造前的硬编码常量一致。
+    // PlayScene 读取 coin_anim_interval 时以它作为回退
+    static constexpr float kDefaultFrameTime = 0.12f; // 默认每帧显示时长（秒）
+
     // 构造：固定金币尺寸为 24x24（正方形，也是精灵表的单帧尺寸）
     Coin()
     {
@@ -47,8 +52,7 @@ private:
     static constexpr float kSpawnMargin = 40.0f; // 翻新位置与窗口边缘保留的边距
     static constexpr int kMaxTries = 20;         // 重生时「避开玩家」的最大重试次数
 
-    static constexpr int kFrameCount = 6;      // 旋转精灵表总帧数（6 帧 x 24px = 144px 宽）
-    static constexpr float kFrameTime = 0.12f; // 每帧显示时长（秒），约 8.3 帧/秒
+    static constexpr int kFrameCount = 6; // 旋转精灵表总帧数（6 帧 x 24px = 144px 宽）
 };
 
 #endif // !__COIN_H__

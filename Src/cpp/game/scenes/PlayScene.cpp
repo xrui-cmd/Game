@@ -4,6 +4,7 @@
 #include "engine/Rect.h"           // rectsOverlap：金币碰撞的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
+#include <algorithm>               // std::max：金币数量下限保护
 #include <memory>                  // std::make_unique：构造 MenuScene
 #include <string>                  // std::string：拼接背景素材的绝对路径
 
@@ -21,9 +22,9 @@ PlayScene::~PlayScene()
     }
 }
 
-// 进入场景：保存 renderer、加载资源、布置初始局面。
+// 进入场景：保存 renderer、读取配置、加载资源、布置初始局面。
 // 每次进入都是新构造的 PlayScene 对象 => 天然是「全新一局」
-void PlayScene::onEnter(SDL_Renderer* renderer)
+void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config)
 {
     // 1) 保存 renderer：后续每帧渲染、资源加载都用它（只借用，不负责销毁）
     m_renderer = renderer;
@@ -31,10 +32,32 @@ void PlayScene::onEnter(SDL_Renderer* renderer)
     // 2) 由 renderer 反查窗口：玩法边界/金币重生需要窗口整数尺寸
     m_window = SDL_GetRenderWindow(renderer);
 
+    // 3) 读取本场景相关的配置项。getFloat/getInt 在缺键或值非法时会记录
+    //    警告并回退到内置默认值（与改造前的常量逐一相同），因此没有
+    //    config/game.ini 时行为与改造前完全一致：
+    //      round_seconds       本局时长（秒）
+    //      coin_count          金币数量
+    //      player_speed        玩家移动速度（像素/秒）
+    //      player_anim_interval 玩家行走动画每帧时长（秒）
+    //      coin_anim_interval  金币旋转动画每帧时长（秒）
+    m_roundSeconds = config.getFloat("round_seconds", kDefaultRoundSeconds);
+    m_timeLeft = m_roundSeconds; // 首局倒计时从满值开始（与按 R 重开保持一致）
+
+    // 负数金币数会被 resize 当作巨大的长度值（size_t 回绕）引发异常，
+    // 所以先用 std::max 夹到 0 以上；0 枚金币（空场）是允许的合法配置
+    const int coinCount = std::max(0, config.getInt("coin_count", kDefaultCoinCount));
+
+    // 玩家与金币的动画节奏、玩家速度：先读出配置值（默认值与 Player/Coin
+    // 各自的默认常量一致），等到相应实体 load 完成后再注入（原因见下）
+    const float playerSpeed = config.getFloat("player_speed", Player::kDefaultSpeed);
+    const float playerAnimInterval =
+        config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
+    const float coinAnimInterval = config.getFloat("coin_anim_interval", Coin::kDefaultFrameTime);
+
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
 
-    // 3) 加载背景图（可选资源）：拼出 <exe目录>/assets/background.png 交给 SDL3_image 解码。
+    // 4) 加载背景图（可选资源）：拼出 <exe目录>/assets/background.png 交给 SDL3_image 解码。
     //    背景不是游戏必需品——加载失败只记录警告并继续；渲染阶段会整块跳过背景，
     //    露出清屏深蓝色兜底，玩法完全不受影响
     const char* basePath = SDL_GetBasePath();
@@ -52,7 +75,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer)
                     "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
     }
 
-    // 4) 玩家纹理：三级回退（精灵表 -> 单帧图 -> 程序化纯色）在 Entity 内完成，
+    // 5) 玩家纹理：三级回退（精灵表 -> 单帧图 -> 程序化纯色）在 Entity 内完成，
     //    这里失败只可能是最后的程序化兜底也失败（内存不足等极端情况）
     if (!m_player.load(m_renderer))
     {
@@ -60,16 +83,22 @@ void PlayScene::onEnter(SDL_Renderer* renderer)
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
-    // 5) 查询窗口实际尺寸并缓存：金币出生和后续边界计算都基于它
+    // 6) 注入玩家配置：速度与行走动画节奏。
+    //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
+    //    配置值晚一步落定才能覆盖它（setFrameTime 对非正值会忽略并警告）
+    m_player.setSpeed(playerSpeed);
+    m_player.setFrameTime(playerAnimInterval);
+
+    // 7) 查询窗口实际尺寸并缓存：金币出生和后续边界计算都基于它
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
-    // 6) 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
+    // 8) 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
     //    每次进入 PlayScene 都从这里开始 => 与「按 R 重开」的初始状态一致
     m_player.reset(m_width / 2.0f - m_player.width() / 2.0f,
                    m_height / 2.0f - m_player.height() / 2.0f);
 
-    // 7) 预创建全部金币对象；resize 按 kCoinCount 构造对象，此时纹理还是空的
-    m_coins.resize(kCoinCount);
+    // 9) 预创建全部金币对象；resize 按配置数量（默认 5）构造对象，此时纹理还是空的
+    m_coins.resize(static_cast<size_t>(coinCount));
 
     // 玩家当前矩形：金币出生点尽量避开玩家所站的位置
     const SDL_FRect playerRect = m_player.rect();
@@ -81,6 +110,9 @@ void PlayScene::onEnter(SDL_Renderer* renderer)
         {
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建金币纹理失败：%s", SDL_GetError());
         }
+
+        // 注入金币动画节奏（同样在 load 之后，覆盖内置默认帧时长）
+        coin.setFrameTime(coinAnimInterval);
 
         // 立即给一个随机出生点，避免所有金币叠在 (0,0)
         coin.respawn(m_width, m_height, playerRect);
@@ -186,9 +218,9 @@ void PlayScene::update(const UpdateContext& ctx)
 // 重开一局：把整局相关的数据全部恢复到初始状态
 void PlayScene::restart()
 {
-    // 分数清零，倒计时回到满值
+    // 分数清零，倒计时回到满值（局时长用 onEnter 时读到的配置值）
     m_score = 0;
-    m_timeLeft = kRoundSeconds;
+    m_timeLeft = m_roundSeconds;
 
     // 刷新窗口实际尺寸缓存：重开时窗口可能已被调整过大小
     SDL_GetWindowSize(m_window, &m_width, &m_height);

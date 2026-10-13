@@ -68,3 +68,12 @@ add_custom_command(TARGET GameDev POST_BUILD
     "${CMAKE_CURRENT_SOURCE_DIR}/assets"
     "$<TARGET_FILE_DIR:GameDev>/assets"
 )
+
+# 运行时把 config/ 配置目录复制到 GameDev.exe 所在目录（与 assets 拷贝并列）。
+# 这样 exe 以 SDL_GetBasePath() 为基准读取 config/game.ini：改完配置重启即生效；
+# 即使整个目录被删掉，游戏也会回退到内置默认值继续运行，不会崩溃
+add_custom_command(TARGET GameDev POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/config"
+    "$<TARGET_FILE_DIR:GameDev>/config"
+)

@@ -13,7 +13,7 @@ bool Coin::load(SDL_Renderer* renderer)
                                    "assets/coin_sheet.png",      // 首选：旋转精灵表相对路径
                                    "assets/coin.png",            // 次选：单帧精灵相对路径
                                    kFrameCount,                  // 精灵表帧数：6 帧
-                                   kFrameTime,                   // 每帧时长：0.12 秒
+                                   kDefaultFrameTime,            // 每帧时长：默认 0.12 秒
                                    SDL_Color{255, 255, 0, 255}); // 回退颜色：不透明黄色
 }
 

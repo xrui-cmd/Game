@@ -24,8 +24,9 @@ public:
     MenuScene() = default; // 无初始状态，默认构造即可
     ~MenuScene() override;  // 析构释放背景纹理（此时 renderer 尚在，安全）
 
-    // 进入场景：保存 renderer、加载背景图
-    void onEnter(SDL_Renderer* renderer) override;
+    // 进入场景：保存 renderer、加载背景图。
+    // config 本阶段没有菜单可调项，签名与基类保持一致（暂不使用）
+    void onEnter(SDL_Renderer* renderer, const Config& /*config*/) override;
 
     // 事件：按 Enter 请求进入对局
     void handleEvent(const SDL_Event& event) override;
