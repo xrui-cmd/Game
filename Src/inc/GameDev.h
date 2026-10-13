@@ -1,76 +1,55 @@
-﻿// GameDev.h: 标准系统包含文件的包含文件
-// 或项目特定的包含文件。
+﻿// GameDev.h: 应用外壳——SDL 生命周期 + 主循环 + 场景转发
 
 #ifndef __GAMEDEV_H__
 #define __GAMEDEV_H__
 
+#include <SDL3/SDL.h>             // SDL_Window / SDL_Renderer / SDL_Event：外壳的基础类型
+#include <memory>                 // std::unique_ptr：SceneManager 的所有权管理
+#include "ErrorCode.h"            // GameError：初始化/渲染失败的返回码
+#include "engine/SceneManager.h"  // SceneManager：当前场景的管理与转发
 
-#include <SDL3/SDL.h>
-#include <vector>
-#include "ErrorCode.h"
-#include "game/Player.h"
-#include "game/Coin.h"
-
-
-// 游戏状态机：把"进行中"和"本局结束"两个阶段显式区分开。
-// 用枚举而不是一个 bool 标志，之后要扩展"暂停/开始菜单"等状态会更方便。
-enum class GameState
-{
-    Playing,  // 正在游戏：接受输入、倒计时递减、检测金币碰撞
-    GameOver  // 本局结束：世界冻结，等待玩家按 R 重新开始
-};
-
+// ============================================================
+// GameDev：应用外壳
+// ============================================================
+//
+// 职责边界（本次改造起）：
+//   - 持有窗口/渲染器，完成 SDL 初始化与销毁（原有职责保留）
+//   - 主循环：算 delta -> 事件（QUIT 在应用层处理）-> 转发给场景
+//     -> 帧末结算场景切换
+//   - 不再包含任何具体玩法（玩家/金币/计分/菜单/暂停均已迁入场景）
+//
+// 场景切换由 SceneManager 延迟结算；shutdown 时先 clear() 场景
+// （纹理先于 renderer 释放），再按 Renderer -> Window -> SDL_Quit 逆序销毁
+// ============================================================
 
 class GameDev
 {
 public:
-    GameDev() = default;
-    ~GameDev();
+    GameDev() = default; // 资源初始状态由成员默认值表达（全部为空）
+    ~GameDev();          // 析构兜底调用 shutdown，main 不需要手动收尾
 
+    // 初始化 SDL、窗口、渲染器，并进入初始场景
     GameError initialize();
+
+    // 主循环：跑帧直到 QUIT 或渲染致命错误
     GameError run();
 
 private:
-    void processEvents();
-    void update();
-    GameError render();
-    void renderHud(); // 绘制 HUD 文字（分数、倒计时、结束界面）
-    void restart();   // 重开一局：重置分数、倒计时、玩家位置与全部金币
-    void shutdown();
+    void processEvents(); // 取出全部事件：QUIT 置停，其余转发给场景
+    void update();        // 装配 UpdateContext（delta/键盘/视口）并转发
+    GameError render();   // 转发场景绘制 + 提交画面
+    void shutdown();      // 逆序释放：场景 -> renderer -> window -> SDL_Quit
 
 private:
-    static constexpr float kRoundSeconds = 30.0f; // 每局总时长（秒）
-    static constexpr float kHudScale = 2.0f;      // HUD 文字放大倍数（8x8 字模太小）
+    SDL_Window* m_window = nullptr;     // 窗口：主循环尺寸查询用（本类创建/销毁）
+    SDL_Renderer* m_renderer = nullptr; // 渲染器：依赖窗口，创建顺序在窗口之后
 
-    SDL_Window* m_window = nullptr;
-    SDL_Renderer* m_renderer = nullptr;
+    // 场景管理器：在 renderer 创建成功后构造（场景 onEnter 需要 renderer）
+    std::unique_ptr<SceneManager> m_sceneManager;
 
-    // 背景纹理：铺底的最底层画面。加载失败时为 nullptr，render 阶段会跳过，
-    // 露出清屏深蓝色兜底（背景不是游戏必需品，加载失败不阻塞启动）
-    SDL_Texture* m_background = nullptr;
-
-    bool m_running = false;
-    float m_deltaTime = 0.0f;
-    Uint64 m_lastTime = 0;
-    Player m_player;
-
-    // 窗口实际尺寸（由 SDL_GetWindowSize 查询得到）：
-    // 玩家移动边界、金币重生范围、重开时归位都基于它计算，不再硬编码 1280x720
-    int m_width = 0;
-    int m_height = 0;
-
-    // 场上同时存在的金币集合；数量固定为 kCoinCount 个
-    std::vector<Coin> m_coins;
-    static constexpr int kCoinCount = 5; // 金币数量（学习项目先用固定小数量）
-    int m_score = 0;                     // 已收集的金币总数（跨帧累计）
-
-    GameState m_state = GameState::Playing; // 当前游戏状态
-    float m_timeLeft = kRoundSeconds;       // 本局剩余秒数（仅 Playing 状态递减）
+    bool m_running = false;   // 主循环开关：收到 QUIT 事件置 false
+    float m_deltaTime = 0.0f; // 本帧真实流逝秒数（主循环每帧计算）
+    Uint64 m_lastTime = 0;    // 上一帧的时间戳（性能计数器读数）
 };
 
 #endif // !__GAMEDEV_H__
-
-
-
-
-
