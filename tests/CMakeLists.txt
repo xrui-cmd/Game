@@ -35,3 +35,61 @@ set_target_properties(rect_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  Config 配置解析器单元测试（config_parse_test）
+#
+#  与 rect_test 的差异：Config 内部使用 SDL_LoadFile 读文件、
+#  SDL_LogWarn 记录警告，因此需要链接 SDL3 并携带 SDL3.dll 运行。
+#
+#  前置条件：主工程已构建过一次（产出 out/build/x64-debug 下的
+#  SDL3.lib 导入库与 SDL3.dll）。若尚未构建请先执行：
+#      cmake --preset x64-debug
+#      cmake --build out/build/x64-debug
+#
+#  运行命令：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\config_parse_test.exe
+# ============================================================
+set(TESTS_SDL3_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../out/build/x64-debug")
+
+# 主工程 SDL3 导入库不存在时给出提示（不中断配置，链接阶段仍会明确报错）
+if(NOT EXISTS "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib")
+    message(WARNING "未找到 ${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib，"
+                    "请先构建主工程（cmake --preset x64-debug; cmake --build out/build/x64-debug）")
+endif()
+
+add_executable(config_parse_test
+    config_parse_test.cpp
+    ../Src/cpp/engine/Config.cpp
+)
+
+if (MSVC)
+    target_compile_options(config_parse_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Config.h 位于 Src/inc，SDL 头位于 vendor/SDL-main/include
+target_include_directories(config_parse_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 链接主工程构建出的 SDL3 导入库（提供 SDL_LoadFile / SDL_LogWarn 等符号）
+target_link_libraries(config_parse_test PRIVATE
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib")
+
+# 运行目录放一份 SDL3.dll（与主工程使用同一份构建产物，版本天然一致）
+add_custom_command(TARGET config_parse_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3.dll"
+    "$<TARGET_FILE_DIR:config_parse_test>"
+)
+
+# 产物统一输出到 tests\bin\，与 rect_test 一致
+set_target_properties(config_parse_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
