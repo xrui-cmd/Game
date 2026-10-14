@@ -10,6 +10,21 @@
 #include <memory>                  // std::make_unique：构造 MenuScene
 #include <string>                  // std::string：拼接素材与字体的绝对路径
 
+// 本编译单元私有的格式化工具（不对外暴露）
+namespace
+{
+
+// 把存活秒数格式化为「存活: mm:ss」文案（分为两位整数、秒两位补零）。
+// 分钟数不设上限（长局显示 12:05 这类自然结果）；负秒按 0 处理（防御性，
+// 计时只做加法不可能为负，但格式化工具不假设调用方永远正确）
+void formatSurvivalText(char* buffer, size_t size, float seconds)
+{
+    const int total = (seconds > 0.0f) ? static_cast<int>(seconds) : 0; // 秒 -> 整秒
+    SDL_snprintf(buffer, size, "存活: %02d:%02d", total / 60, total % 60);
+}
+
+} // 匿名命名空间结束
+
 // 析构：释放场景自持纹理（背景 + 挥击弧光）。
 // 关键时机：SceneManager 先 onExit + 析构旧场景、后销毁 renderer，
 // 因此这里释放纹理时 renderer 尚在，安全；
@@ -298,8 +313,10 @@ void PlayScene::update(const UpdateContext& ctx)
         resolveAttack(playerRect);
     }
 
-    // 怪物刷新（边缘持续刷新 + 随时间增强）：局内秒数累计 + 到点生成
-    m_monsterElapsed += ctx.deltaTime; // 局内秒数：难度曲线与刷新节奏的计时基准
+    // 怪物刷新（边缘持续刷新 + 随时间增强）：局内秒数累计 + 到点生成。
+    // 存活计时与怪物难度计时共用同一时间基准（固定步长，暂停时冻结）
+    m_survivalSeconds += ctx.deltaTime; // 存活时间正计时（HUD/结算展示）
+    m_monsterElapsed += ctx.deltaTime;  // 局内秒数：难度曲线与刷新节奏的计时基准
     if (m_monsterElapsed >= m_monsterNextSpawnTime)
     {
         // 排定下一次尝试：间隔按当前局内时间收紧（下限 1s）。
@@ -528,6 +545,7 @@ void PlayScene::restart()
     m_playerHp = m_playerMaxHp;    // 生命回满（上限用 onEnter 读到的配置值）
     m_killCount = 0;               // 击杀清零
     m_xp = 0;                      // 经验清零
+    m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
     m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
 
     // 怪物刷新计时复位：局内秒清零、首刷时刻回到首刷延迟、累计生成数清零
@@ -717,6 +735,53 @@ void PlayScene::renderHud()
         }
     }
 
+    // ---- 生存 HUD（Playing 与 Paused 都显示）----
+    // 暂停时保留完整 HUD：玩家能看清冻结时刻的生命/击杀/存活/经验；
+    // GameOver 不显示（结束界面有自己的结算排版）
+    if (m_state == PlayState::Playing || m_state == PlayState::Paused)
+    {
+        // 血条几何常量（左上角第一块内容）
+        constexpr float kBarX = 20.0f;    // 血条左边界（与后续文字同一条左边线）
+        constexpr float kBarY = 22.0f;    // 血条上边界
+        constexpr float kBarW = 200.0f;   // 血条满宽（像素）
+        constexpr float kBarH = 22.0f;    // 血条高度（像素）
+
+        // 血条底色（深红）：先铺满整条，剩余生命的亮红前景覆盖其上——
+        // 即使生命很少，也能从底色的存在看出「总量的量级」
+        SDL_SetRenderDrawColor(m_renderer, 90, 24, 24, 255);
+        const SDL_FRect barBack{ kBarX, kBarY, kBarW, kBarH };
+        SDL_RenderFillRect(m_renderer, &barBack);
+
+        // 血条前景（亮红）：宽度 = 满宽 x 剩余生命比例（0 血时宽度为 0）。
+        // 比例计算防御除零（上限配置为 0 的极端情形按空血条画）
+        const float hpRatio = (m_playerMaxHp > 0)
+            ? static_cast<float>(m_playerHp) / static_cast<float>(m_playerMaxHp)
+            : 0.0f;
+        SDL_SetRenderDrawColor(m_renderer, 220, 60, 60, 255);
+        const SDL_FRect barFill{ kBarX, kBarY, kBarW * hpRatio, kBarH };
+        SDL_RenderFillRect(m_renderer, &barFill);
+
+        // 血条右侧：「HP 当前/上限」文字（白色，与血条纵向居中对齐）
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        char hpText[48]; // 容纳 "HP 100/100"，绰绰有余
+        SDL_snprintf(hpText, sizeof(hpText), "HP %d/%d", m_playerHp, m_playerMaxHp);
+        m_hudFont.draw(m_renderer, hpText, kBarX + kBarW + 12.0f, 16.0f);
+
+        // 血条下方三行：击杀 / 存活 / 经验（白色，行距 44 像素——
+        // HUD 字号 32 留出 12 像素行间隔，三行互不重叠）
+        char killText[48]; // 容纳 "击杀: " + 最长数字，绰绰有余
+        SDL_snprintf(killText, sizeof(killText), "击杀: %d", m_killCount);
+        m_hudFont.draw(m_renderer, killText, 20.0f, 64.0f);
+
+        char survivalText[48]; // 容纳「存活: mm:ss」，绰绰有余
+        formatSurvivalText(survivalText, sizeof(survivalText), m_survivalSeconds);
+        m_hudFont.draw(m_renderer, survivalText, 20.0f, 108.0f);
+
+        char xpText[48]; // 容纳 "经验: " + 最长数字，绰绰有余
+        SDL_snprintf(xpText, sizeof(xpText), "经验: %d", m_xp);
+        m_hudFont.draw(m_renderer, xpText, 20.0f, 152.0f);
+    }
+
     if (m_state == PlayState::Paused)
     {
         // 暂停叠层：大号「暂停」+ 两条操作提示。
@@ -740,8 +805,8 @@ void PlayScene::renderHud()
     }
     else if (m_state == PlayState::GameOver)
     {
-        // GameOver 界面：各行文字全部水平居中、围绕窗口中心排布
-        // （击杀/存活统计行在下一批「生存 HUD」补齐）
+        // GameOver 界面（结算）：游戏结束 + 击杀/存活两行成绩 + 两条操作提示，
+        // 全部水平居中、围绕窗口中心排布（不显示等级——升级系统在下一批）
 
         // 水平中心：各行文字共用的对齐基准（垂直位置逐行下移）
         const float screenCenterX = screenW / 2.0f;
@@ -750,11 +815,23 @@ void PlayScene::renderHud()
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
         m_bigFont.drawCentered(m_renderer, "游戏结束", screenCenterX, screenH / 2.0f - 80.0f);
 
-        // 第二行：重开提示（白色）
-        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 40.0f);
+        // 第二行：本局击杀数（黄色）——冒烟观测点：GameOver 结算内容
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
+        char killText[48]; // 容纳 "击杀: " + 最长数字，绰绰有余
+        SDL_snprintf(killText, sizeof(killText), "击杀: %d", m_killCount);
+        m_hudFont.drawCentered(m_renderer, killText, screenCenterX, screenH / 2.0f - 10.0f);
 
-        // 第三行：回菜单提示（白色）。行距与上一行保持一致
-        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 100.0f);
+        // 第三行：本局存活时长（黄色，mm:ss）
+        char survivalText[48]; // 容纳「存活: mm:ss」，绰绰有余
+        formatSurvivalText(survivalText, sizeof(survivalText), m_survivalSeconds);
+        m_hudFont.drawCentered(m_renderer, survivalText, screenCenterX, screenH / 2.0f + 40.0f);
+
+        // 第四行：重开提示（白色）
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 100.0f);
+
+        // 第五行：回菜单提示（白色）。行距与上一行保持一致
+        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 160.0f);
     }
 }
 
