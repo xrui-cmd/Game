@@ -10,6 +10,9 @@
 #         assets/background.png    1280x720 背景图（深蓝渐变 + 细微网格 + 星点）
 #         assets/enemy.png         32x32 敌人单帧精灵（红紫小怪 + 怒目，回退素材）
 #         assets/enemy_sheet.png   64x32 敌人逼近精灵表（2 帧横向排列，每帧 32x32）
+#         assets/gem.png           24x24 经验宝石单帧精灵（青绿菱形 + 高光，回退素材）
+#         assets/gem_sheet.png     144x24 经验宝石旋转精灵表（6 帧横向排列，每帧 24x24）
+#         assets/slash.png         96x96 挥击弧光（朝右月牙形，游戏按面朝角度旋转绘制）
 #         assets/sounds/*.wav      音效（收币/开始/结束/暂停/命中/破纪录，16-bit PCM 单声道）
 #
 # 设计原则：
@@ -564,7 +567,241 @@ $esG.Dispose()
 $esBmp.Dispose()
 
 # ============================================================
-# 7) 音效 WAV：assets/sounds/ 六个 16-bit PCM 单声道 44.1kHz 音效
+# 7) 经验宝石 gem.png / gem_sheet.png：24x24 旋转精灵表（6 帧）
+# ============================================================
+# 原理：与金币旋转同一模式——不真正旋转像素，而是让宝石的「画面宽度」
+#       随转动角度收窄再放开，6 帧连播形成「宝石转动」的循环动画。
+#       配色采用青绿色系（绿松石），与怪物红紫、玩家草绿形成清晰区分
+$gemFrameCount = 6  # 总帧数，必须与 XpGem 代码里的 kFrameCount 一致
+$gemFrameSize = 24  # 单帧边长，必须与 XpGem 的 kSize 一致
+
+# ---- 7.1 单帧宝石 gem.png（精灵表加载失败时的次选回退素材）----
+# 创建 24x24 带透明通道的宝石画布
+$gemBmp = New-Canvas -width $gemFrameSize -height $gemFrameSize
+
+# 获取宝石画布的 Graphics 绘图对象
+$gemG = [System.Drawing.Graphics]::FromImage($gemBmp)
+
+# 打开抗锯齿：菱形与圆形边缘平滑
+$gemG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+# 背景清成完全透明
+$gemG.Clear([System.Drawing.Color]::Transparent)
+
+# 宝石主体画刷：青绿色（R=64, G=224, B=208，绿松石色——经验宝石的识别色）
+$gemBodyBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 64, 224, 208))
+
+# 宝石描边画笔：深青色（R=32, G=140, B=130），2 像素宽，勾出轮廓提升辨识度
+$gemOutlinePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 32, 140, 130), 2)
+
+# 菱形四顶点：上(12,2) 右(21,12) 下(12,22) 左(3,12)——居中的宝石切面造型
+$gemPoints = @(
+    (New-Object System.Drawing.PointF(12.0, 2.0)),
+    (New-Object System.Drawing.PointF(21.0, 12.0)),
+    (New-Object System.Drawing.PointF(12.0, 22.0)),
+    (New-Object System.Drawing.PointF(3.0, 12.0))
+)
+
+# 填充菱形宝石主体
+$gemG.FillPolygon($gemBodyBrush, $gemPoints)
+
+# 描边：沿同一菱形画深青色轮廓
+$gemG.DrawPolygon($gemOutlinePen, $gemPoints)
+
+# 内层高光画刷：半透明白色（alpha=150），模拟宝石顶部的反光切面
+$gemInnerBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 255, 255, 255))
+
+# 内层小菱形（等比收窄）：高光切面的范围
+$gemInnerPoints = @(
+    (New-Object System.Drawing.PointF(12.0, 5.0)),
+    (New-Object System.Drawing.PointF(16.5, 12.0)),
+    (New-Object System.Drawing.PointF(12.0, 19.0)),
+    (New-Object System.Drawing.PointF(7.5, 12.0))
+)
+
+# 填充内层高光
+$gemG.FillPolygon($gemInnerBrush, $gemInnerPoints)
+
+# 左上角亮点画刷：纯白，宝石「闪光」的点睛之笔
+$gemSparkleBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+
+# 画一颗 4x4 的白色小圆作为闪光点
+$gemG.FillEllipse($gemSparkleBrush, 7, 5, 4, 4)
+
+# 保存单帧宝石到 assets/gem.png（内部先删旧文件，保证幂等）
+Save-Png -bitmap $gemBmp -path (Join-Path $assetsDir "gem.png")
+
+# 释放宝石主体画刷
+$gemBodyBrush.Dispose()
+
+# 释放宝石描边画笔
+$gemOutlinePen.Dispose()
+
+# 释放内层高光画刷
+$gemInnerBrush.Dispose()
+
+# 释放闪光点画刷
+$gemSparkleBrush.Dispose()
+
+# 释放宝石画布的 Graphics 对象
+$gemG.Dispose()
+
+# 释放宝石位图本身
+$gemBmp.Dispose()
+
+# ---- 7.2 宝石旋转精灵表 gem_sheet.png（6 帧横向排列，每帧 24x24）----
+# 创建整张精灵表画布：宽 = 6 帧 x 24 = 144，高 = 24
+$gsBmp = New-Canvas -width ($gemFrameCount * $gemFrameSize) -height $gemFrameSize
+
+# 获取精灵表的 Graphics 绘图对象
+$gsG = [System.Drawing.Graphics]::FromImage($gsBmp)
+
+# 打开抗锯齿：菱形边缘平滑
+$gsG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+# 背景清成完全透明，帧与帧之间自然留出透明间隙
+$gsG.Clear([System.Drawing.Color]::Transparent)
+
+# 每帧的宝石宽度比例：1.0 表示满宽（正对观众），越接近 0 越像转到侧面。
+# 序列首尾都接近满宽，循环播放时衔接平滑（与金币旋转同一序列）
+$gsScales = @(1.0, 0.72, 0.42, 0.14, 0.42, 0.72)
+
+# 复用与 gem.png 完全相同的配色：青绿主体、深青描边、半透明高光、纯白闪光
+$gsBodyBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 64, 224, 208))
+$gsOutlinePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 32, 140, 130), 2)
+$gsInnerBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 255, 255, 255))
+$gsSparkleBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+
+# 逐帧绘制：第 f 帧在整张表中的横向起点 = f * 24
+for ($f = 0; $f -lt $gemFrameCount; $f++) {
+    # 本帧的宽度比例（从比例表中取出）
+    $gsScale = $gsScales[$f]
+
+    # 本帧的帧内中心坐标（横向 = 帧起点 + 半帧宽；纵向恒为画布中线）
+    $gsCx = $f * $gemFrameSize + 12.0
+    $gsCy = 12.0
+
+    # 本帧菱形半宽（像素）：满宽半宽 9 按比例缩放；最窄帧保留 1.0 像素，
+    # 配合 2 像素描边仍是一条可辨认的「侧面线」
+    $gsHalfW = [Math]::Max(9.0 * $gsScale, 1.0)
+
+    # 本帧菱形四顶点（横向按比例缩放，纵向不变）。
+    # 注意：点坐标用 [PointF]::new(...) 构造——PS 5.1 的 New-Object 参数里
+    # 不允许内联 +/- 运算（会被误解析成成员访问并报 op_Subtraction 错误）
+    $gsPoints = @(
+        [System.Drawing.PointF]::new($gsCx, $gsCy - 10.0),
+        [System.Drawing.PointF]::new($gsCx + $gsHalfW, $gsCy),
+        [System.Drawing.PointF]::new($gsCx, $gsCy + 10.0),
+        [System.Drawing.PointF]::new($gsCx - $gsHalfW, $gsCy)
+    )
+
+    # 填充菱形主体（青绿实心）
+    $gsG.FillPolygon($gsBodyBrush, $gsPoints)
+
+    # 描边：沿同一菱形画深青轮廓
+    $gsG.DrawPolygon($gsOutlinePen, $gsPoints)
+
+    # 内层高光宽度随旋转等比缩放（最窄保留 0.8 像素，避免线宽为 0）
+    $gsInnerW = [Math]::Max(4.5 * $gsScale, 0.8)
+
+    # 内层高光小菱形（同样按比例收窄；坐标构造方式同上）
+    $gsInnerPoints = @(
+        [System.Drawing.PointF]::new($gsCx, $gsCy - 7.0),
+        [System.Drawing.PointF]::new($gsCx + $gsInnerW, $gsCy),
+        [System.Drawing.PointF]::new($gsCx, $gsCy + 7.0),
+        [System.Drawing.PointF]::new($gsCx - $gsInnerW, $gsCy)
+    )
+
+    # 填充内层高光
+    $gsG.FillPolygon($gsInnerBrush, $gsInnerPoints)
+
+    # 闪光点宽度随比例缩放（最窄保留 1.2 像素，避免消失）
+    $gsSparkW = [Math]::Max(4.0 * $gsScale, 1.2)
+
+    # 闪光点横向位置：位于中心偏左上，随比例向中线收拢；纵向与 gem.png 一致（y=5）
+    $gsSparkX = $gsCx - 4.0 * $gsScale
+    $gsSparkY = $gsCy - 7.0
+
+    # 画闪光小圆（宽高等比）
+    $gsG.FillEllipse($gsSparkleBrush, $gsSparkX, $gsSparkY, $gsSparkW, $gsSparkW)
+}
+
+# 保存宝石旋转精灵表到 assets/gem_sheet.png（内部先删旧文件，保证幂等）
+Save-Png -bitmap $gsBmp -path (Join-Path $assetsDir "gem_sheet.png")
+
+# 释放精灵表的主体画刷
+$gsBodyBrush.Dispose()
+
+# 释放描边画笔
+$gsOutlinePen.Dispose()
+
+# 释放内层高光画刷
+$gsInnerBrush.Dispose()
+
+# 释放闪光点画刷
+$gsSparkleBrush.Dispose()
+
+# 释放 Graphics 绘图对象
+$gsG.Dispose()
+
+# 释放精灵表位图本身
+$gsBmp.Dispose()
+
+# ============================================================
+# 8) 挥击弧光 slash.png：96x96 的月牙弧光（默认朝右）
+# ============================================================
+# 设计：以画布中心 (48,48) 为圆心、半径约 38 像素的一段圆弧（朝右侧开口），
+#       两道叠加——外层低透明宽弧（辉光）+ 内层近白窄弧（刀光主体）。
+#       素材默认朝右（0 度），与玩家初始面朝一致；游戏按面朝角度旋转绘制
+#       （SDL_RenderTextureRotated，绕图像中心旋转）
+$slashSize = 96  # 画布边长（像素），必须与 PlayScene 的 kSlashSize 一致
+
+# 创建 96x96 带透明通道的弧光画布
+$slashBmp = New-Canvas -width $slashSize -height $slashSize
+
+# 获取弧光画布的 Graphics 绘图对象
+$slashG = [System.Drawing.Graphics]::FromImage($slashBmp)
+
+# 打开抗锯齿：圆弧两端与边缘平滑
+$slashG.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+
+# 背景清成完全透明
+$slashG.Clear([System.Drawing.Color]::Transparent)
+
+# 圆弧外接矩形：中心 (48,48)、标称半径 38 -> 外接矩形 (10,10,76,76)。
+# 先算好再传入（PS 5.1 的 New-Object 参数里不允许内联 +/- 运算）
+$slashArcRect = New-Object System.Drawing.Rectangle(10, 10, 76, 76)
+
+# 外圈辉光画笔：宽 12、半透明暖黄（低对比的环境光晕）
+$slashGlowPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(85, 255, 236, 170), 12)
+
+# DrawArc 的角度以 3 点钟方向为 0、顺时针为正：
+# 从 -55 度扫 110 度 = 围绕右侧的一段月牙（跨度约 100 度 + 辉光外扩）
+$slashG.DrawArc($slashGlowPen, $slashArcRect, -55, 110)
+
+# 主体弧画笔：宽 5、近白暖色（清晰的刀光轨迹，压辉光之上）
+$slashCorePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(230, 255, 250, 230), 5)
+
+# 主体弧：比辉光略窄的跨度（-50 度扫 100 度），视觉上更聚焦
+$slashG.DrawArc($slashCorePen, $slashArcRect, -50, 100)
+
+# 保存挥击弧光到 assets/slash.png（内部先删旧文件，保证幂等）
+Save-Png -bitmap $slashBmp -path (Join-Path $assetsDir "slash.png")
+
+# 释放辉光画笔
+$slashGlowPen.Dispose()
+
+# 释放主体弧画笔
+$slashCorePen.Dispose()
+
+# 释放 Graphics 绘图对象
+$slashG.Dispose()
+
+# 释放弧光位图本身
+$slashBmp.Dispose()
+
+# ============================================================
+# 9) 音效 WAV：assets/sounds/ 六个 16-bit PCM 单声道 44.1kHz 音效
 # ============================================================
 # 与 PNG 系素材不同，音效不用绘图库，而是「程序化合成正弦波 + 手写
 # RIFF/WAV 文件头」：
@@ -913,7 +1150,7 @@ $recordSamples = New-SineSamples -segments @(
 Save-Wav16Mono -samples $recordSamples -path (Join-Path $soundsDir "record.wav") -sampleRate $wavSampleRate
 
 # ============================================================
-# 8) 生成后自检：重新读盘校验全部 PNG 的尺寸与 WAV 的头与时长
+# 10) 生成后自检：重新读盘校验全部 PNG 的尺寸与 WAV 的头与时长
 # ============================================================
 # 校验玩家精灵必须为 50x50（与 Player 的 m_width/m_height 对应）
 Assert-PngSize -path (Join-Path $assetsDir "player.png") -expectedWidth 50 -expectedHeight 50
@@ -927,11 +1164,20 @@ Assert-PngSize -path (Join-Path $assetsDir "coin_sheet.png") -expectedWidth 144 
 # 校验玩家行走精灵表必须为 100x50（2 帧 x 每帧 50 宽，与 Player 的 kFrameCount 对应）
 Assert-PngSize -path (Join-Path $assetsDir "player_sheet.png") -expectedWidth 100 -expectedHeight 50
 
-# 校验敌人单帧精灵必须为 32x32（与 Enemy 的 kSize 对应）
+# 校验敌人单帧精灵必须为 32x32（与 Monster 的 kSize 对应）
 Assert-PngSize -path (Join-Path $assetsDir "enemy.png") -expectedWidth 32 -expectedHeight 32
 
-# 校验敌人逼近精灵表必须为 64x32（2 帧 x 每帧 32 宽，与 Enemy 的 kFrameCount/kSize 对应）
+# 校验敌人逼近精灵表必须为 64x32（2 帧 x 每帧 32 宽，与 Monster 的 kFrameCount/kSize 对应）
 Assert-PngSize -path (Join-Path $assetsDir "enemy_sheet.png") -expectedWidth 64 -expectedHeight 32
+
+# 校验经验宝石单帧必须为 24x24（与 XpGem 的 kSize 对应）
+Assert-PngSize -path (Join-Path $assetsDir "gem.png") -expectedWidth 24 -expectedHeight 24
+
+# 校验经验宝石旋转精灵表必须为 144x24（6 帧 x 每帧 24 宽，与 XpGem 的 kFrameCount/kSize 对应）
+Assert-PngSize -path (Join-Path $assetsDir "gem_sheet.png") -expectedWidth 144 -expectedHeight 24
+
+# 校验挥击弧光必须为 96x96（与 PlayScene 的 kSlashSize 对应）
+Assert-PngSize -path (Join-Path $assetsDir "slash.png") -expectedWidth 96 -expectedHeight 96
 
 # 校验背景图必须为 1280x720（与窗口初始尺寸一致；绘制时按窗口实际尺寸拉伸）
 Assert-PngSize -path (Join-Path $assetsDir "background.png") -expectedWidth 1280 -expectedHeight 720

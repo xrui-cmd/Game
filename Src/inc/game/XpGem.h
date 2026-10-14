@@ -1,58 +1,65 @@
-#ifndef __COIN_H__
-#define __COIN_H__
+#ifndef __XPGEM_H__
+#define __XPGEM_H__
 
 #include "engine/Entity.h" // Entity：实体基类（空间/纹理/帧动画公共能力）
 
 // ============================================================
-// Coin：可被玩家收集的金币实体（带旋转帧动画）
+// XpGem：经验宝石实体（怪物掉落、玩家拾取、旋转帧动画）
 // ============================================================
 //
-// 继承自 Entity 获得的能力（与 Player 共用，不再各自复制）：
+// 名称说明：本类由既有 Coin 演进更名而来（文件/类同步改名）——收集物的
+// 语义从「金币计分」改为「经验宝石」（升级系统的经验来源）。玩法差异：
+//   - 不再随机重生：由怪物死亡时掉落在其位置（掉落动作由 PlayScene 完成）；
+//   - 玩家碰到即拾取：场景累计经验并移除本对象，不做分数/连击判定。
+//
+// 继承自 Entity 获得的能力（与 Player/Monster 共用，不再各自复制）：
 //   - 位置/尺寸数据与 rect()、setPosition()、width()/height() 查询
 //   - 纹理生命周期：release() 幂等释放，析构函数兜底
 //   - 三级回退纹理加载：精灵表 -> 单帧图 -> 程序化纯色（loadTextureWithFallback）
-//   - update()：基类默认实现「无条件推进帧动画」恰是金币需要的持续旋转
+//   - update()：基类默认实现「无条件推进帧动画」恰是宝石需要的持续旋转
 //   - render()：按当前帧从精灵表裁帧绘制（本类无需覆写）
 //
 // 本类自己的规则：
 //   1. 纹理来源（三级回退，逐级降级的细节见基类）：
-//      首选 assets/coin_sheet.png 旋转精灵表（6 帧横向排列），持续播动画；
-//      次选 assets/coin.png 单帧静态精灵（旧版素材，动画退化为静止）；
-//      回退为程序化 24x24 黄色方块（素材缺失时兜底，保证游戏可运行）
-//   2. 动画节奏：6 帧循环、默认每帧 0.12 秒（约 8.3 帧/秒，可由配置覆盖），
-//      与渲染帧率解耦
-//   3. 生命周期：load() 创建纹理 ——> update() 推进动画（继承基类默认）
-//      ——> render()/rect() 使用 ——> release() 释放（shutdown 与析构都会兜底）
+//      首选 assets/gem_sheet.png 旋转精灵表（6 帧横向排列），持续播动画；
+//      次选 assets/gem.png 单帧静态精灵（动画退化为静止）；
+//      回退为程序化 24x24 青绿色方块（素材缺失时兜底，保证游戏可运行）
+//   2. 动画节奏：6 帧循环、默认每帧 0.12 秒（代码常量沿用旧金币动画节奏，
+//      本批不进配置文件），与渲染帧率解耦
+//   3. 生命周期：怪物死亡时场景创建并 load -> update 播动画 -> 玩家触碰后
+//      markPicked -> 场景统一清理（cleanup 时析构并释放纹理）
 // ============================================================
 
-class Coin : public Entity
+class XpGem : public Entity
 {
 public:
-    // 配置项缺省值：与改造前的硬编码常量一致。
-    // PlayScene 读取 coin_anim_interval 时以它作为回退
+    // 默认帧时长：旋转动画每帧 0.12 秒（代码常量，不进配置文件）
     static constexpr float kDefaultFrameTime = 0.12f; // 默认每帧显示时长（秒）
 
-    // 构造：固定金币尺寸为 24x24（正方形，也是精灵表的单帧尺寸）
-    Coin()
+    // 构造：固定宝石尺寸为 24x24（正方形，也是精灵表的单帧尺寸）
+    XpGem()
     {
         m_w = kSize; // 宽 = 单帧宽
-        m_h = kSize; // 高 = 单帧高（正方形金币）
+        m_h = kSize; // 高 = 单帧高（正方形宝石）
     }
 
-    // 加载金币纹理：只声明素材路径、帧参数与回退颜色，
+    // 加载宝石纹理：只声明素材路径、帧参数与回退颜色，
     // 三级回退（精灵表 -> 单帧图 -> 程序化纯色）流程全部收敛在基类
     bool load(SDL_Renderer* renderer);
 
-    // 在 (winW, winH) 窗口范围内随机重生，尽量避开 avoidRect（通常传玩家矩形）。
-    // 这是金币特有的玩法逻辑，保留在本类；rect() 直接继承基类实现
-    void respawn(int winW, int winH, const SDL_FRect& avoidRect);
+    // 标记为「已被拾取」：场景在碰撞结算后调用，随后的统一清理会移除本对象。
+    // 用「标记 + 延迟清理」而不是结算当场析构：避免在遍历集合的过程中
+    // 删除元素造成迭代器失效
+    void markPicked() { m_picked = true; }
+
+    // 是否已被拾取（场景清理阶段据此移除对象）
+    bool isPicked() const { return m_picked; }
 
 private:
-    static constexpr float kSize = 24.0f;        // 金币边长（正方形），也是单帧宽高
-    static constexpr float kSpawnMargin = 40.0f; // 翻新位置与窗口边缘保留的边距
-    static constexpr int kMaxTries = 20;         // 重生时「避开玩家」的最大重试次数
-
+    static constexpr float kSize = 24.0f; // 宝石边长（正方形），也是单帧宽高
     static constexpr int kFrameCount = 6; // 旋转精灵表总帧数（6 帧 x 24px = 144px 宽）
+
+    bool m_picked = false; // 是否已被玩家拾取（拾取后等待场景清理）
 };
 
-#endif // !__COIN_H__
+#endif // !__XPGEM_H__

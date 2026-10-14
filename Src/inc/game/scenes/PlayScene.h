@@ -2,53 +2,53 @@
 #define __PLAYSCENE_H__
 
 #include "engine/Scene.h"       // Scene：场景基类
-#include "engine/AudioSystem.h" // AudioSystem：音效系统（收币/结束/暂停/被撞触发播放）
+#include "engine/AudioSystem.h" // AudioSystem：音效系统（拾取/受击/结束/暂停触发播放）
 #include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字，支持中文）
-#include "game/Player.h"        // Player：玩家实体
-#include "game/Coin.h"          // Coin：金币实体
-#include "game/Enemy.h"         // Enemy：追击敌人的实体
-#include <vector>               // std::vector：金币与敌人集合
+#include "game/Player.h"        // Player：玩家实体（移动 + 挥击 + 生命）
+#include "game/Monster.h"       // Monster：追击怪物（对象池）
+#include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
+#include <list>                 // std::list：经验宝石集合（节点式容器，元素地址稳定）
+#include <vector>               // std::vector：怪物对象池
 
 // ============================================================
-// PlayScene：对局场景（原 GameDev 的全部玩法逻辑迁入）
+// PlayScene：对局场景（Roguelike 战斗核心）
 // ============================================================
 //
 // 职责：
-//   1. 资源：在 onEnter 加载背景图（可选，失败兜底）、玩家、金币与敌人纹理；
-//      析构时释放背景纹理（玩家/金币/敌人纹理由各自 Entity 析构兜底）
-//   2. 玩法：WASD 移动、金币连击计分、倒计时、ESC 暂停/恢复、
-//      R 重开、M 回主菜单；敌人按难度曲线出现并追踪玩家（速度随局内
-//      时间爬升、按间隔增援），碰撞扣时、击退与无敌保护
-//   3. 计分（连击制，替代旧「每枚金币 +1」）：距上次收集不超过
-//      combo_window 秒则连击 +1、否则重置为 1；每枚金币的得分为
-//      收集时的当前连击数（连吃依次 +1、+2、+3...）
-//   4. 音效：收币播 coin、倒计时归零播 gameover、ESC 暂停/恢复播 pause、
-//      被敌人撞中播 hit、打破最高分纪录播 record
-//      （经 onEnter 注入的 AudioSystem；降级环境下为安全空操作）
-//   5. 配置：onEnter 时从注入的 Config 读取对局时长、金币数量、
-//      玩家速度与动画节奏、敌人速度与生成节奏、连击窗口；
-//      缺键/坏值自动回退内置默认值
-//   6. 存档：onEnter 读取历史最高分（game/SaveData）；完整对局结束
-//      （倒计时归零）且本局得分超过时立即更新并写盘、标记「新纪录！」
-//      ——中途暂停后按 M 退出不计，只有打完一整局的成绩才参与比较
-//   7. 渲染：背景 -> 玩家 -> 敌人 -> 金币 -> HUD 文字叠层（含 FPS/帧时间显示，
-//      左下角常显，F3 切换显隐——学习项目默认打开便于观察渲染表现）
+//   1. 资源：onEnter 加载背景图、挥击弧光、玩家/怪物纹理与字体
+//      （背景与弧光可选，失败兜底；实体纹理各自析构兜底）；
+//      析构时释放场景自持的背景与弧光纹理
+//   2. 玩法（本批由 COIN RUSH 重构为战斗骨架）：
+//      - WASD 移动、J 挥击（面朝方向近战：冷却 0.4s、伤害 25、约 64x56 判定）；
+//      - 怪物从窗口四边内侧持续刷新并随时间增强（数量上限初始 4、每 20s +2、
+//        封顶 12；刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s），
+//        追踪玩家、接触伤害 10；
+//      - 怪物 30 点生命：受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
+//      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开；拾取宝石累积经验
+//        （升级系统留待下一批）；生命归零 -> GameOver；
+//      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键）。
+//   3. 音效：拾取播 coin、被撞播 hit、生命归零播 gameover、
+//      ESC 暂停/恢复播 pause（经 onEnter 注入的 AudioSystem；降级环境安全空操作）
+//   4. 配置：onEnter 时读取玩家速度/生命/攻击参数与怪物速度曲线/刷新参数/
+//      生命/伤害；缺键/坏值自动回退内置默认值
+//   5. 渲染：背景 -> 玩家 -> 怪物 -> 挥击弧光 -> 经验宝石 -> HUD 文字叠层
+//      （含左下角 FPS/帧时间显示，F3 切换显隐——调试开关维持事件式）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
-// 数据成员的默认值就是初始状态（分数 0、连击 0、倒计时满值）；onEnter 里
-// 把玩家、金币与敌人对象池布置到位即可，不需要额外的「重置场景」逻辑
+// 数据成员的默认值就是初始状态；onEnter 把玩家与怪物池布置到位，
+// R 重开走 restart 复位运行时状态
 //
 // 状态机（PlayState）：
-//   Playing  ：接受输入、倒计时递减、检测金币/敌人碰撞
-//   Paused   ：世界与倒计时冻结，ESC 恢复、M 回主菜单
-//   GameOver ：世界冻结，等待玩家按 R 重开或按 M 回主菜单
+//   Playing  ：接受输入、推进战斗、检测碰撞与刷新
+//   Paused   ：世界冻结，ESC 恢复、M 回主菜单
+//   GameOver ：世界冻结（仅因玩家生命归零触发），等待 R 重开或 M 回主菜单
 // ============================================================
 
-// 对局状态机：用枚举而不是布尔标志，扩展「暂停」等状态后依然直观
+// 对局状态机：用枚举而不是布尔标志，状态互斥关系一眼可见
 enum class PlayState
 {
-    Playing,  // 正在游戏：接受输入、倒计时递减、检测金币/敌人碰撞
-    Paused,   // 暂停：世界与倒计时冻结，ESC 恢复、M 回主菜单
+    Playing,  // 正在游戏：接受输入、推进战斗、检测碰撞与刷新
+    Paused,   // 暂停：世界冻结，ESC 恢复、M 回主菜单
     GameOver  // 本局结束：世界冻结，等待玩家按 R 重开或按 M 回主菜单
 };
 
@@ -56,10 +56,10 @@ class PlayScene : public Scene
 {
 public:
     PlayScene() = default; // 成员默认值即初始局面，无需自定义构造
-    ~PlayScene() override;  // 析构释放背景纹理（此时 renderer 尚在，安全）
+    ~PlayScene() override;  // 析构释放场景自持纹理（此时 renderer 尚在，安全）
 
     // 进入场景：保存 renderer 与音效系统、读取配置、加载全部纹理、
-    // 布置玩家、金币与敌人对象池
+    // 布置玩家与怪物对象池
     void onEnter(SDL_Renderer* renderer, const Config& config, AudioSystem& audio) override;
 
     // 事件：仅 F3 切换 FPS 显示（维持事件式调试开关）。
@@ -67,15 +67,16 @@ public:
     void handleEvent(const SDL_Event& event) override;
 
     // 每帧更新：先处理输入动作边缘（暂停/重开/回菜单，任何状态都响应），
-    // 再仅 Playing 状态推进移动/碰撞/计时（Paused/GameOver 冻结）。
+    // 再仅 Playing 状态推进战斗（Paused/GameOver 冻结）。
     // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移
     void update(const UpdateContext& ctx) override;
 
-    // 每帧渲染：清屏、背景、实体、HUD。alpha 是插值系数，原样转发给实体
+    // 每帧渲染：清屏、背景、实体、挥击弧光、HUD。alpha 是插值系数，原样转发给实体
     void render(float alpha) override;
 
 private:
-    // 重开一局：重置分数、倒计时、玩家位置、全部金币与敌人状态
+    // 重开一局：生命/击杀/经验复位、玩家归位、回收全部怪物与宝石、
+    // 刷新计时重排
     void restart();
 
     // 输入动作的按下边缘处理：暂停/恢复（Playing <-> Paused）、
@@ -84,7 +85,24 @@ private:
     // 保证每次按下恰好触发一次（行为与事件式完全一致）
     void handleInputEdges(const UpdateContext& ctx);
 
-    // 绘制 HUD 文字（分数、最高分、倒计时、FPS、暂停叠层、结束界面）
+    // 结算一次挥击：对判定矩形内的每只存活怪物逐只结算（扣血/死亡/掉宝）。
+    // 挥击是「单次判定」而非持续伤害——每只怪物每次挥击至多结算一次
+    void resolveAttack(const SDL_FRect& playerRect);
+
+    // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位
+    void dropGemAt(float x, float y);
+
+    // 当前存活的怪物数（对象池中 alive 的槽位数；刷新上限的门控依据）
+    int aliveMonsterCount() const;
+
+    // 当前怪物数量上限：初始值（monster_max_count）+ 每 20s +2，封顶 12
+    int currentMonsterCap() const;
+
+    // 当前刷新间隔（秒）：初始值（monster_spawn_interval）随局内时间收紧，
+    // 下限 1s
+    float currentSpawnInterval() const;
+
+    // 绘制 HUD 文字（FPS、暂停叠层、结束界面）
     void renderHud();
 
     // 采样本渲染帧的间隔时间并做 EMA 平滑（render 每帧开头调用）。
@@ -92,36 +110,51 @@ private:
     void sampleFrameTime();
 
 private:
-    // 配置项缺省值：与改造前的硬编码常量逐一相同。
-    // 配置文件缺失或对应键缺失时回退到它们，行为与改造前完全一致
-    static constexpr float kDefaultRoundSeconds = 30.0f; // 默认每局总时长（秒）
-    static constexpr int kDefaultCoinCount = 5;          // 默认场上金币数量
+    // ---- 配置项缺省值（与 config/game.ini 对应键一致；缺键/坏值回退）----
+    static constexpr int kDefaultPlayerHp = 100;                // 玩家生命上限
+    static constexpr int kDefaultAttackDamage = 25;             // 玩家挥击伤害
+    static constexpr float kDefaultMonsterSpeed = 110.0f;       // 怪物基础移动速度（像素/秒）
+    static constexpr float kDefaultMonsterSpeedGrowth = 2.5f;   // 怪物速度成长（像素/秒²，按局内秒数叠加）
+    static constexpr float kDefaultMonsterSpawnInterval = 2.5f; // 刷新间隔初始值（秒）
+    static constexpr int kDefaultMonsterMaxCount = 4;           // 数量上限初始值（只）
+    static constexpr int kDefaultMonsterHp = 30;                // 怪物生命值
+    static constexpr int kDefaultMonsterDamage = 10;            // 怪物接触伤害
 
-    // 连击计分配置缺省值：与 config/game.ini 的 combo_window 一致，
-    // 配置文件缺失时连击窗口按 2 秒运行
-    static constexpr float kDefaultComboWindow = 2.0f; // 默认连击窗口时长（秒）
+    // ---- 玩法常量（代码固定，不进配置；改动须连同注释一起审视）----
+    static constexpr int kMonsterPoolSize = 12;          // 怪物对象池槽位数 = 数量上限封顶值
+    static constexpr float kFirstSpawnDelay = 2.0f;      // 首刷延迟（秒）：开局 2 秒后第 1 只出现
+    static constexpr float kCapGrowthPeriod = 20.0f;     // 数量上限成长周期（秒）：每 20 秒 +2
+    static constexpr int kCapGrowthStep = 2;             // 每次成长的增量（只）
+    static constexpr int kMaxMonsterCap = 12;            // 数量上限封顶（只；与池大小一致）
+    static constexpr float kSpawnIntervalFloor = 1.0f;   // 刷新间隔下限（秒）：收紧到此为止
+    static constexpr float kSpawnIntervalDecay = 0.025f; // 间隔收紧速率（秒/秒）：默认约 60 秒从 2.5 收到 1.0
 
-    // 丁阶段（敌人/难度曲线）配置项缺省值：与 config/game.ini 的对应键取值一致，
-    // 配置文件缺失时敌人按「基础 110 像素/秒、每秒 +2.5、5 秒首袭、每 10 秒
-    // 增援、最多 3 只、撞中扣 5 秒」的完整难度曲线运行
-    static constexpr float kDefaultEnemySpeed = 110.0f;          // 敌人基础移动速度（像素/秒）
-    static constexpr float kDefaultEnemySpeedGrowth = 2.5f;      // 敌人速度成长（像素/秒²）
-    static constexpr float kDefaultEnemyFirstSpawn = 5.0f;       // 第 1 只敌人的出现时间（局内秒）
-    static constexpr float kDefaultEnemySpawnInterval = 10.0f;   // 增援间隔（秒）
-    static constexpr int kDefaultEnemyMaxCount = 3;              // 场上敌人数量上限
-    static constexpr float kDefaultEnemyHitPenalty = 5.0f;       // 被敌人撞中的时间惩罚（秒）
-
-    // 敌人速度上限（像素/秒）：不超过玩家默认速度 300，保证玩家永远可以甩开
+    // 怪物速度上限（像素/秒）：不超过玩家默认速度 300，保证玩家永远可以甩开
     // 追兵（「可逃」是难度曲线的设计红线——速度成长不能把玩家逼进死局）。
     // 默认参数下约 60 秒到达上限，此后维持 260 不再增长
-    static constexpr float kEnemyMaxSpeed = 260.0f;
+    static constexpr float kMonsterMaxSpeed = 260.0f;
 
-    // 玩家被撞中后的无敌时长（秒）：期间跳过敌人碰撞检测、渲染每 0.1 秒闪烁。
-    // 固定玩法规则（不进配置文件）：0.8 秒足够拉开与击退后敌人的距离
+    // 玩家被撞中后的无敌时长（秒）：期间跳过怪物碰撞检测、渲染每 0.1 秒闪烁。
+    // 固定玩法规则（不进配置文件）：0.8 秒足够拉开与击退后怪物的距离
     static constexpr float kPlayerInvincibleSeconds = 0.8f;
 
     // 无敌闪烁的「半周期」（秒）：显 / 隐各占 0.1 秒，即每 0.1 秒切换一次
     static constexpr float kPlayerBlinkHalfPeriod = 0.1f;
+
+    // 接触伤害的怪物弹开距离（像素）：沿用既有机制 150——把怪物弹远，
+    // 配合 0.8s 无敌构成「受击保护窗口」
+    static constexpr float kContactKnockbackDistance = 150.0f;
+
+    // 挥击命中的怪物击退距离（像素）：比接触弹开短——保持追击压力，
+    // 让玩家能跟上补刀（击杀需要两次命中）
+    static constexpr float kAttackKnockbackDistance = 60.0f;
+
+    // 每颗经验宝石的经验值（代码常量）：升级系统下一批落地，本批只累计与显示
+    static constexpr int kGemXpValue = 10;
+
+    // 挥击弧光素材的显示尺寸（像素）：与 scripts/generate_assets 生成的
+    // slash.png 边长一致（96x96），以玩家中心为圆心旋转绘制
+    static constexpr float kSlashSize = 96.0f;
 
     static constexpr float kHudPtSize = 32.0f; // HUD/提示文字字号（像素高，小数需求清晰）
     static constexpr float kBigPtSize = 64.0f; // 暂停/结束标题字号（大号观感）
@@ -133,69 +166,53 @@ private:
     SDL_Renderer* m_renderer = nullptr; // onEnter 保存的渲染器（只借用，不持有所有权）
 
     // onEnter 注入的音效系统指针（所有权在 GameDev，受管理期间必然非空）。
-    // 对局用它在四处触发：收币（update）、被撞中（update）、结束（update）、
-    // 暂停/恢复（handleEvent）
+    // 对局用它在四处触发：拾取（update）、被撞（update）、结束（update）、
+    // 暂停/恢复（handleInputEdges）
     AudioSystem* m_audio = nullptr;
 
-    // 由 renderer 反查的窗口指针：玩法边界/金币重生需要窗口整数尺寸
-    // （与渲染基元无关的「逻辑尺寸」沿用窗口坐标系，保持改造前的数值）
+    // 由 renderer 反查的窗口指针：玩法边界/刷新范围需要窗口整数尺寸
+    // （与渲染基元无关的「逻辑尺寸」沿用窗口坐标系，保持既有数值）
     SDL_Window* m_window = nullptr;
 
     // 背景纹理：加载失败时为 nullptr，render 阶段会跳过，
     // 露出清屏深蓝色兜底（背景不是游戏必需品，加载失败不阻塞启动）
     SDL_Texture* m_background = nullptr;
 
+    // 挥击弧光纹理（assets/slash.png）：加载失败时为 nullptr，挥击特效跳过，
+    // 命中判定与玩法完全不受影响
+    SDL_Texture* m_slashTexture = nullptr;
+
     // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
-    Font m_hudFont; // HUD/提示文字（分数、时间、操作提示、GameOver 列表）
+    Font m_hudFont; // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
     Font m_bigFont; // 大号标题（暂停 / 游戏结束）
 
-    Player m_player;              // 玩家实体
-    std::vector<Coin> m_coins;    // 场上同时存在的金币集合
-    std::vector<Enemy> m_enemies; // 敌人对象池（预创建；前 m_enemySpawned 个为已激活）
+    Player m_player;                 // 玩家实体
+    std::vector<Monster> m_monsters; // 怪物对象池（预创建 kMonsterPoolSize 个槽位）
+    std::list<XpGem> m_gems;         // 场上未被拾取的经验宝石
 
-    // 本局累计得分（跨帧累计）。
-    // 【语义变更】旧版「每枚金币 +1」已被连击制替代：每枚金币贡献的
-    // 分数 = 收集瞬间的当前连击数（连吃依次 +1、+2、+3...；
-    // 超过连击窗口断连后，下一枚重新从 +1 起算）
-    int m_score = 0;
+    // ---- 战斗配置（onEnter 读取；R 重开不重读，整局沿用同一套调参）----
+    int m_playerMaxHp = kDefaultPlayerHp;                 // 玩家生命上限（player_hp）
+    int m_attackDamage = kDefaultAttackDamage;            // 挥击伤害（player_attack_damage）
+    float m_monsterSpeed = kDefaultMonsterSpeed;          // 怪物基础速度（monster_speed）
+    float m_monsterSpeedGrowth = kDefaultMonsterSpeedGrowth; // 速度成长（monster_speed_growth）
+    float m_monsterSpawnInterval = kDefaultMonsterSpawnInterval; // 刷新间隔初始值（monster_spawn_interval）
+    int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）
+    int m_monsterHp = kDefaultMonsterHp;                  // 怪物生命值（monster_hp）
+    int m_monsterDamage = kDefaultMonsterDamage;          // 接触伤害（monster_damage）
 
-    // ---- 连击计分（替代旧「每枚金币 +1」的得分语义） ----
-    // 判定规则：距上次收集不超过 combo_window 秒 -> 连击 +1，否则重置为 1；
-    // 本枚金币的得分 = 当前连击数。窗口倒计时归零 -> 连击数清 0
-    float m_comboWindow = kDefaultComboWindow; // 连击窗口时长（秒）：onEnter 由配置覆盖
-    int m_comboCount = 0;    // 当前连击数（0 = 无连击；HUD 在 >=2 时显示「连击 xN」）
-    float m_comboTimer = 0.0f; // 连击窗口剩余时间（秒；>0 = 窗口内可续连击）
+    // ---- 战斗运行时状态（restart 复位）----
+    int m_playerHp = kDefaultPlayerHp;   // 玩家当前生命（归零 -> GameOver）
+    int m_killCount = 0;                 // 本局累计击杀数（击杀日志/HUD 使用）
+    int m_xp = 0;                        // 本局累计经验（升级逻辑下一批；HUD 展示）
 
-    // ---- 最高分存档与破纪录反馈 ----
-    // 加载时机：onEnter 时经 SaveData::loadHighScore 从用户数据目录读取；
-    // 更新时机：仅「完整对局结束」时（倒计时归零的 GameOver 入口）——
-    // 暂停中按 M 中途退出不计成绩，因此也不参与最高分比较
-    int m_highScore = 0;        // 历史最高分（HUD 顶部中央展示；破纪录后即刷新）
-    bool m_isNewRecord = false; // 本局是否刷新了历史最高分（GameOver 显示「新纪录！」）
-
-    // ---- 丁阶段：敌人与难度曲线（配置 + 运行时状态） ----
-    // 下列配置在 onEnter 时读取（缺键自动回退内置默认值）；R 重开不重读配置，
-    // 只复位下面的运行时状态——保证整局沿用同一套调参
-    float m_enemySpeed = kDefaultEnemySpeed;                   // 敌人基础速度（像素/秒）
-    float m_enemySpeedGrowth = kDefaultEnemySpeedGrowth;       // 速度成长（像素/秒²，按局内秒数叠加）
-    float m_enemyFirstSpawn = kDefaultEnemyFirstSpawn;         // 第 1 只敌人的出现时间（局内秒）
-    float m_enemySpawnInterval = kDefaultEnemySpawnInterval;   // 增援间隔（秒）
-    int m_enemyMaxCount = kDefaultEnemyMaxCount;               // 敌人数量上限（同时决定对象池大小）
-    float m_enemyHitPenalty = kDefaultEnemyHitPenalty;         // 被撞中的时间惩罚（秒）
-
-    float m_enemyElapsed = 0.0f;       // 局内已过秒数（仅 Playing 递增；难度计时基准）
-    float m_enemyNextSpawnTime = 0.0f; // 下一只敌人的出现时刻（局内秒；onEnter 设为首只时间）
-    int m_enemySpawned = 0;            // 本局已生成的敌人数（同时决定激活对象池的前几个）
-
-    // 玩家剩余无敌时间（秒；0 = 未处于无敌）；被撞中时重置为满值，
+    // 玩家剩余无敌时间（秒；0 = 未处于无敌）；受击时重置为满值，
     // 仅 Playing 状态递减——暂停/结束时冻结，闪烁相位随之冻结
     float m_playerInvincibleLeft = 0.0f;
 
-    // 本局总时长（秒）：onEnter 时由配置 round_seconds 覆盖默认值。
-    // 按 R 重开时用它重置倒计时，保证整局时长一致
-    float m_roundSeconds = kDefaultRoundSeconds;
-
-    float m_timeLeft = kDefaultRoundSeconds; // 本局剩余秒数（仅 Playing 状态递减）
+    // ---- 怪物刷新运行时（restart 复位）----
+    float m_monsterElapsed = 0.0f;       // 局内已过秒数（仅 Playing 递增；难度计时基准）
+    float m_monsterNextSpawnTime = 0.0f; // 下一只怪物的刷新时刻（局内秒）
+    int m_monsterSpawnedTotal = 0;       // 本局累计生成数（日志「第 N 只」/冒烟断言用）
 
     PlayState m_state = PlayState::Playing; // 当前对局状态
 
@@ -220,7 +237,7 @@ private:
     Uint64 m_lastFrameCounter = 0;
 
     // 窗口实际尺寸缓存（每次查询窗口后更新）：
-    // 金币重生范围这类需要整数的场合直接用它
+    // 刷新范围这类需要整数的场合直接用它
     int m_width = 0;
     int m_height = 0;
 };

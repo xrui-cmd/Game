@@ -1,20 +1,19 @@
 #include "game/scenes/PlayScene.h"
 #include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
-#include "game/SaveData.h"         // SaveData：最高分存档（读取/写盘）
 #include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
 #include "engine/Input.h"          // Input：ctx.input->pressed 查询暂停/重开/回菜单边缘
-#include "engine/Rect.h"           // rectsOverlap：金币碰撞的 AABB 判定
+#include "engine/Rect.h"           // rectsOverlap：挥击/接触伤害/拾取的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
-#include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
-#include <algorithm>               // std::max：金币数量下限保护、无敌计时夹取
+#include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 与 slash.png
+#include <algorithm>               // std::max / std::min：生命夹取、难度曲线封顶
 #include <cmath>                   // std::fmod：无敌闪烁的相位取模
 #include <memory>                  // std::make_unique：构造 MenuScene
 #include <string>                  // std::string：拼接素材与字体的绝对路径
 
-// 析构：释放背景纹理。
+// 析构：释放场景自持纹理（背景 + 挥击弧光）。
 // 关键时机：SceneManager 先 onExit + 析构旧场景、后销毁 renderer，
 // 因此这里释放纹理时 renderer 尚在，安全；
-// 玩家/金币/敌人的纹理由各自 Entity 的析构函数兜底释放
+// 玩家/怪物/宝石的纹理由各自 Entity 的析构函数兜底释放
 PlayScene::~PlayScene()
 {
     // 只有纹理确实存在时才销毁，避免对空指针调用 SDL_DestroyTexture
@@ -22,6 +21,13 @@ PlayScene::~PlayScene()
     {
         SDL_DestroyTexture(m_background); // 释放背景图占用的显存
         m_background = nullptr;           // 置空：即使重复调用也不会二次销毁
+    }
+
+    // 挥击弧光同款兜底释放（加载失败时为 nullptr，此处天然跳过）
+    if (m_slashTexture != nullptr)
+    {
+        SDL_DestroyTexture(m_slashTexture); // 释放弧光纹理占用的显存
+        m_slashTexture = nullptr;           // 置空：幂等保护
     }
 }
 
@@ -32,97 +38,82 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 1) 保存 renderer：后续每帧渲染、资源加载都用它（只借用，不负责销毁）
     m_renderer = renderer;
 
-    // 2) 保存音效系统指针：收币/结束/暂停/被撞/破纪录五类事件用它触发播放。
+    // 2) 保存音效系统指针：拾取/被撞/结束/暂停四类事件用它触发播放。
     //    所有权在 GameDev，受 SceneManager 管理期间必然非空（与 Config 同一管线）
     m_audio = &audio;
 
-    // 3) 由 renderer 反查窗口：玩法边界/金币重生需要窗口整数尺寸
+    // 3) 由 renderer 反查窗口：玩法边界/刷新范围需要窗口整数尺寸
     m_window = SDL_GetRenderWindow(renderer);
 
     // 4) 读取本场景相关的配置项。getFloat/getInt 在缺键或值非法时会记录
-    //    警告并回退到内置默认值（与改造前的常量逐一相同），因此没有
-    //    config/game.ini 时行为与改造前完全一致：
-    //      round_seconds       本局时长（秒）
-    //      coin_count          金币数量
-    //      player_speed        玩家移动速度（像素/秒）
-    //      player_accel        玩家加速度（像素/秒²）
-    //      player_friction     玩家摩擦减速度（像素/秒²）
-    //      player_anim_interval 玩家行走动画每帧时长（秒）
-    //      coin_anim_interval  金币旋转动画每帧时长（秒）
-    //      enemy_speed         敌人基础移动速度（像素/秒）
-    //      enemy_speed_growth  敌人速度成长（像素/秒²，按局内秒数叠加）
-    //      enemy_first_spawn   第 1 只敌人的出现时间（局内秒）
-    //      enemy_spawn_interval 增援间隔（秒，第一只之后每过这么久 +1 只）
-    //      enemy_max_count     场上敌人数量上限
-    //      enemy_hit_penalty   被敌人撞中的时间惩罚（秒）
-    //      combo_window        连击窗口（秒）：收集间隔不超过它才算连吃
-    m_roundSeconds = config.getFloat("round_seconds", kDefaultRoundSeconds);
-    m_timeLeft = m_roundSeconds; // 首局倒计时从满值开始（与按 R 重开保持一致）
-
-    // 负数金币数会被 resize 当作巨大的长度值（size_t 回绕）引发异常，
-    // 所以先用 std::max 夹到 0 以上；0 枚金币（空场）是允许的合法配置
-    const int coinCount = std::max(0, config.getInt("coin_count", kDefaultCoinCount));
-
-    // 玩家与金币的动画节奏、玩家速度与加减速：先读出配置值（默认值与
-    // Player/Coin 各自的默认常量一致），等到相应实体 load 完成后再注入
+    //    警告并回退到内置默认值，因此没有 config/game.ini 时游戏照常可玩：
+    //      player_speed            玩家移动速度（像素/秒）
+    //      player_accel            玩家加速度（像素/秒²）
+    //      player_friction         玩家摩擦减速度（像素/秒²）
+    //      player_anim_interval    玩家行走动画每帧时长（秒）
+    //      player_hp               玩家生命上限
+    //      player_attack_cooldown  挥击冷却（秒）
+    //      player_attack_damage    挥击伤害
+    //      monster_speed           怪物基础移动速度（像素/秒）
+    //      monster_speed_growth    怪物速度成长（像素/秒²，按局内秒数叠加）
+    //      monster_spawn_interval  刷新间隔初始值（秒，随局内时间收紧）
+    //      monster_max_count       数量上限初始值（只，随局内时间 +2）
+    //      monster_hp              怪物生命值
+    //      monster_damage          怪物接触伤害
     const float playerSpeed = config.getFloat("player_speed", Player::kDefaultSpeed);
     const float playerAccel = config.getFloat("player_accel", Player::kDefaultAccel);
     const float playerFriction = config.getFloat("player_friction", Player::kDefaultFriction);
     const float playerAnimInterval =
         config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
-    const float coinAnimInterval = config.getFloat("coin_anim_interval", Coin::kDefaultFrameTime);
+    m_playerMaxHp = config.getInt("player_hp", kDefaultPlayerHp);
+    const float attackCooldown =
+        config.getFloat("player_attack_cooldown", Player::kDefaultAttackCooldown);
+    m_attackDamage = config.getInt("player_attack_damage", kDefaultAttackDamage);
+    m_monsterSpeed = config.getFloat("monster_speed", kDefaultMonsterSpeed);
+    m_monsterSpeedGrowth = config.getFloat("monster_speed_growth", kDefaultMonsterSpeedGrowth);
+    m_monsterSpawnInterval =
+        config.getFloat("monster_spawn_interval", kDefaultMonsterSpawnInterval);
+    m_monsterHp = config.getInt("monster_hp", kDefaultMonsterHp);
+    m_monsterDamage = config.getInt("monster_damage", kDefaultMonsterDamage);
 
-    // 连击窗口（秒）：两枚金币的收集间隔不超过它才算「连吃」，
-    // 本枚金币的得分 = 当前连击数（详见 update 的金币收集分支）。
-    // 【语义变更】旧版「每枚金币固定 +1」已被此连击制替代
-    m_comboWindow = config.getFloat("combo_window", kDefaultComboWindow);
+    // 负数会经 static_cast 变成巨大的 size_t 引发异常（与金币池时代的防护同款），
+    // 所以先用 std::max 夹到 0 以上；0 只怪物（无敌人模式）是允许的合法配置。
+    // 上限封顶在 currentMonsterCap 中再统一处理（kMaxMonsterCap = 池大小）
+    m_monsterMaxCount = std::max(0, config.getInt("monster_max_count", kDefaultMonsterMaxCount));
 
-    // 丁阶段：敌人与难度曲线配置。语义：
-    //   enemy_speed          基础移动速度（像素/秒）——追击速度的起点
-    //   enemy_speed_growth   速度成长（像素/秒²）——每秒比前一秒快多少
-    //   enemy_first_spawn    第 1 只敌人的出现时间（局内秒）
-    //   enemy_spawn_interval 增援间隔（秒）——第一只之后，每过这么久多 1 只
-    //   enemy_max_count      数量上限——同时存在的敌人不超过它
-    //   enemy_hit_penalty    被撞中的时间惩罚（秒）
-    m_enemySpeed = config.getFloat("enemy_speed", kDefaultEnemySpeed);
-    m_enemySpeedGrowth = config.getFloat("enemy_speed_growth", kDefaultEnemySpeedGrowth);
-    m_enemyFirstSpawn = config.getFloat("enemy_first_spawn", kDefaultEnemyFirstSpawn);
-    m_enemySpawnInterval = config.getFloat("enemy_spawn_interval", kDefaultEnemySpawnInterval);
-    m_enemyHitPenalty = config.getFloat("enemy_hit_penalty", kDefaultEnemyHitPenalty);
-
-    // 负数会经 static_cast 变成巨大的 size_t 引发异常（与金币同一防护），
-    // 所以先用 std::max 夹到 0 以上；0 只敌人（无敌人模式）是允许的合法配置
-    m_enemyMaxCount = std::max(0, config.getInt("enemy_max_count", kDefaultEnemyMaxCount));
-
-    // 生成时刻表从「首只出现时间」开始计：倒计时到点即生成第一只；
-    // R 重开会用同一初值复位（见 restart）
-    m_enemyNextSpawnTime = m_enemyFirstSpawn;
-
-    // 4.5) 读取最高分存档（game/SaveData）：存档缺失（首次运行）/损坏时
-    //      内部已警告并返回 0——与 Config 同一降级纪律，外部文件异常不是
-    //      游戏问题，继续运行。此值不随 R 重开重置：跨局展示与比较始终
-    //      使用最新纪录（破纪录时在 GameOver 入口更新并写盘）
-    m_highScore = SaveData::loadHighScore();
+    // 玩家生命从满值开始（restart 复用同一初值）；刷新时刻表从首刷延迟起算
+    m_playerHp = m_playerMaxHp;                  // 生命回满：全新一局
+    m_monsterNextSpawnTime = kFirstSpawnDelay;   // 首只怪物：局内 2 秒后出现
 
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
 
-    // 5) 加载背景图（可选资源）：拼出 <exe目录>/assets/background.png 交给 SDL3_image 解码。
-    //    背景不是游戏必需品——加载失败只记录警告并继续；渲染阶段会整块跳过背景，
-    //    露出清屏深蓝色兜底，玩法完全不受影响
+    // 5) 加载可选的场景级纹理：背景图与挥击弧光（拼 <exe目录>/assets/... 路径）。
+    //    两者都不是游戏必需品——加载失败只记录警告并继续：
+    //    背景缺失露出清屏深蓝兜底，弧光缺失跳过挥击特效（命中判定不受影响）
     const char* basePath = SDL_GetBasePath();
     if (basePath != nullptr)
     {
         // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
-        std::string bgPath = std::string(basePath) + "assets/background.png";
+        const std::string bgPath = std::string(basePath) + "assets/background.png";
         // IMG_LoadTexture：读文件 -> 解码 PNG -> 一步创建 GPU 纹理
         m_background = IMG_LoadTexture(m_renderer, bgPath.c_str());
+
+        // 挥击弧光：与背景同一加载模式（可选资源，失败容忍）
+        const std::string slashPath = std::string(basePath) + "assets/slash.png";
+        m_slashTexture = IMG_LoadTexture(m_renderer, slashPath.c_str());
     }
-    // 无论失败原因是「拿不到基路径」还是「图片读取失败」，都统一走这条警告
+    // 背景失败（拿不到基路径或图片读取失败）统一走这条警告
     if (m_background == nullptr)
     {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
+    }
+    // 弧光失败同样只警告：挥击表现降级为「无特效」，玩法照常
+    if (m_slashTexture == nullptr)
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "加载挥击弧光失败（%s），挥击特效将跳过", SDL_GetError());
     }
 
     // 6) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
@@ -146,55 +137,33 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
-    // 8) 注入玩家配置：速度、加减速与行走动画节奏。
+    // 8) 注入玩家配置：速度、加减速、行走动画节奏与挥击冷却。
     //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
-    //    配置值晚一步落定才能覆盖它（setFrameTime 对非正值会忽略并警告；
-    //    setMotion 对负值整组忽略，0 合法）
+    //    配置值晚一步落定才能覆盖它（各 set 对非法值会忽略并警告）
     m_player.setSpeed(playerSpeed);
     m_player.setMotion(playerAccel, playerFriction);
     m_player.setFrameTime(playerAnimInterval);
+    m_player.setAttackCooldown(attackCooldown);
 
-    // 9) 查询窗口实际尺寸并缓存：金币出生和后续边界计算都基于它
+    // 9) 查询窗口实际尺寸并缓存：刷新出生和后续边界计算都基于它
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
     // 10) 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
-    //    每次进入 PlayScene 都从这里开始 => 与「按 R 重开」的初始状态一致
+    //     每次进入 PlayScene 都从这里开始 => 与「按 R 重开」的初始状态一致
     m_player.reset(m_width / 2.0f - m_player.width() / 2.0f,
                    m_height / 2.0f - m_player.height() / 2.0f);
 
-    // 11) 预创建全部金币对象；resize 按配置数量（默认 5）构造对象，此时纹理还是空的
-    m_coins.resize(static_cast<size_t>(coinCount));
+    // 11) 预创建怪物对象池：resize 按池大小（kMonsterPoolSize = 数量上限封顶 12）
+    //     构造槽位（此刻纹理为空、均为未激活）。刷新规则由 update 按难度曲线驱动；
+    //     未激活的槽位不更新、不渲染、不参与碰撞
+    m_monsters.resize(static_cast<size_t>(kMonsterPoolSize));
 
-    // 玩家当前矩形：金币出生点尽量避开玩家所站的位置
-    const SDL_FRect playerRect = m_player.rect();
-
-    for (Coin& coin : m_coins)
+    for (Monster& monster : m_monsters)
     {
-        // 为每个金币创建纹理（同样是三级回退），失败只记录不中断
-        if (!coin.load(m_renderer))
+        // 为每个槽位创建纹理（三级回退），失败只记录不中断（同玩家的处理）
+        if (!monster.load(m_renderer))
         {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建金币纹理失败：%s", SDL_GetError());
-        }
-
-        // 注入金币动画节奏（同样在 load 之后，覆盖内置默认帧时长）
-        coin.setFrameTime(coinAnimInterval);
-
-        // 立即给一个随机出生点，避免所有金币叠在 (0,0)
-        coin.respawn(m_width, m_height, playerRect);
-    }
-
-    // 12) 丁阶段：预创建敌人对象池并加载纹理。resize 按数量构造对象
-    //     （数量 = enemy_max_count，默认 3；上限语义由「最多激活前 N 个」实现），
-    //     此时纹理为空。敌人的出生位置与时刻由 update 按难度曲线决定
-    //     （见「敌人出现」分支）；未生成的敌人不更新、不渲染、不参与碰撞
-    m_enemies.resize(static_cast<size_t>(m_enemyMaxCount));
-
-    for (Enemy& enemy : m_enemies)
-    {
-        // 为每个敌人创建纹理（三级回退），失败只记录不中断（同金币的处理）
-        if (!enemy.load(m_renderer))
-        {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建敌人纹理失败：%s", SDL_GetError());
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建怪物纹理失败：%s", SDL_GetError());
         }
     }
 }
@@ -233,7 +202,7 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
     const bool restartPressed = ctx.input != nullptr && ctx.input->pressed("restart");
     const bool menuPressed = ctx.input != nullptr && ctx.input->pressed("menu");
 
-    // 暂停/恢复：ESC 在 Playing 与 Paused 之间切换（GameOver 下不响应）。
+    // 暂停/恢复：在 Playing 与 Paused 之间切换（GameOver 下不响应）。
     // 去重标记：同一帧补多个固定步时 pressed 恒 true，只在「首次见到上升沿」
     // 的那一步执行切换，避免一帧内反复横跳
     if (pausePressed && !m_pauseHandled)
@@ -249,7 +218,7 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
         }
         else if (m_state == PlayState::Paused)
         {
-            // 从暂停处继续：玩家/金币/倒计时的状态原样保留，继续推进
+            // 从暂停处继续：实体状态原样保留，继续推进
             m_state = PlayState::Playing;
             // 播放恢复轻音（同样是 pause 音效：暂停/恢复切换共用）
             m_audio->play(SoundId::Pause);
@@ -276,10 +245,9 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
     m_menuHandled = menuPressed; // 记录采样：上升沿去重
 }
 
-// 每帧更新：先处理输入动作边缘（任何状态都响应），再按状态推进游戏逻辑。
-// 只有 Playing 状态才推进游戏逻辑。
-// Paused（暂停）与 GameOver（结束）都冻结玩家、敌人、倒计时与金币——暂停
-// 由此天然实现了「世界与计时冻结」（敌人 update 的统一门控就在本函数开头）
+// 每帧更新：先处理输入动作边缘（任何状态都响应），再按状态推进战斗。
+// Paused（暂停）与 GameOver（结束）都冻结玩家、怪物、宝石与计时——暂停
+// 由此天然实现了「世界与计时冻结」（实体 update 的统一门控就在本函数）
 void PlayScene::update(const UpdateContext& ctx)
 {
     // 输入动作边缘：暂停/重开/回菜单（与状态无关，先于冻结分支处理——
@@ -294,155 +262,134 @@ void PlayScene::update(const UpdateContext& ctx)
         // alpha 波动来回插值，暂停画面上会出现亚像素级漂移/抖动；
         // 对齐后 prev==cur，无论 alpha 取何值，渲染位置恒等于当前位置
         m_player.snapshotPreviousPosition(); // 玩家：prev=cur
-        for (Coin& coin : m_coins)
+        for (Monster& monster : m_monsters)
         {
-            coin.snapshotPreviousPosition(); // 金币：逐枚对齐
+            monster.snapshotPreviousPosition(); // 怪物（含空槽位，统一处理更稳妥）
         }
-        // 敌人同款对齐（含尚未生成的空对象，统一处理更稳妥）：
-        // 这正是「暂停/GameOver 时敌人静止」的实现——敌人的 update 只在
-        // 下面的 Playing 分支被调用，冻结期间无人修改 m_x/m_y；这里再对齐
-        // 快照，渲染插值即恒等于当前位置，画面完全不漂移
-        for (Enemy& enemy : m_enemies)
+        for (XpGem& gem : m_gems)
         {
-            enemy.snapshotPreviousPosition(); // 敌人：逐个对齐
+            gem.snapshotPreviousPosition(); // 经验宝石：逐颗对齐
         }
         return;
     }
 
-    // 每帧查询窗口实际尺寸并缓存：玩家边界、金币重生范围都基于它，
-    // 窗口尺寸一旦变化，本帧逻辑立即跟随（与改造前行为一致）
+    // 每帧查询窗口实际尺寸并缓存：玩家边界、刷新范围都基于它，
+    // 窗口尺寸一旦变化，本帧逻辑立即跟随
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
-    // 玩家使用上下文更新：内部按 ctx.keyboard 移动、按 ctx.viewport* 做边界 clamp
-    m_player.update(ctx);
-
-    // 玩家矩形只取一次：本帧所有金币/敌人的碰撞检测与敌人追踪都共用它
-    const SDL_FRect playerRect = m_player.rect();
-
-    // 丁阶段（无敌计时）：递减剩余无敌时间并夹到 0。
-    // 被撞中的瞬间会在下面的碰撞分支重置为满值；暂停/结束时本函数提前
-    // 返回，计时自然冻结——恢复后无敌不会「凭空流逝」
+    // 玩家无敌计时：递减剩余无敌时间并夹到 0。受击瞬间会在下面的碰撞
+    // 分支重置为满值；暂停/结束时本函数提前返回，计时自然冻结——恢复后
+    // 无敌不会「凭空流逝」
     if (m_playerInvincibleLeft > 0.0f)
     {
         m_playerInvincibleLeft = std::max(m_playerInvincibleLeft - ctx.deltaTime, 0.0f);
     }
 
-    // 丁阶段（敌人出现 / 增援节奏）：局内秒数累计 + 到点生成。
-    // m_enemyElapsed 只在 Playing 递增（暂停/结束不涨，难度节奏与游戏时间一致），
-    // R 重开时清零（见 restart）。节奏：局内第 enemy_first_spawn 秒出现第 1 只，
-    // 此后每 enemy_spawn_interval 秒 +1 只，最多 enemy_max_count 只；
-    // 出生点距玩家至少约 300px，由 Enemy::spawn 内部保证
-    m_enemyElapsed += ctx.deltaTime;
-    if (m_enemySpawned < m_enemyMaxCount && m_enemyElapsed >= m_enemyNextSpawnTime)
+    // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动、按
+    // ctx.viewport* 做边界 clamp，并处理挥击输入（起手脉冲经 attackStarted() 暴露）
+    m_player.update(ctx);
+
+    // 玩家矩形只取一次：本步的碰撞检测与怪物追踪共用一个快照
+    const SDL_FRect playerRect = m_player.rect();
+
+    // 挥击结算：本步刚起手才结算（对判定范围内的每只怪物逐只结算一次）
+    if (m_player.attackStarted())
     {
-        // 激活对象池中的下一个敌人：随机出生点尽量远离玩家（当前矩形）
-        Enemy& enemy = m_enemies[static_cast<size_t>(m_enemySpawned)];
-        enemy.spawn(m_width, m_height, playerRect);
-        ++m_enemySpawned; // 计数 +1：这只从此刻起参与追踪/碰撞/渲染
-
-        // 排定下一只的出现时刻：本只时刻 + 增援间隔。
-        // 固定步长（1/120s）保证一步至多跨过一个生成点，无需 while 循环；
-        // 即使把间隔配得极小，每步也至多激活一只，不会瞬间喷出整池敌人
-        m_enemyNextSpawnTime += m_enemySpawnInterval;
-
-        // 冒烟观测点：敌人出现日志（自动化测试据此断言首袭与增援节奏）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "敌人出现（第 %d 只）", m_enemySpawned);
+        resolveAttack(playerRect);
     }
 
-    // 丁阶段（难度曲线·速度爬升）：本步追击速度 = 基础速度 + 每秒成长 x
-    // 局内已过秒数，并封顶 kEnemyMaxSpeed。封顶值 260 刻意低于玩家默认
-    // 速度 300——追兵再快也追不上全速逃跑的玩家，「可逃」是难度的设计红线；
-    // 默认参数下约 60 秒（110 + 2.5 x 60 = 260）到达上限，此后维持 260
-    const float enemySpeed =
-        std::min(m_enemySpeed + m_enemySpeedGrowth * m_enemyElapsed, kEnemyMaxSpeed);
-
-    // 丁阶段（敌人追踪）：每个已生成的敌人注入「本步目标 + 本步速度」后更新。
-    // 「场景注入、实体执行」的分工让难度规则完全留在本层：
-    // 目标 = 玩家矩形中心（Enemy::setTarget 内部取中心），
-    // 速度 = 上方按难度曲线算出的本步值
-    for (int i = 0; i < m_enemySpawned; ++i)
+    // 怪物刷新（边缘持续刷新 + 随时间增强）：局内秒数累计 + 到点生成
+    m_monsterElapsed += ctx.deltaTime; // 局内秒数：难度曲线与刷新节奏的计时基准
+    if (m_monsterElapsed >= m_monsterNextSpawnTime)
     {
-        Enemy& enemy = m_enemies[static_cast<size_t>(i)];
-        enemy.setTarget(playerRect);     // 注入追踪目标（玩家矩形 → 中心点）
-        enemy.setChaseSpeed(enemySpeed); // 注入本步速度（难度曲线：随时间爬升）
-        enemy.update(ctx);               // 执行：朝目标直线移动 + 播逼近动画
-    }
+        // 排定下一次尝试：间隔按当前局内时间收紧（下限 1s）。
+        // 固定步长（1/120s）保证一步至多跨过一个刷新点，无需 while 循环
+        m_monsterNextSpawnTime += currentSpawnInterval();
 
-    // 连击窗口倒计时：距上次收集超过 combo_window 秒后断连。
-    // 只在「窗口激活」时递减（0 表示已在窗口外，无事可做）；
-    // 归零时把连击数清 0——HUD 的「连击 xN」随之在下一帧消失
-    if (m_comboTimer > 0.0f)
-    {
-        m_comboTimer -= ctx.deltaTime; // 与倒计时同一时间基准（固定步长，暂停时冻结）
-        if (m_comboTimer <= 0.0f)
+        // 数量上限当前值：初始值 + 每 20s +2，封顶 12（池大小）
+        if (aliveMonsterCount() < currentMonsterCap())
         {
-            m_comboTimer = 0.0f; // 夹到 0：负数会让下一次收集的 >0 判定出现差错
-            if (m_comboCount >= 2)
+            // 从池中找一个空槽位（优先复用已死亡怪物的槽位）
+            for (Monster& monster : m_monsters)
             {
-                // 冒烟观测点：自动化测试据此断言「超窗口断连」（xN 清零）
+                if (monster.isAlive())
+                {
+                    continue; // 在场的槽位跳过，继续找空位
+                }
+
+                // 边缘内侧随机落位（避让玩家近旁）并按配置注入生命值
+                monster.spawnEdge(m_width, m_height, playerRect, m_monsterHp);
+                ++m_monsterSpawnedTotal; // 累计生成数 +1（日志编号自增）
+
+                // 冒烟观测点：怪物出现日志（沿用既有格式，自动化测试据此断言）
                 SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "连击窗口到期，连击中断（x%d）", m_comboCount);
+                            "怪物出现（第 %d 只）", m_monsterSpawnedTotal);
+                break; // 本步至多生成一只
             }
-            m_comboCount = 0; // 连击数清除：窗口外的下一次收集从 +1 重新起算
         }
     }
 
-    // 逐个检测金币与玩家是否重叠：重叠即视为「收集成功」
-    for (Coin& coin : m_coins)
+    // 难度曲线（速度爬升）：本步追击速度 = 基础速度 + 每秒成长 x 局内已过
+    // 秒数，并封顶 kMonsterMaxSpeed（260——低于玩家速度，保证跑得掉）
+    const float monsterSpeed =
+        std::min(m_monsterSpeed + m_monsterSpeedGrowth * m_monsterElapsed, kMonsterMaxSpeed);
+
+    // 怪物追踪：每个存活怪物注入「本步目标 + 本步速度」后更新。
+    // 「场景注入、实体执行」的分工让难度规则完全留在本层
+    for (Monster& monster : m_monsters)
     {
-        // 推进本枚金币的旋转动画（纯画面表现，不影响 24x24 碰撞盒）。
-        // 走的是 Entity 默认 update：无条件累加动画时间轴，与改造前一致
-        coin.update(ctx);
-
-        // AABB 相交检测；返回 true 说明玩家和这枚金币碰到了
-        if (rectsOverlap(playerRect, coin.rect()))
+        if (!monster.isAlive())
         {
-            // ---- 连击判定（本工序的核心规则；替代旧「每枚金币 +1」）----
-            // 距上次收集不超过 combo_window 秒（m_comboTimer 仍 >0）时
-            // 连击 +1，否则连击从 1 重新起算；本枚金币的得分 = 当前连击数。
-            // 连吃依次 +1、+2、+3...：密集收集的收益递增，
-            // 鼓励规划走位连续吃币，而不是慢慢单点收集
-            m_comboCount = (m_comboTimer > 0.0f) ? m_comboCount + 1 : 1;
-            m_score += m_comboCount;      // 累加本枚金币的连击得分
-            m_comboTimer = m_comboWindow; // 窗口重置：下一枚在窗口内收集即可续连
+            continue; // 空槽位不更新（也不渲染/碰撞）
+        }
 
-            // 冒烟观测点：记录本次得分与连击数（自动化测试据此断言连击节奏）
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "连击计分: +%d（连击 x%d）", m_comboCount, m_comboCount);
+        monster.setTarget(playerRect);       // 注入追踪目标（玩家矩形 → 中心点）
+        monster.setChaseSpeed(monsterSpeed); // 注入本步速度（难度曲线：随时间爬升）
+        monster.update(ctx);                 // 执行：移动 + 动画 + 闪白计时
+    }
 
-            // 播放收币短促「叮」（coin）：每次收集都触发；
-            // 同一音效连续触发时轨道从头重播，连收多枚时的听感自然衔接
+    // 经验宝石：推进旋转动画 -> 拾取判定 -> 统一清理
+    for (XpGem& gem : m_gems)
+    {
+        // 播放旋转动画（基类默认 update：推进帧时间轴，与渲染帧率解耦）
+        gem.update(ctx);
+
+        // AABB 相交即拾取：标记 + 累计经验 + 播放「叮」音效；
+        // 实际移除放在循环之后统一做（避免边遍历边删除）
+        if (!gem.isPicked() && rectsOverlap(playerRect, gem.rect()))
+        {
+            gem.markPicked();    // 标记：本次遍历结束后统一清理
+            m_xp += kGemXpValue; // 本批只累积经验值（升级系统下一批）
+
+            // 拾取音效沿用 coin.wav（与旧金币收集同一听觉反馈）
             m_audio->play(SoundId::Coin);
 
-            // 立刻把这枚金币传送到新的随机位置（随机范围跟随窗口实际尺寸）
-            coin.respawn(m_width, m_height, playerRect);
+            // 冒烟观测点：拾取日志（自动化测试据此断言掉落-拾取链路）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "拾取经验宝石（经验 %d）", m_xp);
         }
     }
+    // 统一清理已被拾取的宝石（保持其余元素的地址不变）
+    std::erase_if(m_gems, [](const XpGem& gem) { return gem.isPicked(); });
 
-    // 丁阶段（敌人碰撞）：仅玩家非无敌时检测（无敌期跳过碰撞 = 保护窗口）。
-    // 命中结算：扣时间、敌人沿远离玩家方向击退 150px、玩家进入 0.8s 无敌、
-    // 播放 hit 音效；时间归零统一由下文倒计时之后的 GameOver 入口处理
+    // 接触伤害：仅玩家非无敌时整段检测（无敌期 = 保护窗口，跳过判定）。
+    // 命中结算：扣生命、播 hit 音效、玩家进入无敌、怪物弹开；
+    // 同一步至多结算一次（结算后玩家立即无敌，其余怪物不再判定）
     if (m_playerInvincibleLeft <= 0.0f)
     {
-        for (int i = 0; i < m_enemySpawned; ++i)
+        for (Monster& monster : m_monsters)
         {
-            Enemy& enemy = m_enemies[static_cast<size_t>(i)];
-
-            // AABB 相交检测；返回 false 说明玩家和这只敌人还没碰上
-            if (!rectsOverlap(playerRect, enemy.rect()))
+            // 空槽位或与本步玩家矩形不相交：检查下一只（逐只独立判定）
+            if (!monster.isAlive() || !rectsOverlap(playerRect, monster.rect()))
             {
-                continue; // 未碰上：检查下一个（用 continue 而非 break——每只独立判定）
+                continue;
             }
 
-            // ---- 命中结算（同一步内至多触发一次：结算后玩家立即可无敌）----
-
-            // 1) 扣除时间：沿用「时间耗尽 → GameOver」的既有语义——
-            //    这里只扣，归零检查统一放在倒计时递减之后（GameOver 唯一入口）
-            m_timeLeft -= m_enemyHitPenalty;
-
-            // 冒烟观测点：被撞日志（自动化测试据此断言扣时发生）
+            // 1) 扣生命（夹到 0：日志展示永远不为负）
+            m_playerHp = std::max(m_playerHp - m_monsterDamage, 0);
+            // 冒烟观测点：受击日志（自动化测试据此断言扣血链路）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "被敌人击中，扣 %g 秒", static_cast<double>(m_enemyHitPenalty));
+                        "被怪物击中，扣 %d 点生命（剩余 %d/%d）",
+                        m_monsterDamage, m_playerHp, m_playerMaxHp);
 
             // 2) 打击音效（低频「闷响」）：与渲染闪烁共同构成「被撞」反馈
             m_audio->play(SoundId::Hit);
@@ -450,93 +397,161 @@ void PlayScene::update(const UpdateContext& ctx)
             // 3) 玩家无敌：碰撞检测从下一步起跳过；渲染上每 0.1s 显/隐交替
             m_playerInvincibleLeft = kPlayerInvincibleSeconds;
 
-            // 4) 敌人击退：沿「玩家中心 -> 敌人中心」方向瞬移 150px 并 clamp 视口。
+            // 4) 怪物弹开：沿「玩家中心 -> 怪物中心」方向瞬移 150px（沿用机制）。
             //    knockback 是瞬移类操作，内部已快照 prev=cur 防止插值拉丝
             const float playerCenterX = playerRect.x + playerRect.w * 0.5f;
             const float playerCenterY = playerRect.y + playerRect.h * 0.5f;
-            enemy.knockback(playerCenterX, playerCenterY,
-                            static_cast<float>(m_width), static_cast<float>(m_height));
+            monster.knockback(playerCenterX, playerCenterY,
+                              static_cast<float>(m_width), static_cast<float>(m_height),
+                              kContactKnockbackDistance);
 
-            break; // 玩家已进入无敌：同一步内的其余敌人不再判定
+            break; // 玩家已进入无敌：本步的其余怪物不再判定
         }
     }
 
-    // 倒计时按真实流逝时间递减（delta 单位是秒，与 30 秒常量同量纲）
-    m_timeLeft -= ctx.deltaTime;
-
-    // 时间耗尽：进入 GameOver 状态
-    if (m_timeLeft <= 0.0f)
+    // 生命归零：进入 GameOver（唯一入口——GameOver 仅因生命归零触发）
+    if (m_playerHp <= 0)
     {
-        m_timeLeft = 0.0f;             // 夹到 0，避免 HUD 显示 -0.1 这类负数
         m_state = PlayState::GameOver; // 冻结世界，等待玩家按 R 重开
-        // 播放结束下行音（gameover）：进入结束状态的唯一入口在这一处，
-        // 音效天然与状态切换一一对应（R 重开不会重复触发）
+        // 播放结束下行音（gameover）：与状态切换一一对应（R 重开不重复触发）
         m_audio->play(SoundId::GameOver);
         // 冒烟观测点：日志标记本局结束（自动化测试据此确认 GameOver 已到达）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "倒计时归零，本局结束");
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "生命归零，本局结束");
+    }
+}
 
-        // ---- 破纪录判定与存档（仅完整对局结束时结算）----
-        // 「完整对局」= 倒计时自然归零，且这是 GameOver 的唯一入口；
-        // 暂停中按 M 中途退出不经过这里，因此天然满足「中途退出不计」。
-        // 每局至多结算一次：GameOver 后 update 提前返回、R 重开进入的是
-        // 下一局的新分数，不会重复比较或重复写盘
-        if (m_score > m_highScore)
+// 结算一次挥击：对判定矩形内的每只存活怪物逐只结算。
+// 「每次挥击对范围内每只怪物结算一次」——判定在本函数一次完成，
+// 不随弧光显示时长持续扣血（挥击是单次判定而非持续伤害）
+void PlayScene::resolveAttack(const SDL_FRect& playerRect)
+{
+    // 攻击判定矩形：由玩家面朝方向与逻辑位置推出（约 64x56 的长条）
+    const SDL_FRect attackArea = m_player.attackRect();
+
+    // 伤害来源参照点：玩家中心（击退方向 = 远离玩家）
+    const float playerCenterX = playerRect.x + playerRect.w * 0.5f;
+    const float playerCenterY = playerRect.y + playerRect.h * 0.5f;
+
+    // 逐只判定存活怪物；池上限 12，线性遍历成本可忽略
+    for (Monster& monster : m_monsters)
+    {
+        if (!monster.isAlive())
         {
-            m_highScore = m_score; // 内存立即更新：HUD 与结束界面展示新纪录
-            m_isNewRecord = true;  // 标记本局破纪录（GameOver 显示「新纪录！」）
+            continue; // 空槽位跳过
+        }
 
-            // 立即写盘（而不是退出时统一保存）：即使随后进程被强杀/崩溃，
-            // 新纪录也不会丢。写盘失败由 SaveData 内部警告——内存里仍按
-            // 新纪录展示，只是下次启动会回退到旧值，游戏流程不受影响
-            SaveData::saveHighScore(m_highScore);
+        // AABB 相交检测：挥击矩形与怪物矩形是否重叠
+        if (!rectsOverlap(attackArea, monster.rect()))
+        {
+            continue; // 不在挥击范围内：这只怪物不受影响
+        }
 
-            // 破纪录专用音效（record，上行琶音）：与结束下行音形成对比，
-            // 在「本局结束」的听感上叠一层「刷新纪录」的奖励反馈
-            m_audio->play(SoundId::Record);
+        // 扣血（每只怪物本次挥击只结算一次：本循环对每只至多命中一次）
+        const bool died = monster.takeDamage(m_attackDamage);
 
-            // 冒烟观测点：自动化测试据此断言破纪录分支触发
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "新纪录！最高分更新为 %d", m_highScore);
+        if (died)
+        {
+            // 击杀结算：计数 +1、原地掉落经验宝石（位置取怪物中心）
+            ++m_killCount;
+            dropGemAt(monster.rect().x + monster.width() * 0.5f,
+                      monster.rect().y + monster.height() * 0.5f);
+
+            // 冒烟观测点：击杀日志（自动化测试据此断言攻击链路生效）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
+        }
+        else
+        {
+            // 未死：短距击退（沿「玩家中心 -> 怪物中心」方向远离玩家），
+            // 并记录剩余生命（冒烟观测点：受击链路）
+            monster.knockback(playerCenterX, playerCenterY,
+                              static_cast<float>(m_width), static_cast<float>(m_height),
+                              kAttackKnockbackDistance);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "命中怪物（剩余生命 %d）", monster.hp());
         }
     }
+}
+
+// 掉落一颗经验宝石到 (x, y)：两个坐标指「怪物中心」，内部换算为宝石左上角
+void PlayScene::dropGemAt(float x, float y)
+{
+    // 在链表尾部原位构造（节点式容器：插入不搬动既有元素，
+    // 实体持有的纹理指针绝不会因扩容被复制——这是选 std::list 的原因）
+    m_gems.emplace_back();
+    XpGem& gem = m_gems.back(); // 引用新宝石：完成加载与落位
+
+    // 纹理加载（三级回退在实体内部；失败只记录不中断——该宝石渲染时跳过）
+    if (!gem.load(m_renderer))
+    {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建经验宝石纹理失败：%s", SDL_GetError());
+    }
+
+    // 落位：坐标以怪物中心给出，换算到宝石左上角；setPosition 内部同步插值快照
+    gem.setPosition(x - gem.width() * 0.5f, y - gem.height() * 0.5f);
+}
+
+// 存活怪物计数：刷新上限的门控依据（池最多 12 个槽位，遍历成本可忽略）
+int PlayScene::aliveMonsterCount() const
+{
+    int count = 0; // 存活计数从 0 起
+    for (const Monster& monster : m_monsters)
+    {
+        if (monster.isAlive())
+        {
+            ++count; // 在场槽位 +1
+        }
+    }
+    return count; // 返回存活总数
+}
+
+// 当前数量上限：初始值（monster_max_count）+ 每 20 秒 +2，封顶 kMaxMonsterCap（12）。
+// 初始值高于封顶（配置异常/未来池扩容）时以封顶为准——池容量是硬边界
+int PlayScene::currentMonsterCap() const
+{
+    // 按已过「整 20 秒」的段数计算成长（int 截断即段数，如 39s -> 1 段）
+    const int grown = static_cast<int>(m_monsterElapsed / kCapGrowthPeriod) * kCapGrowthStep;
+    return std::min(m_monsterMaxCount + grown, kMaxMonsterCap); // 封顶后返回
+}
+
+// 当前刷新间隔：初始值（monster_spawn_interval，默认 2.5s）随局内时间
+// 线性收紧（kSpawnIntervalDecay），下限 kSpawnIntervalFloor（1s）。
+// 默认参数下约 60 秒从 2.5 收紧到 1.0，此后维持 1s
+float PlayScene::currentSpawnInterval() const
+{
+    return std::max(m_monsterSpawnInterval - m_monsterElapsed * kSpawnIntervalDecay,
+                    kSpawnIntervalFloor);
 }
 
 // 重开一局：把整局相关的数据全部恢复到初始状态
 void PlayScene::restart()
 {
-    // 分数清零，倒计时回到满值（局时长用 onEnter 时读到的配置值）
-    m_score = 0;
-    m_timeLeft = m_roundSeconds;
+    // 战斗数值复位：生命回满、击杀/经验清零、无敌清零
+    m_playerHp = m_playerMaxHp;    // 生命回满（上限用 onEnter 读到的配置值）
+    m_killCount = 0;               // 击杀清零
+    m_xp = 0;                      // 经验清零
+    m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
 
-    // 新纪录标记只属于刚结束的那一局：新一局从「未破纪录」状态开始。
-    // m_highScore 刻意保留——刚写入的最新纪录继续参与下一局的比较
-    m_isNewRecord = false;
-
-    // 连击状态复位：新一局从「无连击」开始（窗口计时一并清零）
-    m_comboCount = 0;
-    m_comboTimer = 0.0f;
+    // 怪物刷新计时复位：局内秒清零、首刷时刻回到首刷延迟、累计生成数清零
+    m_monsterElapsed = 0.0f;                   // 难度计时重新起算
+    m_monsterNextSpawnTime = kFirstSpawnDelay; // 首只怪物重新按 2s 延迟出现
+    m_monsterSpawnedTotal = 0;                 // 日志编号重新从第 1 只开始
 
     // 刷新窗口实际尺寸缓存：重开时窗口可能已被调整过大小
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
-    // 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半
+    // 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
+    // reset 同时清零速度与攻击状态（冷却/弧光/脉冲）
     m_player.reset(m_width / 2.0f - m_player.width() / 2.0f,
                    m_height / 2.0f - m_player.height() / 2.0f);
 
-    // 玩家矩形取一次，作为所有金币重生的避让区域
-    const SDL_FRect playerRect = m_player.rect();
-
-    // 所有金币重新随机位置，避免重开后还停在上一局的位置
-    for (Coin& coin : m_coins)
+    // 怪物池全部回收：槽位标记未激活（不再更新/渲染/碰撞），
+    // 等刷新时刻从空槽位重新生成；despawn 同时清掉追踪目标与闪白残留
+    for (Monster& monster : m_monsters)
     {
-        coin.respawn(m_width, m_height, playerRect);
+        monster.despawn();
     }
 
-    // 丁阶段：敌人与难度计时全部复位——已生成的敌人「收回池中」
-    //（m_enemySpawned 归零后不再更新/渲染/碰撞），生成时刻表回到首只时间
-    m_enemyElapsed = 0.0f;                        // 局内秒数清零：难度节奏重新起算
-    m_enemySpawned = 0;                           // 已生成数清零：对象池全部回收
-    m_enemyNextSpawnTime = m_enemyFirstSpawn;     // 首只敌人重新按配置时间出现
-    m_playerInvincibleLeft = 0.0f;                // 新一局从非无敌开始
+    // 场上经验宝石清空（析构各自释放纹理；renderer 尚在，安全）
+    m_gems.clear();
 
     // 最后切回 Playing，新一局正式开始
     m_state = PlayState::Playing;
@@ -545,7 +560,7 @@ void PlayScene::restart()
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "重开一局");
 }
 
-// 每帧渲染：清屏 -> 背景 -> 玩家 -> 敌人 -> 金币 -> HUD。
+// 每帧渲染：清屏 -> 背景 -> 玩家 -> 怪物 -> 挥击弧光 -> 宝石 -> HUD。
 // 不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
 // alpha 是插值系数，原样传给各实体——它们据此在上一固定步位置与当前
 // 固定步位置之间平滑绘制
@@ -595,32 +610,53 @@ void PlayScene::render(float alpha)
         m_player.render(m_renderer, alpha);
     }
 
-    // 丁阶段：绘制已生成的敌人（未生成的保持不可见——门控与 update 一致）。
-    // 与玩家/金币同样按插值位置绘制，逻辑步的离散位移平滑呈现
-    for (int i = 0; i < m_enemySpawned; ++i)
+    // 怪物：只绘制存活槽位（与 update 同一门控——空槽位不可见）
+    for (const Monster& monster : m_monsters)
     {
-        m_enemies[static_cast<size_t>(i)].render(m_renderer, alpha);
+        if (monster.isAlive())
+        {
+            monster.render(m_renderer, alpha);
+        }
     }
 
-    // 遍历绘制所有金币；数量少，直接循环即可（金币压在玩家与敌人之上，
-    // 拾取目标永远清晰可辨）
-    for (const Coin& coin : m_coins)
+    // 挥击弧光：在怪物之后绘制（命中特效压在怪物上方清晰可见）。
+    // 仅在「弧光计时 > 0」且纹理加载成功时绘制（素材缺失则特效整体跳过）
+    if (m_player.swingLeft() > 0.0f && m_slashTexture != nullptr)
     {
-        coin.render(m_renderer, alpha); // 每个金币按插值位置画到屏幕上
+        // 挂点：玩家插值中心（与本体同一平滑位置，快速移动时特效不脱节）
+        const SDL_FPoint center = m_player.interpolatedCenter(alpha);
+
+        // 目标矩形：素材边长（kSlashSize）以玩家中心为中心摆放
+        const SDL_FRect slashDst{ center.x - kSlashSize * 0.5f,
+                                  center.y - kSlashSize * 0.5f,
+                                  kSlashSize, kSlashSize };
+
+        // 旋转绘制：角度 = 面朝角（度、顺时针，与屏幕坐标一致）；
+        // center 传 nullptr = 绕目标矩形自身中心旋转（弧光的圆心与素材
+        // 图像中心重合，见素材生成脚本；旋转后弧口仍指向面朝方向）
+        SDL_RenderTextureRotated(m_renderer, m_slashTexture, nullptr, &slashDst,
+                                 static_cast<double>(m_player.facingAngleDegrees()),
+                                 nullptr, SDL_FLIP_NONE);
     }
 
-    // 游戏世界画完后再叠加 HUD 文字（分数/倒计时/暂停叠层/结束界面）
+    // 经验宝石：逐颗按插值位置绘制（最上层——拾取目标永远清晰可辨）
+    for (const XpGem& gem : m_gems)
+    {
+        gem.render(m_renderer, alpha);
+    }
+
+    // 游戏世界画完后再叠加 HUD 文字
     renderHud();
 }
 
-// 绘制 HUD 文字（分数、倒计时、暂停叠层、结束界面）。
+// 绘制 HUD 文字（左下角 FPS、暂停叠层、结束界面）。
 // 游戏文案统一走 Font（TTF 中文字体）：传入屏幕像素坐标，文字颜色由调用
 // 前的 SDL_SetRenderDrawColor 决定；左下角 FPS 调试行例外，仍用 DebugText
 // （SDL 内置调试字体，仅 ASCII，观感与改造前一致）
 void PlayScene::renderHud()
 {
-    // 查询渲染器输出尺寸（物理像素）。HUD 的右上角对齐等定位
-    // 都基于这个实际尺寸，而不是把 1280x720 硬编码进来
+    // 查询渲染器输出尺寸（物理像素）。HUD 的布局定位都基于这个实际尺寸，
+    // 而不是把 1280x720 硬编码进来
     int outW = 0;
     int outH = 0;
     SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
@@ -629,9 +665,9 @@ void PlayScene::renderHud()
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    // Paused / GameOver 叠层加半透明暗化遮罩：把游戏世界（背景/玩家/金币）
+    // Paused / GameOver 叠层加半透明暗化遮罩：把游戏世界（背景/玩家/怪物）
     // 整体压暗，让叠层文字从画面中浮出来。绘制顺序：遮罩放在最前——
-    // 之后绘制的 FPS 行、分数/时间与叠层文字都压在遮罩之上，保持全亮
+    // 之后绘制的 FPS 行与叠层文字都压在遮罩之上，保持全亮
     if (m_state == PlayState::Paused || m_state == PlayState::GameOver)
     {
         // 打开混合模式：颜色按 alpha 与画面混合（默认模式会直接覆盖）
@@ -659,11 +695,11 @@ void PlayScene::renderHud()
     // 这行是调试信息而非游戏 UI 文案，保持 SDL 内置调试字体（ASCII）
     if (m_fpsVisible)
     {
-        // 灰白色：不抢分数/时间的视觉焦点
+        // 灰白色：不抢游戏内容的视觉焦点
         SDL_SetRenderDrawColor(m_renderer, 180, 180, 180, 255);
 
-        // 左对齐 x=20（与分数行同一条左边线）；文字高 = 8 逻辑像素 x
-        // kFpsScale = 16 屏幕像素，再留 24 像素底边距 => y = 屏高 - 40
+        // 左对齐 x=20；文字高 = 8 逻辑像素 x kFpsScale = 16 屏幕像素，
+        // 再留 24 像素底边距 => y = 屏高 - 40
         const float fpsY = screenH - 40.0f;
 
         if (m_hasFrameSample)
@@ -679,43 +715,6 @@ void PlayScene::renderHud()
             DebugText::drawFormat(m_renderer, kFpsScale, 20.0f, fpsY,
                                   "FPS: -- | -- ms");
         }
-    }
-
-    // Playing 与 Paused 都显示分数/倒计时：
-    // 暂停时保留完整 HUD，玩家能看清冻结时刻的分数与剩余时间
-    if (m_state == PlayState::Playing || m_state == PlayState::Paused)
-    {
-        // 左上角：当前分数（白色）。位置沿用旧版屏幕坐标 (20, 20)
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        char scoreText[32]; // 容纳 "分数: " + 最长数字，绰绰有余
-        SDL_snprintf(scoreText, sizeof(scoreText), "分数: %d", m_score);
-        m_hudFont.draw(m_renderer, scoreText, 20.0f, 20.0f);
-
-        // 分数下方：连击数（橙色，>=2 才显示——单枚收集不值得单独提示；
-        // 断连后连击数清零，此行随下一帧渲染自动消失）。
-        // y=68 与分数行保持约一个行高的间隔，两行不重叠
-        if (m_comboCount >= 2)
-        {
-            SDL_SetRenderDrawColor(m_renderer, 255, 165, 0, 255);
-            char comboText[32]; // 容纳 "连击 x" + 最长数字，绰绰有余
-            SDL_snprintf(comboText, sizeof(comboText), "连击 x%d", m_comboCount);
-            m_hudFont.draw(m_renderer, comboText, 20.0f, 68.0f);
-        }
-
-        // 右上角：剩余时间（黄色）。右对齐：先实测文本宽度再反推 x
-        // （中文字体数字宽度不定，不能按字符数估算）
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        char timeText[32]; // 容纳 "时间: " + "xx.x"，绰绰有余
-        SDL_snprintf(timeText, sizeof(timeText), "时间: %.1f", m_timeLeft);
-        const SDL_FPoint timeSize = m_hudFont.measure(timeText); // 实测文本尺寸
-        m_hudFont.draw(m_renderer, timeText, screenW - timeSize.x - 20.0f, 20.0f);
-
-        // 顶部中央：历史最高分（金色）。与左上分数、右上时间同一条水平线，
-        // 三块各占一区互不重叠；drawCentered 实测宽度居中，窗口缩放后依然居中
-        SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
-        char highScoreText[32]; // 容纳 "最高分: " + 最长数字，绰绰有余
-        SDL_snprintf(highScoreText, sizeof(highScoreText), "最高分: %d", m_highScore);
-        m_hudFont.drawCentered(m_renderer, highScoreText, screenW / 2.0f, 20.0f);
     }
 
     if (m_state == PlayState::Paused)
@@ -742,41 +741,20 @@ void PlayScene::renderHud()
     else if (m_state == PlayState::GameOver)
     {
         // GameOver 界面：各行文字全部水平居中、围绕窗口中心排布
-        // （常规为四行；破纪录时在「最终分数」下方多一行「新纪录！」）。
-        // 标题行用大字号（kBigPtSize），行距据此重新排布
+        // （击杀/存活统计行在下一批「生存 HUD」补齐）
 
         // 水平中心：各行文字共用的对齐基准（垂直位置逐行下移）
         const float screenCenterX = screenW / 2.0f;
 
         // 第一行：游戏结束（白色大号标题）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_bigFont.drawCentered(m_renderer, "游戏结束", screenCenterX, screenH / 2.0f - 110.0f);
+        m_bigFont.drawCentered(m_renderer, "游戏结束", screenCenterX, screenH / 2.0f - 80.0f);
 
-        // 第二行：最终得分（黄色）。分数位数不定，先格式化到缓冲区，
-        // 由 drawCentered 实测宽度实现居中
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        char scoreText[32]; // 容纳 "最终分数: " + 最长数字，绰绰有余
-        SDL_snprintf(scoreText, sizeof(scoreText), "最终分数: %d", m_score);
-        m_hudFont.drawCentered(m_renderer, scoreText, screenCenterX, screenH / 2.0f - 10.0f);
+        // 第二行：重开提示（白色）
+        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 40.0f);
 
-        // 新纪录标记：本局得分刷新历史最高分时，在「最终分数」正下方
-        // 显示一行金色「新纪录！」（无新纪录时不显示、不占位）。
-        // 布局处理：显示时把下方两行整体下移 45px（一个行距），
-        // 保证三行互不重叠；不显示时保持改造前的原布局
-        const float recordShift = m_isNewRecord ? 45.0f : 0.0f; // 下方提示行的下移量
-        if (m_isNewRecord)
-        {
-            // 金色：与最终分数（黄色）拉开层次，突出"纪录"的荣誉感
-            SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
-            m_hudFont.drawCentered(m_renderer, "新纪录！", screenCenterX, screenH / 2.0f + 45.0f);
-        }
-
-        // 第三行：重开提示（白色）。破纪录时按 recordShift 下移
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 60.0f + recordShift);
-
-        // 第四行：回菜单提示（白色）。行距与上一行保持一致
-        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 120.0f + recordShift);
+        // 第三行：回菜单提示（白色）。行距与上一行保持一致
+        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 100.0f);
     }
 }
 
