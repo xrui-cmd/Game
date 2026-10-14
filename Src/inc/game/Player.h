@@ -7,7 +7,7 @@
 // Player：玩家实体（WASD 移动 + 行走帧动画）
 // ============================================================
 //
-// 继承自 Entity 获得的能力（与 Coin 共用，不再各自复制）：
+// 继承自 Entity 获得的能力（与 Monster/XpGem 共用，不再各自复制）：
 //   - 位置/尺寸数据与 rect()、setPosition()、width()/height() 查询
 //   - 纹理生命周期：release() 幂等释放，析构函数兜底
 //   - 三级回退纹理加载：精灵表 -> 单帧图 -> 程序化纯色（loadTextureWithFallback）

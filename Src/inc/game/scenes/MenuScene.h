@@ -11,14 +11,15 @@
 //
 // 职责：
 //   1. 资源：背景图与 PlayScene 相同（background.png，加载失败容忍）；
-//      标题/提示/小字字体（assets/fonts/SmileySans-Oblique.ttf，失败降级跳过文字）
+//      标题/提示字体（assets/fonts/SmileySans-Oblique.ttf，失败降级跳过文字）
 //   2. 交互：按 Enter（确认动作，可在 config 改键）进入对局——先播 start
 //      音效，再请求 SceneManager 切换到 PlayScene。输入走引擎输入系统的
 //      pressed 边缘（update 内查询），与对局内其他动作同一套体系
-//   3. 存档展示：onEnter 时读取历史最高分（game/SaveData），显示在
-//      操作说明下方的小字「历史最高: N」——每次回到菜单都重新读取，
-//      展示的是最新纪录（如刚从对局回来且破了纪录）
-//   4. 渲染：背景 + 四行文字——大号标题 / 开始提示 / 操作说明 / 历史最高
+//   3. 渲染：背景 + 三行文字——大号标题（工作名「ROGUE ARENA」，占位、
+//      易改）/ 开始提示 / 操作说明
+//
+// 历史注记：菜单曾展示「历史最高」小字（经 SaveData 读取）；本批存档链路
+// 整体停用（SaveData 文件保留、不调用），「最佳战绩」将在 M1-B 重构回归。
 //
 // 切换时机：Enter 只是「请求」切换，旧场景的析构与新场景的加载
 // 由 SceneManager 在帧末统一结算（原因见 SceneManager.h 的说明）
@@ -48,7 +49,6 @@ public:
 private:
     static constexpr float kTitlePtSize = 96.0f; // 标题字号（像素高，大号观感）
     static constexpr float kHintPtSize = 32.0f;  // 提示文字字号（与 HUD 同级）
-    static constexpr float kSmallPtSize = 24.0f; // 小字号（历史最高分注脚）
 
     SDL_Renderer* m_renderer = nullptr; // onEnter 保存的渲染器（只借用，不持有所有权）
 
@@ -60,10 +60,6 @@ private:
     // 露出清屏深蓝色兜底（与对局场景共用同一张 background.png）
     SDL_Texture* m_background = nullptr;
 
-    // 历史最高分：onEnter 时经 SaveData::loadHighScore 读取（缺失/损坏 → 0，
-    // 内部已警告）。每次进入菜单都重新读取，保证从对局返回后展示最新纪录
-    int m_highScore = 0;
-
     // 确认动作的去重标记：记录「上一次更新采样时 pressed 的值」。
     // pressed 在整帧的所有固定步都为 true（引擎按渲染帧采样），
     // 若不去重，一帧内补多个固定步会请求切换多次（构造多个 PlayScene）；
@@ -72,9 +68,8 @@ private:
 
     // 字体资源：一个实例对应一个字号。加载失败时 draw/measure 安全跳过
     // （Font 内部已记录警告），菜单仍然可玩（背景 + 无文字）
-    Font m_titleFont; // 大号标题字体（"COIN RUSH"）
+    Font m_titleFont; // 大号标题字体（"ROGUE ARENA"）
     Font m_hintFont;  // 提示文字字体（开始提示 / 操作说明）
-    Font m_smallFont; // 小字字体（历史最高分注脚）
 };
 
 #endif // !__MENUSCENE_H__

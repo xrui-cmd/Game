@@ -1,6 +1,5 @@
 #include "game/scenes/MenuScene.h"
 #include "game/scenes/PlayScene.h" // PlayScene：Enter 后要切换过去的对局场景
-#include "game/SaveData.h"         // SaveData：读取历史最高分（菜单注脚展示）
 #include "engine/Input.h"          // Input：ctx.input->pressed 查询确认动作边缘
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
@@ -54,22 +53,16 @@ void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/, AudioS
 
     // 4) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
     //    路径拼装模式与背景图一致：以 exe 所在目录为基准。
-    //    标题/提示/小字各加载一份（字号不同）；Font::load 内部会记录失败警告，
+    //    标题/提示各加载一份（字号不同）；Font::load 内部会记录失败警告，
     //    失败后对应文字安全跳过，菜单仍可进入对局，不阻塞游戏流程
     if (basePath != nullptr)
     {
         // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
         const std::string fontPath = std::string(basePath) + "assets/fonts/SmileySans-Oblique.ttf";
-        // 三个字号彼此独立：一份加载失败不影响其它份
+        // 两个字号彼此独立：一份加载失败不影响另一份
         m_titleFont.load(fontPath, kTitlePtSize); // 大号标题
         m_hintFont.load(fontPath, kHintPtSize);   // 提示文字
-        m_smallFont.load(fontPath, kSmallPtSize); // 历史最高分注脚（小字）
     }
-
-    // 5) 读取历史最高分（game/SaveData）：缺失（首次运行）/损坏时内部
-    //    已警告并按 0 处理——菜单永远能显示出一个合法数值。
-    //    每次进入菜单都重新读取：从对局返回后展示的就是最新纪录
-    m_highScore = SaveData::loadHighScore();
 }
 
 // 每帧更新：查询确认动作的按下边缘（Enter -> 进入对局）。
@@ -136,22 +129,15 @@ void MenuScene::render(float /*alpha*/)
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    // 第一行：大号标题（金黄色，与金币呼应）。
-    // 保留英文 "COIN RUSH"：品牌名不翻译，中文信息由下面两行承载
+    // 第一行：大号标题（金黄色）——工作名「ROGUE ARENA」为占位，改名成本
+    // 极低：只改这一处字符串与 GameDev 的窗口标题即可
     SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
-    m_titleFont.drawCentered(m_renderer, "COIN RUSH", screenW / 2.0f, screenH * 0.28f);
+    m_titleFont.drawCentered(m_renderer, "ROGUE ARENA", screenW / 2.0f, screenH * 0.30f);
 
     // 第二行：开始提示（白色，UTF-8 中文文案由 TTF 字体渲染）
     SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
     m_hintFont.drawCentered(m_renderer, "按 Enter 开始", screenW / 2.0f, screenH * 0.55f);
 
-    // 第三行：操作说明（白色，与上一行同字号）
-    m_hintFont.drawCentered(m_renderer, "WASD 移动 / ESC 暂停", screenW / 2.0f, screenH * 0.68f);
-
-    // 第四行：历史最高分小字（金色注脚）。放在操作说明下方、更小的字号，
-    // 数值位数不定，先格式化到缓冲区，由 drawCentered 实测宽度实现居中
-    SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);
-    char highScoreText[32]; // 容纳 "历史最高: " + 最长数字，绰绰有余
-    SDL_snprintf(highScoreText, sizeof(highScoreText), "历史最高: %d", m_highScore);
-    m_smallFont.drawCentered(m_renderer, highScoreText, screenW / 2.0f, screenH * 0.80f);
+    // 第三行：操作说明（白色，与上一行同字号）——本批起攻击键 J 正式登场
+    m_hintFont.drawCentered(m_renderer, "WASD 移动 / J 攻击 / ESC 暂停", screenW / 2.0f, screenH * 0.68f);
 }

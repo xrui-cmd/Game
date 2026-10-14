@@ -201,9 +201,10 @@ GameError GameDev::initialize()
     const int windowHeight = m_config.getInt("window_height", kDefaultWindowHeight);
 
     // 窗口由 GameDev 持有：主循环每帧查询它的尺寸装配视口信息。
-    // 标题用 UTF-8 中英混排（源码按 /utf-8 编译，SDL 接受 UTF-8 字符串）
+    // 标题使用工作名「ROGUE ARENA」——占位、易改：与菜单标题保持一致，
+    // 正式定名时两处字符串同步替换即可（纯 ASCII，不依赖 UTF-8 编码约定）
     m_window = SDL_CreateWindow(
-        "COIN RUSH 金币冲刺",
+        "ROGUE ARENA",
         windowWidth,
         windowHeight,
         0
