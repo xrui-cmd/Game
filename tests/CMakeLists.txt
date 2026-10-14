@@ -94,3 +94,52 @@ set_target_properties(config_parse_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  Input 输入系统单元测试（input_test）
+#
+#  与 config_parse_test 同模式：编译引擎源码（src/Input.cpp）并链接
+#  SDL3（Input.cpp 的 update() 路径引用 SDL_GetKeyboardState）。
+#  测试用 updateFromKeyArray 注入合成键盘状态，无需窗口与真实键盘，
+#  边沿检测与改键行为可确定性验证。
+#
+#  前置条件与运行命令同 config_parse_test：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\input_test.exe
+# ============================================================
+
+add_executable(input_test
+    input_test.cpp
+    ../libs/GameEngine/src/Input.cpp
+)
+
+if (MSVC)
+    target_compile_options(input_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Input.h 位于引擎子模块（按 "engine/Input.h" 引用），
+# SDL 头位于 vendor/SDL-main/include
+target_include_directories(input_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 链接主工程构建出的 SDL3 导入库（提供 SDL_GetKeyboardState / SDL_LogWarn 等符号）
+target_link_libraries(input_test PRIVATE
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib")
+
+# 运行目录放一份 SDL3.dll（与主工程使用同一份构建产物，版本天然一致）
+add_custom_command(TARGET input_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3.dll"
+    "$<TARGET_FILE_DIR:input_test>"
+)
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(input_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
