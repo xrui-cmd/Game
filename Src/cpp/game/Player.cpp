@@ -1,5 +1,6 @@
 #include "game/Player.h"
-#include <algorithm> // std::min / std::max / std::clamp：速度逼近与边界限制
+#include "engine/Input.h" // Input：经 ctx.input 查询移动动作（held）的接口定义
+#include <algorithm>      // std::min / std::max / std::clamp：速度逼近与边界限制
 
 // 本编译单元私有的移动小工具（不对外暴露）
 namespace
@@ -75,10 +76,11 @@ void Player::setMotion(float accel, float friction)
     m_friction = friction; // 覆盖摩擦减速度：无输入时的衰减速率随之更新
 }
 
-// 覆写更新：渐近加减速移动 + 行走动画。
-// 速度模型（本次改造）：目标速度 = 输入方向 x m_speed；当前速度以 accel
+// 覆写更新：动作查询驱动的渐近加减速移动 + 行走动画。
+// 速度模型（沿用上一版）：目标速度 = 输入方向 x m_speed；当前速度以 accel
 // （有输入）/ friction（无输入）逐轴逼近；位移 = 速度 x 固定步长。
-// 稳态速度与改造前一致（300 像素/秒），只是起步/停步多了短促过渡
+// 本批改造点：方向输入从「键位直读」迁移到「语义动作查询」——移动绑在
+// 哪些键上由 config 的 bind_move_* 决定，本函数对改键完全透明
 void Player::update(const UpdateContext& ctx)
 {
     // 第一行固定动作：快照「本步开始前的位置」作为渲染插值起点。
@@ -86,25 +88,30 @@ void Player::update(const UpdateContext& ctx)
     snapshotPreviousPosition();
 
     // 1) 读取输入方向（逐轴独立，取值 -1 / 0 / +1）。
-    //    同时按下相反方向时两值互相抵消（净输入为 0，视为无输入）
+    //    每一轴 = 正方向动作按下（+1）与负方向动作按下（-1）的合成，
+    //    同时按下相反方向时两值互相抵消（净输入为 0，视为无输入）。
+    //    input 为空指针（旧调用方未装配输入系统）时按「无输入」安全降级
     float inputX = 0.0f; // 水平输入累积：正右负左
     float inputY = 0.0f; // 垂直输入累积：正下负上（SDL 的 y 轴向下为正）
 
-    if (ctx.keyboard[SDL_SCANCODE_W])
+    if (ctx.input != nullptr)
     {
-        inputY -= 1.0f; // 上
-    }
-    if (ctx.keyboard[SDL_SCANCODE_S])
-    {
-        inputY += 1.0f; // 下
-    }
-    if (ctx.keyboard[SDL_SCANCODE_A])
-    {
-        inputX -= 1.0f; // 左
-    }
-    if (ctx.keyboard[SDL_SCANCODE_D])
-    {
-        inputX += 1.0f; // 右
+        if (ctx.input->held("move_up"))
+        {
+            inputY -= 1.0f; // 上
+        }
+        if (ctx.input->held("move_down"))
+        {
+            inputY += 1.0f; // 下
+        }
+        if (ctx.input->held("move_left"))
+        {
+            inputX -= 1.0f; // 左
+        }
+        if (ctx.input->held("move_right"))
+        {
+            inputX += 1.0f; // 右
+        }
     }
 
     // 2) 逐轴渐近更新速度（固定步长下的速度积分，结果与帧率无关）：

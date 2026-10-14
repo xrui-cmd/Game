@@ -8,6 +8,7 @@
 #include "ErrorCode.h"            // GameError：初始化/渲染失败的返回码
 #include "engine/AudioSystem.h"   // AudioSystem：音效系统的所有权持有者（成员类型）
 #include "engine/Config.h"        // Config：启动时加载的配置数据（成员类型）
+#include "engine/Input.h"         // Input：键盘动作映射/边沿检测（主循环每帧采样）
 #include "engine/SceneManager.h"  // SceneManager：当前场景的管理与转发
 
 // ============================================================
@@ -70,6 +71,7 @@ private:
     void update(float frameDelta); // 余额累加 + 固定步长补步（一帧内可能多次调用场景 update）
     GameError render();            // 计算插值系数 -> 转发场景绘制 -> 提交画面
     void shutdown();               // 逆序释放：场景 -> renderer -> window -> SDL_Quit
+    void bindInputActions();       // 装配输入绑定：config 的 bind_* 键 -> 语义动作（非法键名警告+默认回退）
 
 private:
     // 配置项缺省值：与改造前的硬编码常量逐一相同。
@@ -85,6 +87,13 @@ private:
     static constexpr int kMaxStepsPerFrame = 30;                      // 单帧补步上限：0.25s x 120Hz = 30 步（第二道防线）
 
     Config m_config; // 配置数据：initialize() 加载后只读；生命周期覆盖整个应用
+
+    // 输入系统：语义动作（move_up/attack/pause 等）到物理按键的映射表 + 边沿状态。
+    // initialize() 依据 config 的 bind_* 键完成绑定（见 bindInputActions）；
+    // run() 每个渲染帧在事件处理之后调用 m_input.update() 采样一次键盘；
+    // 上下文装配时以指针注入（UpdateContext::input），场景与实体经动作名
+    // 查询 held/pressed，不再直接读取物理按键
+    Input m_input;
 
     // 音效系统：所有权在本类，生命周期覆盖全部场景（场景只借用其指针）。
     // initialize() 里初始化；shutdown() 里在场景之后、renderer 之前销毁。

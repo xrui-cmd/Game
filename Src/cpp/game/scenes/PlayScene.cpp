@@ -2,6 +2,7 @@
 #include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
 #include "game/SaveData.h"         // SaveData：最高分存档（读取/写盘）
 #include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
+#include "engine/Input.h"          // Input：ctx.input->pressed 查询暂停/重开/回菜单边缘
 #include "engine/Rect.h"           // rectsOverlap：金币碰撞的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
@@ -198,8 +199,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     }
 }
 
-// 事件处理：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M 回主菜单。
-// 用「按键按下」事件而不是每帧轮询键盘状态，天然保证按一次只触发一次
+// 事件处理：只保留 F3（帧率显示切换）。
+// 迁移说明：暂停/重开/回菜单原先在这里按 SDL_EVENT_KEY_DOWN 处理，
+// 本批统一迁移为 update 中的 pressed 动作边缘（见 handleInputEdges）——
+// 好处是这些动作走 config 的 bind_* 配置、可改键，且与移动/攻击同一套查询；
+// F3 刻意维持事件式：它是调试开关而非玩法动作，不需要参与动作绑定
 void PlayScene::handleEvent(const SDL_Event& event)
 {
     // 只关心按键按下事件；其余事件一律忽略
@@ -208,12 +212,35 @@ void PlayScene::handleEvent(const SDL_Event& event)
         return;
     }
 
-    // ESC：在 Playing 与 Paused 之间切换（GameOver 下不响应）
-    if (event.key.scancode == SDL_SCANCODE_ESCAPE)
+    // F3：切换左下角 FPS/帧时间显示（任何对局状态下都响应）。
+    // 它不影响对局状态，只控制显示
+    if (event.key.scancode == SDL_SCANCODE_F3)
+    {
+        m_fpsVisible = !m_fpsVisible; // 开 <-> 关
+        // 冒烟观测点：日志确认切换实际发生（自动化测试据此断言）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "帧率显示: %s", m_fpsVisible ? "开" : "关");
+    }
+}
+
+// 输入动作的按下边缘处理（每个上升沿恰好响应一次）。
+// 调用位置：update 的最开头——暂停/重开/回菜单在任何状态下都要能响应
+//（包括 Paused/GameOver 的冻结分支；PlayScene 世界冻结但输入始终可用）
+void PlayScene::handleInputEdges(const UpdateContext& ctx)
+{
+    // 本步的边沿采样（ctx.input 为 nullptr 时按「都没按」安全降级）。
+    // 三个动作的语义与物理键位的对应关系由 config 的 bind_* 决定
+    const bool pausePressed = ctx.input != nullptr && ctx.input->pressed("pause");
+    const bool restartPressed = ctx.input != nullptr && ctx.input->pressed("restart");
+    const bool menuPressed = ctx.input != nullptr && ctx.input->pressed("menu");
+
+    // 暂停/恢复：ESC 在 Playing 与 Paused 之间切换（GameOver 下不响应）。
+    // 去重标记：同一帧补多个固定步时 pressed 恒 true，只在「首次见到上升沿」
+    // 的那一步执行切换，避免一帧内反复横跳
+    if (pausePressed && !m_pauseHandled)
     {
         if (m_state == PlayState::Playing)
         {
-            // 进入暂停：世界与倒计时从此冻结（update 对非 Playing 直接返回）
+            // 进入暂停：世界与计时从此冻结（update 对非 Playing 直接返回）
             m_state = PlayState::Paused;
             // 播放暂停轻音（pause）：与恢复共用同一个音效，切换动作的听觉确认
             m_audio->play(SoundId::Pause);
@@ -229,39 +256,36 @@ void PlayScene::handleEvent(const SDL_Event& event)
             // 冒烟观测点：确认恢复触发（自动化测试据此断言）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "对局恢复");
         }
-        return; // ESC 已处理：直接返回，避免落入下面的按键分支
     }
+    m_pauseHandled = pausePressed; // 记录本步采样：边沿消失前不再重复处理
 
-    // F3：切换左下角 FPS/帧时间显示（任何对局状态下都响应）。
-    // 放在 ESC 之后、其他分支之前：它不影响对局状态，只控制显示
-    if (event.key.scancode == SDL_SCANCODE_F3)
+    // 重开：仅 GameOver 下响应（Playing/Paused 按 R 无效果，与旧行为一致）
+    if (restartPressed && !m_restartHandled && m_state == PlayState::GameOver)
     {
-        m_fpsVisible = !m_fpsVisible; // 开 <-> 关
-        // 冒烟观测点：日志确认切换实际发生（自动化测试据此断言）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "帧率显示: %s", m_fpsVisible ? "开" : "关");
-        return; // F3 已处理：直接返回，避免落入下面的按键分支
+        restart(); // 重开一局（内部重置全部局面数据并打日志）
     }
+    m_restartHandled = restartPressed; // 记录采样：上升沿去重
 
-    // GameOver 下按 R：重置整局数据并切回 Playing
-    if (event.key.scancode == SDL_SCANCODE_R && m_state == PlayState::GameOver)
-    {
-        restart(); // 重开一局
-    }
-
-    // Paused 与 GameOver 下按 M：回主菜单（Playing 下不响应）。
+    // 回主菜单：Paused 与 GameOver 下按 M 生效（Playing 下不响应）。
     // 请求只登记，帧末由 SceneManager 结算，避免在自身回调里析构自己
-    if (event.key.scancode == SDL_SCANCODE_M &&
+    if (menuPressed && !m_menuHandled &&
         (m_state == PlayState::Paused || m_state == PlayState::GameOver))
     {
         m_sceneManager->requestScene(std::make_unique<MenuScene>());
     }
+    m_menuHandled = menuPressed; // 记录采样：上升沿去重
 }
 
-// 每帧更新：只有 Playing 状态才推进游戏逻辑。
+// 每帧更新：先处理输入动作边缘（任何状态都响应），再按状态推进游戏逻辑。
+// 只有 Playing 状态才推进游戏逻辑。
 // Paused（暂停）与 GameOver（结束）都冻结玩家、敌人、倒计时与金币——暂停
 // 由此天然实现了「世界与计时冻结」（敌人 update 的统一门控就在本函数开头）
 void PlayScene::update(const UpdateContext& ctx)
 {
+    // 输入动作边缘：暂停/重开/回菜单（与状态无关，先于冻结分支处理——
+    // 否则暂停后按 ESC/M 将无法恢复/回菜单）
+    handleInputEdges(ctx);
+
     // 非 Playing 状态：世界冻结。
     if (m_state != PlayState::Playing)
     {

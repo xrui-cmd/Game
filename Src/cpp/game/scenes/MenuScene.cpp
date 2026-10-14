@@ -1,6 +1,7 @@
 #include "game/scenes/MenuScene.h"
 #include "game/scenes/PlayScene.h" // PlayScene：Enter 后要切换过去的对局场景
 #include "game/SaveData.h"         // SaveData：读取历史最高分（菜单注脚展示）
+#include "engine/Input.h"          // Input：ctx.input->pressed 查询确认动作边缘
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
 #include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png 背景图
 #include <memory>                  // std::make_unique：构造 PlayScene
@@ -71,19 +72,20 @@ void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/, AudioS
     m_highScore = SaveData::loadHighScore();
 }
 
-// 事件处理：按 Enter 开始游戏。
-// 用「按键按下」事件而不是每帧轮询键盘状态，天然保证按一次只触发一次
-void MenuScene::handleEvent(const SDL_Event& event)
+// 每帧更新：查询确认动作的按下边缘（Enter -> 进入对局）。
+// 迁移说明：原先走 SDL_EVENT_KEY_DOWN 事件，现改为经输入系统查询 pressed；
+// 语义仍是「按一次进入一次」，且确认键走 config 的 bind_confirm 可改键
+void MenuScene::update(const UpdateContext& ctx)
 {
-    // 只关心按键按下事件；其余事件一律忽略
-    if (event.type != SDL_EVENT_KEY_DOWN)
-    {
-        return;
-    }
+    // 确认动作 = 主键盘 Enter（bind_confirm）或内置别名小键盘 Enter；
+    // ctx.input 为 nullptr（旧调用方未装配输入系统）时按「未按下」安全降级
+    const bool confirmPressed =
+        ctx.input != nullptr &&
+        (ctx.input->pressed("confirm") || ctx.input->pressed("confirm_kp"));
 
-    // 主键盘 Enter 与小键盘 Enter 都接受（SDL 把它们区分为两个键码）
-    if (event.key.scancode == SDL_SCANCODE_RETURN ||
-        event.key.scancode == SDL_SCANCODE_KP_ENTER)
+    // 去重标记：同一帧补多个固定步时 pressed 恒 true，只在首次见到上升沿
+    // 的那一步请求切换，避免同一帧构造多个 PlayScene
+    if (confirmPressed && !m_confirmHandled)
     {
         // 播放下发确认音（start，上扬音）：先给耳朵一个"开局"信号，
         // 场景切换本身由帧末结算，听觉与画面各走各的时序互不阻塞。
@@ -94,6 +96,7 @@ void MenuScene::handleEvent(const SDL_Event& event)
         // 每次按 Enter 都构造一个新的 PlayScene —— 「每次进入 = 全新一局」
         m_sceneManager->requestScene(std::make_unique<PlayScene>());
     }
+    m_confirmHandled = confirmPressed; // 记录本步采样：边沿消失前不再重复处理
 }
 
 // 每帧渲染：清屏 -> 背景 -> 标题与提示文字。

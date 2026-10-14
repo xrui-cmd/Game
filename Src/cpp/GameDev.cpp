@@ -1,14 +1,162 @@
 #include "GameDev.h"
 #include "game/scenes/MenuScene.h"  // 初始场景：主菜单（Enter 进入对局）
 #include <SDL3_ttf/SDL_ttf.h>       // TTF_Init / TTF_Quit：SDL3_ttf 库级生命周期
+#include <cctype>                   // std::toupper：键名解析前统一大写归一化
 #include <memory>                   // std::make_unique：构造场景管理器与场景
 #include <string>                   // std::string：拼接配置文件的绝对路径
+
+// 本编译单元私有的输入绑定解析工具（不对外暴露）
+namespace
+{
+
+// 键名 -> SDL 扫描码的「命名键」查找表：只收录带名字的非字母数字键。
+// 字母 A~Z 与数字 0~9 不在此表中——它们的扫描码是连续区段，由
+// parseKeyName 直接按偏移计算（少写几十行表项，见下）
+struct NamedKey
+{
+    const char* name;  // 配置里书写的键名（解析前统一归一化为大写）
+    SDL_Scancode key;  // 对应的 SDL 扫描码（与键盘布局无关的物理键位码）
+};
+
+// 命名键表：大小写不敏感；需要新键时在此追加（表小，线性查找足够直观）
+constexpr NamedKey kNamedKeys[] = {
+    { "ESC", SDL_SCANCODE_ESCAPE },          // ESC 简写
+    { "ESCAPE", SDL_SCANCODE_ESCAPE },       // ESC 全拼
+    { "ENTER", SDL_SCANCODE_RETURN },        // 主键盘回车
+    { "RETURN", SDL_SCANCODE_RETURN },       // ENTER 的别名写法
+    { "KP_ENTER", SDL_SCANCODE_KP_ENTER },   // 小键盘回车
+    { "SPACE", SDL_SCANCODE_SPACE },         // 空格
+    { "TAB", SDL_SCANCODE_TAB },             // 制表
+    { "BACKSPACE", SDL_SCANCODE_BACKSPACE }, // 退格
+    { "LEFT", SDL_SCANCODE_LEFT },           // 方向键：左
+    { "RIGHT", SDL_SCANCODE_RIGHT },         // 方向键：右
+    { "UP", SDL_SCANCODE_UP },               // 方向键：上
+    { "DOWN", SDL_SCANCODE_DOWN },           // 方向键：下
+    { "SHIFT", SDL_SCANCODE_LSHIFT },        // 修饰键统一取左侧键位
+    { "CTRL", SDL_SCANCODE_LCTRL },          // CTRL 简写
+    { "CONTROL", SDL_SCANCODE_LCTRL },       // CTRL 全拼
+    { "ALT", SDL_SCANCODE_LALT },            // ALT（取左侧）
+};
+
+// 把配置里的键名解析成 SDL 扫描码。解析规则（大小写不敏感）：
+//   1. 单字母 A~Z —— SDL_SCANCODE_A 起连续区段，按字母偏移直达
+//   2. 单数字 0~9 —— '1'~'9' 连续；'0' 在 SDL 枚举里排在 '9' 之后，单独映射
+//   3. F1~F12    —— SDL_SCANCODE_F1 起连续区段，按编号偏移
+//   4. 命名键     —— 查 kNamedKeys 表
+// 未识别的键名返回 SDL_SCANCODE_UNKNOWN（枚举值 0），调用方据此警告并回退
+SDL_Scancode parseKeyName(const std::string& name)
+{
+    // 归一化为大写后逐规则匹配：拷贝一份处理，不修改传入的原文
+    std::string upper = name;
+    for (char& c : upper)
+    {
+        // toupper 只接受 unsigned char 范围或 EOF：先转换再转回 char，
+        // 避免负值字符（非 ASCII）传入造成未定义行为
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    }
+
+    // 规则 1：单字母（'A' 的扫描码 + 字母序号 = 该字母的扫描码）
+    if (upper.size() == 1 && upper[0] >= 'A' && upper[0] <= 'Z')
+    {
+        return static_cast<SDL_Scancode>(SDL_SCANCODE_A + (upper[0] - 'A'));
+    }
+
+    // 规则 2：单数字——'1'~'9' 连续段按偏移映射
+    if (upper.size() == 1 && upper[0] >= '1' && upper[0] <= '9')
+    {
+        return static_cast<SDL_Scancode>(SDL_SCANCODE_1 + (upper[0] - '1'));
+    }
+    // '0' 不取巧：SDL 枚举里 0 排在 9 之后，直接给出（单条目不值得再凑公式）
+    if (upper.size() == 1 && upper[0] == '0')
+    {
+        return SDL_SCANCODE_0;
+    }
+
+    // 规则 3：F1~F12（"F12" 两位数时按十位/个位还原编号）
+    if (upper.size() >= 2 && upper[0] == 'F' && upper[1] >= '1' && upper[1] <= '9')
+    {
+        int number = upper[1] - '0'; // 十位数字（F1~F9 时即编号本身）
+        if (upper.size() == 3 && upper[2] >= '0' && upper[2] <= '9')
+        {
+            number = number * 10 + (upper[2] - '0'); // 个位：拼出 F10~F19 的编号
+        }
+        if (upper.size() <= 3 && number >= 1 && number <= 12)
+        {
+            return static_cast<SDL_Scancode>(SDL_SCANCODE_F1 + (number - 1));
+        }
+    }
+
+    // 规则 4：命名键线性查表（条目少，几次字符串比较即可）
+    for (const NamedKey& entry : kNamedKeys)
+    {
+        if (upper == entry.name)
+        {
+            return entry.key;
+        }
+    }
+
+    // 全部规则未命中：未知键名，交由调用方走「警告 + 默认回退」
+    return SDL_SCANCODE_UNKNOWN;
+}
+
+} // 匿名命名空间结束
 
 // GameDev 离开作用域时自动释放 SDL 资源。
 // main() 不需要手动调用 shutdown()。
 GameDev::~GameDev()
 {
     shutdown();
+}
+
+// 装配输入绑定：config/game.ini 的 bind_* 键 -> 语义动作名。
+// 调用时机：配置加载完成之后、场景创建之前（场景/实体随时可以查询动作）。
+// 每个动作的默认键名在调用处给出：缺键时 getString 返回默认键名；
+// 键名无法识别时警告并回退该动作的默认键——配置写错不会让游戏失去操作
+void GameDev::bindInputActions()
+{
+    // 单个动作的绑定流程（lambda 收敛重复十次的读-解析-回退-绑定逻辑）：
+    // 读配置键名 -> 解析为扫描码 -> 无法识别则警告并改用默认键 -> 写入输入系统
+    const auto bindAction =
+        [this](const char* action, const char* configKey,
+               const char* defaultKeyName, SDL_Scancode defaultKeyCode)
+    {
+        // 读取键名：缺键/空值由 getString 内部警告并返回默认键名（本处传入）
+        const std::string keyName = m_config.getString(configKey, defaultKeyName);
+
+        // 解析为 SDL 扫描码；BADKEY 之类的未知名走警告 + 默认回退分支
+        const SDL_Scancode key = parseKeyName(keyName);
+        if (key == SDL_SCANCODE_UNKNOWN)
+        {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "配置项 %s 的键名 \"%s\" 无法识别，回退默认键 %s",
+                        configKey, keyName.c_str(), defaultKeyName);
+            m_input.bind(action, defaultKeyCode); // 回退路径：用内置默认键
+            return;
+        }
+
+        m_input.bind(action, key); // 正常路径：按配置键名解析出的按键绑定
+    };
+
+    // 移动动作（held 持续查询：按住即走，松开即停）
+    bindAction("move_up", "bind_move_up", "W", SDL_SCANCODE_W);
+    bindAction("move_down", "bind_move_down", "S", SDL_SCANCODE_S);
+    bindAction("move_left", "bind_move_left", "A", SDL_SCANCODE_A);
+    bindAction("move_right", "bind_move_right", "D", SDL_SCANCODE_D);
+
+    // 战斗动作（pressed 边缘：按一次触发一次）
+    bindAction("attack", "bind_attack", "J", SDL_SCANCODE_J);
+
+    // 对局控制（pressed 边缘：暂停/重开/回菜单）
+    bindAction("pause", "bind_pause", "ESC", SDL_SCANCODE_ESCAPE);
+    bindAction("restart", "bind_restart", "R", SDL_SCANCODE_R);
+    bindAction("menu", "bind_menu", "M", SDL_SCANCODE_M);
+
+    // 菜单确认（pressed 边缘：菜单按确认进入对局）
+    bindAction("confirm", "bind_confirm", "ENTER", SDL_SCANCODE_RETURN);
+
+    // 小键盘回车：确认动作的内置别名（历史行为两个 Enter 都接受；
+    // 它不占配置键位——九个 bind_* 配置保持最小集合，菜单查询时一并检查）
+    m_input.bind("confirm_kp", SDL_SCANCODE_KP_ENTER);
 }
 
 GameError GameDev::initialize()
@@ -41,6 +189,10 @@ GameError GameDev::initialize()
         // 返回值刻意不判断「失败即中止」：加载失败是允许的降级路径
         m_config.loadFromFile(configPath);
     }
+
+    // 装配输入绑定：把 config 的 bind_* 键（缺键回退内置默认键、非法键名
+    // 警告后回退）写入输入系统。必须放在配置加载之后、任何场景创建之前
+    bindInputActions();
 
     // 窗口尺寸由配置决定（window_width / window_height，默认 1280x720）：
     // 改配置后重启即生效。极端非法尺寸（如 0）由 SDL_CreateWindow 的
@@ -130,6 +282,11 @@ GameError GameDev::run()
         //    事件按「渲染帧」粒度处理，本帧的所有固定步共享同一份键盘快照
         processEvents();
 
+        // 2.5 采样输入系统：每个渲染帧在事件泵之后采样一次 SDL 键盘状态，
+        //     推进动作的 held/pressed/released 边沿；同一渲染帧内补的所有
+        //     固定步共享这份快照（边沿不会中途消失——见 Input.h 的采样说明）
+        m_input.update();
+
         // 3. 固定步长补步：把本帧时间余额换成一个或多个固定步的 update
         update(frameDelta);
 
@@ -187,12 +344,15 @@ void GameDev::update(float frameDelta)
         SDL_GetWindowSize(m_window, &width, &height);
 
         // 装配固定步的「世界上下文」：一次构造，本帧所有固定步复用。
-        // deltaTime 恒为 kFixedDelta（固定步长，与真实帧率无关）
+        // deltaTime 恒为 kFixedDelta（固定步长，与真实帧率无关）。
+        // input 指向本帧已采样的输入系统（边沿在整帧内可见）；
+        // keyboard 是过渡期保留的键盘直读数组，新代码一律走 input 动作查询
         const UpdateContext fixedCtx{
             kFixedDelta,                   // 固定步长（秒）：逻辑与计时的唯一时间基准
-            SDL_GetKeyboardState(nullptr), // SDL 键盘状态数组（事件已在帧首统一刷新）
+            SDL_GetKeyboardState(nullptr), // SDL 键盘状态数组（过渡字段，待后续批次移除）
             static_cast<float>(width),     // 视口宽：移动边界 / 重生范围的计算基准
-            static_cast<float>(height)     // 视口高：同上
+            static_cast<float>(height),    // 视口高：同上
+            &m_input                       // 输入系统指针：动作查询入口（held/pressed）
         };
 
         // 3) 固定步循环：每转一圈消耗一步余额，直到不足一步或达到上限

@@ -12,8 +12,9 @@
 // 职责：
 //   1. 资源：背景图与 PlayScene 相同（background.png，加载失败容忍）；
 //      标题/提示/小字字体（assets/fonts/SmileySans-Oblique.ttf，失败降级跳过文字）
-//   2. 交互：按 Enter 进入对局（先播 start 音效，再请求 SceneManager
-//      切换到 PlayScene）
+//   2. 交互：按 Enter（确认动作，可在 config 改键）进入对局——先播 start
+//      音效，再请求 SceneManager 切换到 PlayScene。输入走引擎输入系统的
+//      pressed 边缘（update 内查询），与对局内其他动作同一套体系
 //   3. 存档展示：onEnter 时读取历史最高分（game/SaveData），显示在
 //      操作说明下方的小字「历史最高: N」——每次回到菜单都重新读取，
 //      展示的是最新纪录（如刚从对局回来且破了纪录）
@@ -36,10 +37,11 @@ public:
     // config 本阶段没有菜单可调项，签名与基类保持一致（暂不使用）
     void onEnter(SDL_Renderer* renderer, const Config& /*config*/, AudioSystem& audio) override;
 
-    // 事件：按 Enter 请求进入对局
-    void handleEvent(const SDL_Event& event) override;
+    // 每帧更新：查询确认动作的按下边缘（Enter -> 进入对局）。
+    // pressed 在整帧的所有固定步都为 true，用去重标记保证按一次只触发一次
+    void update(const UpdateContext& ctx) override;
 
-    // 渲染：背景 + 标题 + 提示文字（无更新逻辑，不覆写 update）。
+    // 渲染：背景 + 标题 + 提示文字（无其它更新逻辑）。
     // 菜单是纯静态界面，没有可插值的实体，alpha 参数忽略
     void render(float alpha) override;
 
@@ -61,6 +63,12 @@ private:
     // 历史最高分：onEnter 时经 SaveData::loadHighScore 读取（缺失/损坏 → 0，
     // 内部已警告）。每次进入菜单都重新读取，保证从对局返回后展示最新纪录
     int m_highScore = 0;
+
+    // 确认动作的去重标记：记录「上一次更新采样时 pressed 的值」。
+    // pressed 在整帧的所有固定步都为 true（引擎按渲染帧采样），
+    // 若不去重，一帧内补多个固定步会请求切换多次（构造多个 PlayScene）；
+    // 该标记把响应折叠为「每个上升沿恰好一次」
+    bool m_confirmHandled = false;
 
     // 字体资源：一个实例对应一个字号。加载失败时 draw/measure 安全跳过
     // （Font 内部已记录警告），菜单仍然可玩（背景 + 无文字）

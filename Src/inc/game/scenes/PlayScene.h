@@ -62,11 +62,12 @@ public:
     // 布置玩家、金币与敌人对象池
     void onEnter(SDL_Renderer* renderer, const Config& config, AudioSystem& audio) override;
 
-    // 事件：ESC 暂停/恢复、GameOver 下按 R 重开、Paused/GameOver 下按 M
-    // 回主菜单、F3 切换 FPS 显示（任何状态都响应）
+    // 事件：仅 F3 切换 FPS 显示（维持事件式调试开关）。
+    // 暂停/重开/回菜单已迁移为 update 中的 pressed 动作边缘（见 handleInputEdges）
     void handleEvent(const SDL_Event& event) override;
 
-    // 每帧更新：仅 Playing 状态推进移动/碰撞/倒计时（Paused/GameOver 冻结）。
+    // 每帧更新：先处理输入动作边缘（暂停/重开/回菜单，任何状态都响应），
+    // 再仅 Playing 状态推进移动/碰撞/计时（Paused/GameOver 冻结）。
     // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移
     void update(const UpdateContext& ctx) override;
 
@@ -76,6 +77,12 @@ public:
 private:
     // 重开一局：重置分数、倒计时、玩家位置、全部金币与敌人状态
     void restart();
+
+    // 输入动作的按下边缘处理：暂停/恢复（Playing <-> Paused）、
+    // 重开（GameOver 下 R）、回菜单（Paused/GameOver 下 M）。
+    // pressed 在整帧的所有固定步都为 true，用「本帧已处理」标记去重，
+    // 保证每次按下恰好触发一次（行为与事件式完全一致）
+    void handleInputEdges(const UpdateContext& ctx);
 
     // 绘制 HUD 文字（分数、最高分、倒计时、FPS、暂停叠层、结束界面）
     void renderHud();
@@ -191,6 +198,15 @@ private:
     float m_timeLeft = kDefaultRoundSeconds; // 本局剩余秒数（仅 Playing 状态递减）
 
     PlayState m_state = PlayState::Playing; // 当前对局状态
+
+    // ---- 输入动作边缘的去重标记 ----
+    // 语义：记录「上一次固定步采样时该动作的 pressed 值」。
+    // pressed 在整帧的所有固定步都为 true（引擎按渲染帧采样），若不做去重，
+    // 一帧内补多个固定步会让暂停这类切换动作被响应多次；该标记把响应
+    // 折叠为「每个上升沿恰好一次」。动作松开后标记随采样自然复位
+    bool m_pauseHandled = false;   // 暂停/恢复动作本帧是否已处理
+    bool m_restartHandled = false; // 重开动作本帧是否已处理
+    bool m_menuHandled = false;    // 回菜单动作本帧是否已处理
 
     // ---- FPS / 帧时间显示 ----
     // 显示内容：左下角 "FPS: 59.9 | 16.7 ms"。数值来自渲染帧间隔的
