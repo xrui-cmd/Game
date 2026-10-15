@@ -29,7 +29,9 @@ void formatSurvivalText(char* buffer, size_t size, float seconds)
 // Player 自持的武器素材绘制）。
 // 关键时机：SceneManager 先 onExit + 析构旧场景、后销毁 renderer，
 // 因此这里释放纹理时 renderer 尚在，安全；
-// 玩家/怪物/宝石的纹理由各自 Entity 的析构函数兜底释放
+// 玩家/怪物/宝石的纹理由各自 Entity 的析构函数兜底释放；
+// 升级音效播放器（LevelupSfx 成员）与本类其余成员一样随析构自动收尾
+// （关闭音频流、释放 PCM——同为 RAII，见该类头文件）
 PlayScene::~PlayScene()
 {
     // 只有纹理确实存在时才销毁，避免对空指针调用 SDL_DestroyTexture
@@ -68,20 +70,44 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      monster_spawn_interval  刷新间隔初始值（秒，随局内时间收紧）
     //      monster_max_count       数量上限初始值（只，随局内时间 +2）
     //      monster_damage          怪物接触伤害
+    //      xp_level_base           升级曲线基数（第 1 级升第 2 级的需求）
+    //      xp_level_growth         升级曲线倍率（需求逐级倍率）
+    //      levelup_max_hp_bonus    每级生命上限强化（并即时回血等值）
+    //      levelup_damage_bonus    每级攻击伤害强化（点）
+    //      levelup_speed_bonus     每级移速强化（像素/秒）
     const float playerSpeed = config.getFloat("player_speed", Player::kDefaultSpeed);
     const float playerAccel = config.getFloat("player_accel", Player::kDefaultAccel);
     const float playerFriction = config.getFloat("player_friction", Player::kDefaultFriction);
     const float playerAnimInterval =
         config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
-    m_playerMaxHp = config.getInt("player_hp", kDefaultPlayerHp);
     const float attackCooldown =
         config.getFloat("attack_cooldown", Player::kDefaultAttackCooldown);
-    m_attackDamage = config.getInt("attack_damage", kDefaultAttackDamage);
     m_attackRange = config.getFloat("attack_range", kDefaultAttackRange);
     m_monsterSpeedGrowth = config.getFloat("monster_speed_growth", kDefaultMonsterSpeedGrowth);
     m_monsterSpawnInterval =
         config.getFloat("monster_spawn_interval", kDefaultMonsterSpawnInterval);
     m_monsterDamage = config.getInt("monster_damage", kDefaultMonsterDamage);
+
+    // 三项「基准值」= 配置里的初始值（restart 复位目标）；三项「当前值」
+    // 从基准起步，局内升级由 grantXp 逐级追加，重开时再回到基准重新累积
+    m_playerSpeedBase = playerSpeed;                                         // 移速基准
+    m_playerMaxHpBase = config.getInt("player_hp", kDefaultPlayerHp);        // 生命上限基准
+    m_attackDamageBase = config.getInt("attack_damage", kDefaultAttackDamage); // 攻击伤害基准
+    m_playerSpeed = m_playerSpeedBase;   // 当前移速 = 基准（本局成长尚未发生）
+    m_playerMaxHp = m_playerMaxHpBase;   // 当前生命上限 = 基准
+    m_attackDamage = m_attackDamageBase; // 当前攻击伤害 = 基准
+
+    // 升级曲线与每级强化：曲线参数直接注入 LevelCurve——它内部对
+    // 0/负基数、小于 1 或 NaN 的倍率有完整的边界夹取（见其头文件，有单测）；
+    // 强化值负数无玩法语义（升级反而倒扣属性），沿用 monster_max_count
+    // 同款的防御写法：夹到 0 起（静默，注释即约定）
+    m_levelCurve.base = config.getInt("xp_level_base", kDefaultXpLevelBase);
+    m_levelCurve.growth = config.getFloat("xp_level_growth", kDefaultXpLevelGrowth);
+    m_levelupHpBonus = std::max(0, config.getInt("levelup_max_hp_bonus", kDefaultLevelupHpBonus));
+    m_levelupDamageBonus =
+        std::max(0, config.getInt("levelup_damage_bonus", kDefaultLevelupDamageBonus));
+    m_levelupSpeedBonus =
+        std::max(0.0f, config.getFloat("levelup_speed_bonus", kDefaultLevelupSpeedBonus));
 
     // 负数会经 static_cast 变成巨大的 size_t 引发异常（与金币池时代的防护同款），
     // 所以先用 std::max 夹到 0 以上；0 只怪物（无敌人模式）是允许的合法配置。
@@ -136,8 +162,9 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
 
     // 8) 注入玩家配置：速度、加减速、行走动画节奏与自动攻击冷却。
     //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
-    //    配置值晚一步落定才能覆盖它（各 set 对非法值会忽略并警告）
-    m_player.setSpeed(playerSpeed);
+    //    配置值晚一步落定才能覆盖它（各 set 对非法值会忽略并警告）。
+    //    速度注入的是「当前值」字段（= 基准起步；升级成长改的也是它）
+    m_player.setSpeed(m_playerSpeed);
     m_player.setMotion(playerAccel, playerFriction);
     m_player.setFrameTime(playerAnimInterval);
     m_player.setAttackCooldown(attackCooldown);
@@ -155,6 +182,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //     变体在「刷新时刻」才等权随机决定，纹理随变体由 loadVariant 按需加载
     //     （单帧 PNG 解码开销很小）；未激活的槽位不更新、不渲染、不参与碰撞
     m_monsters.resize(static_cast<size_t>(kMonsterPoolSize));
+
+    // 12) 加载升级音效（可选增强）：素材缺失/无音频设备只警告，升级静默、
+    //     流程照常（降级细节见 LevelupSfx.h 的契约）
+    m_levelupSfx.load();
 }
 
 // 事件处理：只保留 F3（帧率显示切换）。
@@ -274,6 +305,20 @@ void PlayScene::update(const UpdateContext& ctx)
         m_playerInvincibleLeft = std::max(m_playerInvincibleLeft - ctx.deltaTime, 0.0f);
     }
 
+    // 等级瞬闪计时与漂浮文字推进（仅 Playing 分支能走到这里）：暂停/结束时
+    // 本函数提前返回，计时与飘字寿命随世界一起冻结——暂停画面完全静止，
+    // 与「世界与计时冻结」的既有承诺一致
+    if (m_levelFlashLeft > 0.0f)
+    {
+        m_levelFlashLeft = std::max(m_levelFlashLeft - ctx.deltaTime, 0.0f);
+    }
+    for (FloatingText& text : m_floatingTexts)
+    {
+        text.update(ctx.deltaTime); // 寿命递减；位置与透明度在渲染时按进度即时换算
+    }
+    // 统一清理已到期的飘字（寿命归零 = 已淡尽，保留其余元素的遍历语义）
+    std::erase_if(m_floatingTexts, [](const FloatingText& text) { return text.isExpired(); });
+
     // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动、按
     // ctx.viewport* 做边界 clamp、按水平移动切换朝向翻转，并推进攻击计时
     m_player.update(ctx);
@@ -363,14 +408,20 @@ void PlayScene::update(const UpdateContext& ctx)
         // 实际移除放在循环之后统一做（避免边遍历边删除）
         if (!gem.isPicked() && rectsOverlap(playerRect, gem.rect()))
         {
-            gem.markPicked();    // 标记：本次遍历结束后统一清理
-            m_xp += kGemXpValue; // 本批只累积经验值（升级系统下一批）
+            gem.markPicked(); // 标记：本次遍历结束后统一清理
+
+            // 经验结算（本批新增）：进度累计 + 按曲线循环结算 + 逐级强化与
+            // 反馈（可能连升多级——grantXp 内部循环，日志逐级记录）
+            grantXp(kGemXpValue);
 
             // 拾取音效沿用 coin.wav（与旧金币收集同一听觉反馈）
             m_audio->play(SoundId::Coin);
 
-            // 冒烟观测点：拾取日志（自动化测试据此断言掉落-拾取链路）
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "拾取经验宝石（经验 %d）", m_xp);
+            // 冒烟观测点：拾取日志（自动化测试据此断言掉落-拾取链路）。
+            // 经验展示为「当前级进度/本级需求」——升级后的进度重置肉眼可查
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "拾取经验宝石（进度 %d/%d，等级 %d）",
+                        m_xp, m_levelCurve.needed(m_level), m_level);
         }
     }
     // 统一清理已被拾取的宝石（保持其余元素的地址不变）
@@ -487,6 +538,14 @@ void PlayScene::resolveAutoAttack(const SDL_FRect& playerRect)
     // 命中结算（单体）：扣血（闪白在 takeDamage 内自动触发）+ 死亡判定
     const bool died = nearest->takeDamage(m_attackDamage);
 
+    // 伤害飘字（本批新增）：在怪物位置弹出「-当前伤害值」（上浮+淡出）。
+    // 无论是否致死都展示——命中即反馈。位置取目标中心、上移 20 像素：
+    // 32 号字高约 40 像素，上移半字高让数字视觉上居中挂在怪物身上
+    char damageText[32]; // 容纳 "-" + 最长伤害数字，绰绰有余
+    SDL_snprintf(damageText, sizeof(damageText), "-%d", m_attackDamage);
+    spawnFloatingText(damageText, targetCenterX, targetCenterY - 20.0f,
+                      SDL_Color{ 255, 255, 255, 255 }); // 白色：与金色升级飘字区分
+
     // 冒烟观测点：自动攻击命中日志（含剩余生命——击杀这一击记为 0）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "自动攻击命中（剩余生命 %d）", nearest->hp());
 
@@ -527,6 +586,75 @@ void PlayScene::dropGemAt(float x, float y)
     gem.setPosition(x - gem.width() * 0.5f, y - gem.height() * 0.5f);
 }
 
+// 经验结算：把 amount 点经验并入当前进度，按升级曲线循环结算（一枚宝石
+// 可连升多级），并逐级发放强化与反馈。曲线计算走 LevelCurve 纯函数——
+// 本函数只负责「把结果落实到局面」：三项强化、升级飘字、HUD 瞬闪、音效
+void PlayScene::grantXp(int amount)
+{
+    // 曲线结算：返回新等级 / 当前级新进度 / 连升级数（纯函数，输入输出皆为数据）
+    const LevelUpResult result = m_levelCurve.apply(m_level, m_xp, amount);
+
+    // 记录升级前的等级：下面按「旧+1 .. 新」逐级发强化与反馈
+    const int oldLevel = m_level;
+
+    // 先落定结算结果：强化循环与结束界面读取的都是新状态
+    m_xp = result.xp;       // 当前级进度（恒小于本级需求）
+    m_level = result.level; // 新等级（等级只增不减）
+
+    // 逐级发放（一枚宝石连升多级时每级都发一份——强化是「每级」语义）
+    for (int levelReached = oldLevel + 1; levelReached <= m_level; ++levelReached)
+    {
+        // 1) 生命上限 +bonus 且即时回血等值（回血夹在上限内——从残血升级
+        //    能立刻多出这一截生命，构成「升级即续航」的即时正反馈）
+        m_playerMaxHp += m_levelupHpBonus; // 上限抬高
+        m_playerHp = std::min(m_playerHp + m_levelupHpBonus, m_playerMaxHp); // 即时回血并夹取
+
+        // 2) 攻击伤害 +bonus（此后自动攻击结算用新值，伤害飘字同步变大）
+        m_attackDamage += m_levelupDamageBonus;
+
+        // 3) 移速 +bonus 并注入玩家实体（下一固定步的移动立即使用新速度）
+        m_playerSpeed += m_levelupSpeedBonus;
+        m_player.setSpeed(m_playerSpeed);
+
+        // 4) 冒烟观测点：升级日志（规格文案「升级！等级 N」——自动化测试断言点）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级！等级 %d", levelReached);
+
+        // 5) 升级飘字（金色）挂在玩家上方；连升多级时逐条向上错开
+        //    （每条偏移 26 像素，避免多级连升时文字完全重叠）
+        const SDL_FRect playerRect = m_player.rect(); // 玩家当前位置（左上角）
+        spawnFloatingText("升级！",
+                          playerRect.x + playerRect.w * 0.5f,               // 水平中心
+                          playerRect.y - 24.0f - (levelReached - oldLevel - 1) * 26.0f, // 头顶上方
+                          SDL_Color{ 255, 215, 0, 255 },                    // 金色：升级高光
+                          kLevelupTextLifeSeconds);                         // 比伤害数字停留更久
+
+        // 6) 升级音效（游戏层直读 levelup.wav；音频不可用安全静默）
+        m_levelupSfx.play();
+    }
+
+    // 有升级才触发 HUD 瞬闪：短暂窗口内等级数字金白交替（渲染端消费本计时）
+    if (result.levelsGained > 0)
+    {
+        m_levelFlashLeft = kLevelFlashSeconds; // 重置为满值（连升多级只刷一次时长）
+    }
+}
+
+// 生成一条漂浮文字：同屏超上限先移除最老的一条，再原位构造新的
+void PlayScene::spawnFloatingText(const char* text, float centerX, float topY,
+                                  SDL_Color color, float lifeSeconds)
+{
+    // 上限控制：超标时丢弃最老一条（链表头）——「大量同屏不崩」的兜底，
+    // 正常节奏下（冷却 0.4s、寿命 0.8s）根本到不了上限
+    if (m_floatingTexts.size() >= static_cast<size_t>(kMaxFloatingTexts))
+    {
+        m_floatingTexts.pop_front(); // 移除最老（先创建的在前，按时间序淘汰）
+    }
+
+    // 原位构造新飘字（链表节点式容器，插入不搬动既有元素）并初始化
+    m_floatingTexts.emplace_back(); // 默认构造：寿命 0（未激活）
+    m_floatingTexts.back().spawn(text, centerX, topY, color, lifeSeconds); // 写入全部字段
+}
+
 // 存活怪物计数：刷新上限的门控依据（池最多 12 个槽位，遍历成本可忽略）
 int PlayScene::aliveMonsterCount() const
 {
@@ -562,10 +690,18 @@ float PlayScene::currentSpawnInterval() const
 // 重开一局：把整局相关的数据全部恢复到初始状态
 void PlayScene::restart()
 {
-    // 战斗数值复位：生命回满、击杀/经验清零、无敌清零
-    m_playerHp = m_playerMaxHp;    // 生命回满（上限用 onEnter 读到的配置值）
+    // 三项属性回基准：本局升级累积的成长全部撤销（基准值整局只读、从未被写）
+    m_playerMaxHp = m_playerMaxHpBase;   // 生命上限回到配置初值
+    m_attackDamage = m_attackDamageBase; // 攻击伤害回到配置初值
+    m_playerSpeed = m_playerSpeedBase;   // 移速回到配置初值
+    m_player.setSpeed(m_playerSpeed);    // 并重新注入玩家实体（立即生效）
+
+    // 战斗数值复位：生命回满、击杀/等级/经验清零、无敌清零
+    m_playerHp = m_playerMaxHp;    // 生命回满（上限已先回到基准）
     m_killCount = 0;               // 击杀清零
-    m_xp = 0;                      // 经验清零
+    m_level = 1;                   // 等级回到 1（新一局从第 1 级重新累积）
+    m_xp = 0;                      // 当前级进度清零
+    m_levelFlashLeft = 0.0f;       // 清掉上一局残留的等级瞬闪状态
     m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
     m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
 
@@ -591,6 +727,9 @@ void PlayScene::restart()
 
     // 场上经验宝石清空（析构各自释放纹理；renderer 尚在，安全）
     m_gems.clear();
+
+    // 场上漂浮文字清空：上一局未播完的伤害/升级飘字不跨局残留
+    m_floatingTexts.clear();
 
     // 最后切回 Playing，新一局正式开始
     m_state = PlayState::Playing;
@@ -667,6 +806,13 @@ void PlayScene::render(float alpha)
         gem.render(m_renderer, alpha);
     }
 
+    // 漂浮文字（伤害/升级共用）：世界层最上层——叠加在实体之上、HUD 之下。
+    // 暂停/结束时寿命已冻结，这里照常绘制即「静止画面」（位置/透明度不变）
+    for (const FloatingText& text : m_floatingTexts)
+    {
+        text.render(m_renderer, m_hudFont);
+    }
+
     // 游戏世界画完后再叠加 HUD 文字
     renderHud();
 }
@@ -740,21 +886,23 @@ void PlayScene::renderHud()
     }
 
     // ---- 生存 HUD（Playing 与 Paused 都显示）----
-    // 暂停时保留完整 HUD：玩家能看清冻结时刻的生命/击杀/存活/经验；
+    // 暂停时保留完整 HUD：玩家能看清冻结时刻的生命/等级/经验/击杀/存活；
     // GameOver 不显示（结束界面有自己的结算排版）
     if (m_state == PlayState::Playing || m_state == PlayState::Paused)
     {
-        // 血条几何常量（左上角第一块内容）
-        constexpr float kBarX = 20.0f;    // 血条左边界（与后续文字同一条左边线）
-        constexpr float kBarY = 22.0f;    // 血条上边界
-        constexpr float kBarW = 200.0f;   // 血条满宽（像素）
-        constexpr float kBarH = 22.0f;    // 血条高度（像素）
+        // 条状 HUD 几何常量（左上角第一块内容）
+        constexpr float kBarX = 20.0f;    // 条左边界（与后续文字同一条左边线）
+        constexpr float kBarW = 200.0f;   // 条满宽（像素）
+        constexpr float kHpBarY = 22.0f;  // 血条上边界
+        constexpr float kHpBarH = 22.0f;  // 血条高度（像素）
+        constexpr float kXpBarY = 112.0f; // 经验条上边界（等级行之下）
+        constexpr float kXpBarH = 16.0f;  // 经验条高度（像素）
 
         // 血条底色（深红）：先铺满整条，剩余生命的亮红前景覆盖其上——
         // 即使生命很少，也能从底色的存在看出「总量的量级」
         SDL_SetRenderDrawColor(m_renderer, 90, 24, 24, 255);
-        const SDL_FRect barBack{ kBarX, kBarY, kBarW, kBarH };
-        SDL_RenderFillRect(m_renderer, &barBack);
+        const SDL_FRect hpBarBack{ kBarX, kHpBarY, kBarW, kHpBarH };
+        SDL_RenderFillRect(m_renderer, &hpBarBack);
 
         // 血条前景（亮红）：宽度 = 满宽 x 剩余生命比例（0 血时宽度为 0）。
         // 比例计算防御除零（上限配置为 0 的极端情形按空血条画）
@@ -762,8 +910,8 @@ void PlayScene::renderHud()
             ? static_cast<float>(m_playerHp) / static_cast<float>(m_playerMaxHp)
             : 0.0f;
         SDL_SetRenderDrawColor(m_renderer, 220, 60, 60, 255);
-        const SDL_FRect barFill{ kBarX, kBarY, kBarW * hpRatio, kBarH };
-        SDL_RenderFillRect(m_renderer, &barFill);
+        const SDL_FRect hpBarFill{ kBarX, kHpBarY, kBarW * hpRatio, kHpBarH };
+        SDL_RenderFillRect(m_renderer, &hpBarFill);
 
         // 血条右侧：「HP 当前/上限」文字（白色，与血条纵向居中对齐）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
@@ -771,19 +919,51 @@ void PlayScene::renderHud()
         SDL_snprintf(hpText, sizeof(hpText), "HP %d/%d", m_playerHp, m_playerMaxHp);
         m_hudFont.draw(m_renderer, hpText, kBarX + kBarW + 12.0f, 16.0f);
 
-        // 血条下方三行：击杀 / 存活 / 经验（白色，行距 44 像素——
-        // HUD 字号 32 留出 12 像素行间隔，三行互不重叠）
+        // 等级行（第 2 行）：升级瞬闪窗口内金/白交替闪烁（高光反馈），
+        // 其余时刻白色。相位 = 剩余时长对闪烁周期取模，前 0.08s 一亮一暗
+        const bool levelFlashOn = m_levelFlashLeft > 0.0f &&
+            std::fmod(m_levelFlashLeft, kLevelFlashBlinkPeriod) < kLevelFlashBlinkPeriod * 0.5f;
+        if (levelFlashOn)
+        {
+            SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金：高光相位
+        }
+        else
+        {
+            SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255); // 白：常规（含窗口结束）
+        }
+        char levelText[48]; // 容纳 "等级: " + 最长数字，绰绰有余
+        SDL_snprintf(levelText, sizeof(levelText), "等级: %d", m_level);
+        m_hudFont.draw(m_renderer, levelText, kBarX, 64.0f);
+
+        // 经验条（第 3 行）：深金底 + 亮金前景（当前级进度/本级需求）。
+        // 升级瞬间进度被扣减并重置——条长回缩即「经验条重置」的视觉证据
+        const int xpNeeded = m_levelCurve.needed(m_level); // 本级需求（契约恒 >= 1）
+        const float xpRatio = (xpNeeded > 0)
+            ? static_cast<float>(m_xp) / static_cast<float>(xpNeeded)
+            : 0.0f;
+        SDL_SetRenderDrawColor(m_renderer, 70, 58, 30, 255); // 深金底：空白部分
+        const SDL_FRect xpBarBack{ kBarX, kXpBarY, kBarW, kXpBarH };
+        SDL_RenderFillRect(m_renderer, &xpBarBack);
+        SDL_SetRenderDrawColor(m_renderer, 230, 190, 60, 255); // 亮金前景：已积累部分
+        const SDL_FRect xpBarFill{ kBarX, kXpBarY,
+                                   kBarW * std::min(xpRatio, 1.0f), kXpBarH };
+        SDL_RenderFillRect(m_renderer, &xpBarFill);
+
+        // 经验条右侧：「经验 当前/所需」文字（白色）——数字与条同源同义，
+        // 取代旧版的「经验: N」累计值展示（现在 N 是当前级进度）
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        char xpText[64]; // 容纳 "经验 999/999"，绰绰有余
+        SDL_snprintf(xpText, sizeof(xpText), "经验 %d/%d", m_xp, xpNeeded);
+        m_hudFont.draw(m_renderer, xpText, kBarX + kBarW + 12.0f, 100.0f);
+
+        // 第 4/5 行：击杀 / 存活（白色，行距 44 像素——32 号字留 12 像素行间隔）
         char killText[48]; // 容纳 "击杀: " + 最长数字，绰绰有余
         SDL_snprintf(killText, sizeof(killText), "击杀: %d", m_killCount);
-        m_hudFont.draw(m_renderer, killText, 20.0f, 64.0f);
+        m_hudFont.draw(m_renderer, killText, 20.0f, 146.0f);
 
         char survivalText[48]; // 容纳「存活: mm:ss」，绰绰有余
         formatSurvivalText(survivalText, sizeof(survivalText), m_survivalSeconds);
-        m_hudFont.draw(m_renderer, survivalText, 20.0f, 108.0f);
-
-        char xpText[48]; // 容纳 "经验: " + 最长数字，绰绰有余
-        SDL_snprintf(xpText, sizeof(xpText), "经验: %d", m_xp);
-        m_hudFont.draw(m_renderer, xpText, 20.0f, 152.0f);
+        m_hudFont.draw(m_renderer, survivalText, 20.0f, 190.0f);
     }
 
     if (m_state == PlayState::Paused)
@@ -809,33 +989,36 @@ void PlayScene::renderHud()
     }
     else if (m_state == PlayState::GameOver)
     {
-        // GameOver 界面（结算）：游戏结束 + 击杀/存活两行成绩 + 两条操作提示，
-        // 全部水平居中、围绕窗口中心排布（不显示等级——升级系统在下一批）
+        // GameOver 界面（结算）：游戏结束 + 本局成绩（等级/击杀/存活）+
+        // 两条操作提示，全部水平居中、围绕窗口中心排布
 
-        // 水平中心：各行文字共用的对齐基准（垂直位置逐行下移）
+        // 水平中心与基准纵坐标：各行文字共用（基准取屏幕中心，行距 44 像素）
         const float screenCenterX = screenW / 2.0f;
+        const float centerY = screenH / 2.0f;
 
         // 第一行：游戏结束（白色大号标题）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_bigFont.drawCentered(m_renderer, "游戏结束", screenCenterX, screenH / 2.0f - 80.0f);
+        m_bigFont.drawCentered(m_renderer, "游戏结束", screenCenterX, centerY - 150.0f);
 
-        // 第二行：本局击杀数（黄色）——冒烟观测点：GameOver 结算内容
+        // 第二行：本局等级（黄色）——冒烟观测点：结束界面的「等级: N」
+        char levelText[48]; // 容纳 "等级: " + 最长数字，绰绰有余
+        SDL_snprintf(levelText, sizeof(levelText), "等级: %d", m_level);
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        char killText[48]; // 容纳 "击杀: " + 最长数字，绰绰有余
-        SDL_snprintf(killText, sizeof(killText), "击杀: %d", m_killCount);
-        m_hudFont.drawCentered(m_renderer, killText, screenCenterX, screenH / 2.0f - 10.0f);
+        m_hudFont.drawCentered(m_renderer, levelText, screenCenterX, centerY - 60.0f);
 
-        // 第三行：本局存活时长（黄色，mm:ss）
+        // 第三行：本局击杀与存活（黄色，mm:ss）——保留旧结算信息
+        char runText[64];      // 容纳 "击杀: 999 · 存活: mm:ss"，绰绰有余
         char survivalText[48]; // 容纳「存活: mm:ss」，绰绰有余
         formatSurvivalText(survivalText, sizeof(survivalText), m_survivalSeconds);
-        m_hudFont.drawCentered(m_renderer, survivalText, screenCenterX, screenH / 2.0f + 40.0f);
+        SDL_snprintf(runText, sizeof(runText), "击杀: %d · %s", m_killCount, survivalText);
+        m_hudFont.drawCentered(m_renderer, runText, screenCenterX, centerY - 10.0f);
 
         // 第四行：重开提示（白色）
         SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, screenH / 2.0f + 100.0f);
+        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, centerY + 100.0f);
 
         // 第五行：回菜单提示（白色）。行距与上一行保持一致
-        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH / 2.0f + 160.0f);
+        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, centerY + 160.0f);
     }
 }
 

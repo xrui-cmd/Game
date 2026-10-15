@@ -2,12 +2,15 @@
 #define __PLAYSCENE_H__
 
 #include "engine/Scene.h"       // Scene：场景基类
-#include "engine/AudioSystem.h" // AudioSystem：音效系统（拾取/受击/结束/暂停触发播放）
-#include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字，支持中文）
+#include "engine/AudioSystem.h" // AudioSystem：音效系统（拾取/受击/结束/暂停/破纪录触发播放）
+#include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字/漂浮文字，支持中文）
 #include "game/Player.h"        // Player：玩家实体（移动 + 自动攻击 + 武器挥击表现）
 #include "game/Monster.h"       // Monster：追击怪物（三变体、对象池）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
-#include <list>                 // std::list：经验宝石集合（节点式容器，元素地址稳定）
+#include "game/LevelCurve.h"    // LevelCurve：升级经验曲线（纯逻辑，tests/xp_test.cpp 直测）
+#include "game/FloatingText.h"  // FloatingText：漂浮文字（伤害飘字与升级飘字共用）
+#include "game/LevelupSfx.h"    // LevelupSfx：升级音效（游戏层直读；引擎加 SoundId::LevelUp 前的过渡）
+#include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
 #include <vector>               // std::vector：怪物对象池
 
 // ============================================================
@@ -18,30 +21,39 @@
 //   1. 资源：onEnter 加载背景图、玩家/怪物纹理与字体（背景可选，失败兜底；
 //      实体纹理各自析构兜底，玩家的武器素材由 Player 自持）；析构时释放
 //      场景自持的背景纹理
-//   2. 玩法（本批：素材换血 + 自动战斗改版——自动攻击·生存流）：
+//   2. 玩法（本批：成长闭环——经验升级与升级反馈）：
 //      - WASD 移动（左右移动时水平翻转朝向，静止保持上次朝向）；
 //      - 自动攻击（无需按键）：每个固定步结算一次索敌——对攻击范围
 //        （attack_range，默认 96px，玩家中心与怪物中心的距离）内
 //        「最近的怪物」出手；冷却 attack_cooldown（默认 0.4s）门控，
-//        伤害 attack_damage（默认 25）；本批单目标（多目标扩展留后续）；
+//        伤害 attack_damage（默认 25，随升级成长）；本批单目标；
 //        无目标不发招（索敌为空则整个结算流程直接结束）；
 //        出手时玩家朝目标方向播放武器挥击表现（0.12s 前探+收回）；
+//        命中瞬间在怪物位置弹出伤害飘字（-当前伤害值，上浮淡出）；
 //      - 怪物三变体等权随机刷新（史莱姆 20/90、哥布林 30/110、骷髅 18/140
 //        ——生命/基础速度，数值常量见 Monster.cpp 变体表），从窗口四边内侧
 //        持续刷新并随时间增强（数量上限初始 4、每 20s +2、封顶 12；
 //        刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s）；
 //        共同追踪玩家、接触伤害 10；
 //      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
-//      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开；拾取宝石累积经验
-//        （升级系统留待下一批）；生命归零 -> GameOver；
+//      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开；
+//      - 成长闭环（本批新增）：拾取宝石 +10 经验 -> 按 LevelCurve 曲线
+//        循环结算（溢出一枚可连升多级）-> 每级自动强化：生命上限 +10
+//        （并即时回血 10）、攻击伤害 +3、移速 +10；升级时「升级！」飘字
+//        （玩家上方）+ 等级数字瞬闪高亮 + levelup 音效（LevelupSfx 直读）；
+//      - 生命归零 -> GameOver；
 //      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键）。
 //   3. 音效：拾取播 coin、被撞播 hit、生命归零播 gameover、
-//      ESC 暂停/恢复播 pause（经 onEnter 注入的 AudioSystem；降级环境安全空操作）
-//   4. 配置：onEnter 时读取玩家速度/生命/自动攻击参数与怪物速度成长/刷新参数/
-//      接触伤害；缺键/坏值自动回退内置默认值
-//   5. 渲染：背景 -> 玩家（含挥剑表现）-> 怪物 -> 经验宝石 -> 生存 HUD
-//      （左上：HP 血条+文字；其下：击杀/存活/经验；左下角 FPS/帧时间，
-//      F3 切换显隐——调试开关维持事件式）
+//      ESC 暂停/恢复播 pause（经 onEnter 注入的 AudioSystem；
+//      降级环境安全空操作）、升级播 levelup（LevelupSfx 游戏层直读，
+//      见该类头文件说明——引擎 SoundId 扩展前的过渡实现）
+//   4. 配置：onEnter 时读取玩家速度/生命/自动攻击参数、怪物速度成长/刷新参数/
+//      接触伤害、升级曲线（xp_level_base/xp_level_growth）与每级强化
+//      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
+//      缺键/坏值自动回退内置默认值
+//   5. 渲染：背景 -> 玩家（含挥剑表现）-> 怪物 -> 经验宝石 -> 漂浮文字
+//      -> 生存 HUD（左上：HP 血条+文字；其下：等级（升级时瞬闪）/经验条
+//      （当前级进度/所需）/击杀/存活；左下角 FPS/帧时间，F3 切换显隐）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
 // 数据成员的默认值就是初始状态；onEnter 把玩家与怪物池布置到位，
@@ -49,8 +61,8 @@
 //
 // 状态机（PlayState）：
 //   Playing  ：接受输入、推进战斗、检测碰撞与刷新、存活时间正计时
-//   Paused   ：世界冻结（含存活计时），ESC 恢复、M 回主菜单
-//   GameOver ：世界冻结（仅因玩家生命归零触发），显示击杀/存活结算，
+//   Paused   ：世界冻结（含存活计时与飘字动画），ESC 恢复、M 回主菜单
+//   GameOver ：世界冻结（仅因玩家生命归零触发），显示本局等级/击杀/存活，
 //              等待 R 重开或 M 回主菜单
 // ============================================================
 
@@ -81,13 +93,13 @@ public:
     // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移
     void update(const UpdateContext& ctx) override;
 
-    // 每帧渲染：清屏、背景、玩家（含挥剑表现）、怪物、宝石、HUD。
+    // 每帧渲染：清屏、背景、玩家（含挥剑表现）、怪物、宝石、漂浮文字、HUD。
     // alpha 是插值系数，原样转发给实体
     void render(float alpha) override;
 
 private:
-    // 重开一局：生命/击杀/经验复位、玩家归位、回收全部怪物与宝石、
-    // 刷新计时重排
+    // 重开一局：生命/击杀/等级/经验复位、三项属性回基准、玩家归位、
+    // 回收全部怪物/宝石/飘字、刷新计时重排
     void restart();
 
     // 输入动作的按下边缘处理：暂停/恢复（Playing <-> Paused）、
@@ -104,6 +116,16 @@ private:
     // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位
     void dropGemAt(float x, float y);
 
+    // 经验结算（拾取宝石时调用）：按升级曲线循环结算，并逐级发放强化与反馈
+    // （生命上限+回血、攻击伤害、移速、日志、「升级！」飘字、HUD 瞬闪、音效）。
+    // 曲线计算走 LevelCurve 纯函数——本函数只负责把结果落实到局面
+    void grantXp(int amount);
+
+    // 生成一条漂浮文字（伤害飘字/升级飘字共用）。同屏数量超过上限时
+    // 先移除最老的一条（front），保证渲染开销有界、大量同屏不失控
+    void spawnFloatingText(const char* text, float centerX, float topY, SDL_Color color,
+                           float lifeSeconds = FloatingText::kDefaultLifeSeconds);
+
     // 当前存活的怪物数（对象池中 alive 的槽位数；刷新上限的门控依据）
     int aliveMonsterCount() const;
 
@@ -114,7 +136,8 @@ private:
     // 下限 1s
     float currentSpawnInterval() const;
 
-    // 绘制 HUD 文字（生存 HUD：HP/击杀/存活/经验；FPS 调试行；暂停/结束叠层）
+    // 绘制 HUD 文字/条（生存 HUD：HP 条、等级+经验条、击杀/存活；
+    // FPS 调试行；暂停/结束叠层与结算界面）
     void renderHud();
 
     // 采样本渲染帧的间隔时间并做 EMA 平滑（render 每帧开头调用）。
@@ -130,6 +153,11 @@ private:
     static constexpr float kDefaultMonsterSpawnInterval = 2.5f; // 刷新间隔初始值（秒）
     static constexpr int kDefaultMonsterMaxCount = 4;           // 数量上限初始值（只）
     static constexpr int kDefaultMonsterDamage = 10;            // 怪物接触伤害
+    static constexpr int kDefaultXpLevelBase = 30;              // 升级曲线基数（xp_level_base）
+    static constexpr float kDefaultXpLevelGrowth = 1.35f;       // 升级曲线倍率（xp_level_growth）
+    static constexpr int kDefaultLevelupHpBonus = 10;           // 每级生命上限强化（levelup_max_hp_bonus）
+    static constexpr int kDefaultLevelupDamageBonus = 3;        // 每级攻击伤害强化（levelup_damage_bonus）
+    static constexpr float kDefaultLevelupSpeedBonus = 10.0f;   // 每级移速强化（levelup_speed_bonus，像素/秒）
 
     // ---- 玩法常量（代码固定，不进配置；改动须连同注释一起审视）----
     static constexpr int kMonsterPoolSize = 12;          // 怪物对象池槽位数 = 数量上限封顶值
@@ -162,8 +190,24 @@ private:
     // 让玩家在冷却窗口内仍有下一击的牵制（多数变体两击内可杀）
     static constexpr float kAttackKnockbackDistance = 60.0f;
 
-    // 每颗经验宝石的经验值（代码常量）：升级系统下一批落地，本批只累计与显示
+    // 每颗经验宝石的经验值（代码常量，不进配置）：10 点 = 默认曲线第 1 级
+    // 需求（30）的三分之一——升到 2 级需要拾取 3 颗
     static constexpr int kGemXpValue = 10;
+
+    // 漂浮文字同屏上限（条）：超过上限时移除最老一条。数量级参考——默认
+    // 节奏下命中冷却 0.4s、飘字寿命 0.8s，稳定同屏只有寥寥几条；上限只是
+    // 「大量同屏」（如未来多目标攻击）时的兜底，保证绘制开销有界不失控
+    static constexpr int kMaxFloatingTexts = 64;
+
+    // 升级时等级数字的高亮时长（秒）：窗口内数字颜色金白交替闪烁（瞬闪效果）
+    static constexpr float kLevelFlashSeconds = 0.5f;
+
+    // 升级高亮闪烁周期（秒）：金/白各占半周期（0.08s 切换一次，肉眼可感的短闪）
+    static constexpr float kLevelFlashBlinkPeriod = 0.16f;
+
+    // 「升级！」飘字寿命（秒）：比伤害数字更长——升级是稀有的高光反馈，
+    // 多停留一会儿让玩家看清；伤害数字用 FloatingText 的默认寿命（0.8s）
+    static constexpr float kLevelupTextLifeSeconds = 1.2f;
 
     static constexpr float kHudPtSize = 32.0f; // HUD/提示文字字号（像素高，小数需求清晰）
     static constexpr float kBigPtSize = 64.0f; // 暂停/结束标题字号（大号观感）
@@ -194,20 +238,45 @@ private:
     Player m_player;                 // 玩家实体
     std::vector<Monster> m_monsters; // 怪物对象池（预创建 kMonsterPoolSize 个槽位）
     std::list<XpGem> m_gems;         // 场上未被拾取的经验宝石
+    std::list<FloatingText> m_floatingTexts; // 场上存活的漂浮文字（伤害/升级共用）
+
+    // 升级音效播放器（游戏层直读 assets/sounds/levelup.wav）：
+    // 引擎 AudioSystem 是固定 6 音效的强类型枚举、没有 LevelUp，而本批
+    // 约束「引擎仓不动」——故用自包含小播放器过渡（设计见 LevelupSfx.h）。
+    // 随场景构造/析构（RAII）：切场景或退出时自动关流释放
+    LevelupSfx m_levelupSfx;
 
     // ---- 战斗配置（onEnter 读取；R 重开不重读，整局沿用同一套调参）----
-    int m_playerMaxHp = kDefaultPlayerHp;                 // 玩家生命上限（player_hp）
-    int m_attackDamage = kDefaultAttackDamage;            // 自动攻击伤害（attack_damage）
+    // 三项基准值：配置里的「初始值」，也是 restart 复位时的还原目标；
+    // 本局升级带来的成长只体现在下面的「当前值」，不污染基准
+    int m_playerMaxHpBase = kDefaultPlayerHp;      // 生命上限基准（player_hp）
+    int m_attackDamageBase = kDefaultAttackDamage; // 攻击伤害基准（attack_damage）
+    float m_playerSpeedBase = Player::kDefaultSpeed; // 移速基准（player_speed）
+
+    // 三项当前值：基准 + 本局升级累积（grantXp 每级追加；restart 从基准复位）；
+    // 均注入 Player/局面——它们才是实际参与战斗运算的数值
+    int m_playerMaxHp = kDefaultPlayerHp;            // 当前生命上限（受 levelup_max_hp_bonus 增长）
+    int m_attackDamage = kDefaultAttackDamage;       // 当前攻击伤害（受 levelup_damage_bonus 增长）
+    float m_playerSpeed = Player::kDefaultSpeed;     // 当前移速（受 levelup_speed_bonus 增长；经 setSpeed 注入）
+
     float m_attackRange = kDefaultAttackRange;            // 自动攻击范围（attack_range，像素）
     float m_monsterSpeedGrowth = kDefaultMonsterSpeedGrowth; // 速度成长（monster_speed_growth）
     float m_monsterSpawnInterval = kDefaultMonsterSpawnInterval; // 刷新间隔初始值（monster_spawn_interval）
     int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）
     int m_monsterDamage = kDefaultMonsterDamage;          // 接触伤害（monster_damage）
 
+    // ---- 升级配置与曲线（onEnter 读取；R 重开不重读）----
+    LevelCurve m_levelCurve;                              // 经验曲线（base/growth 从 xp_* 键注入）
+    int m_levelupHpBonus = kDefaultLevelupHpBonus;        // 每级生命上限强化（levelup_max_hp_bonus）
+    int m_levelupDamageBonus = kDefaultLevelupDamageBonus; // 每级攻击伤害强化（levelup_damage_bonus）
+    float m_levelupSpeedBonus = kDefaultLevelupSpeedBonus; // 每级移速强化（levelup_speed_bonus）
+
     // ---- 战斗运行时状态（restart 复位）----
     int m_playerHp = kDefaultPlayerHp;   // 玩家当前生命（归零 -> GameOver）
     int m_killCount = 0;                 // 本局累计击杀数（击杀日志/HUD/结算使用）
-    int m_xp = 0;                        // 本局累计经验（升级逻辑下一批；HUD 展示）
+    int m_level = 1;                     // 当前等级（restart 复位为 1；升级只增不减）
+    int m_xp = 0;                        // 当前级已积累经验（结算后恒小于本级需求；HUD 进度条）
+    float m_levelFlashLeft = 0.0f;       // 等级数字瞬闪剩余时长（秒；升级时置满，仅 Playing 递减）
 
     // 本局存活时间（秒）：仅 Playing 正计时（暂停/结束冻结），restart 清零。
     // 从「倒计时」改为「正向累积」——GameOver 仅由生命归零触发，存活时间

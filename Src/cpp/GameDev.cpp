@@ -241,7 +241,9 @@ GameError GameDev::initialize()
     }
 
     // 初始化音效系统（可选增强）：MIX_Init + 打开默认播放设备 + 预加载
-    // 四个 WAV。任何环节失败（如系统无音频设备）都只在内部警告一次并
+    // 六个 WAV（升级音 levelup.wav 不在其中——引擎 SoundId 扩展前由对局侧
+    // 的 LevelupSfx 直读播放，见 game/LevelupSfx.h 的过渡性说明）。
+    // 任何环节失败（如系统无音频设备）都只在内部警告一次并
     // 整体降级——游戏静默运行，不因此中止启动，因此返回值刻意不判断
     m_audio.initialize();
 

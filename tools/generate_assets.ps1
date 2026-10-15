@@ -9,6 +9,7 @@
 #         assets/sounds/pause.wav     暂停轻提示
 #         assets/sounds/hit.wav       受击闷响
 #         assets/sounds/record.wav    破纪录上行琶音
+#         assets/sounds/levelup.wav   升级四连上行琶音（本批新增）
 #
 # 【职责调整】图像素材（角色/怪物/宝石/武器/背景）已移交
 #   tools/compose_sprites.ps1——由它从 third_party 原始像素帧组装成品；
@@ -361,6 +362,19 @@ $recordSamples = New-SineSamples -segments @(
 ) -amplitude 0.8 -decayTime 0.15
 Save-Wav16Mono -samples $recordSamples -path (Join-Path $soundsDir "record.wav") -sampleRate $wavSampleRate
 
+# ---- 7) 升级音 levelup.wav：上行四连音琶音（本批新增）----
+# C5(523.25) -> E5(659.25) -> G5(783.99) -> C6(1046.50Hz)，每段 0.1s、
+# 共约 0.4s：在 record 的三连音之上再顶到高八度 C6 收束——「升了一级、
+# 又上一层」的情绪比破纪录更短促集中；衰减取 0.4s（明显慢于 record 的
+# 0.15s）让四颗音在整段时长内都清晰可辨，不被指数包络吃掉
+$levelupSamples = New-SineSamples -segments @(
+    @{ StartHz = 523.25;  EndHz = 523.25;  Seconds = 0.1 },
+    @{ StartHz = 659.25;  EndHz = 659.25;  Seconds = 0.1 },
+    @{ StartHz = 783.99;  EndHz = 783.99;  Seconds = 0.1 },
+    @{ StartHz = 1046.50; EndHz = 1046.50; Seconds = 0.1 }
+) -amplitude 0.8 -decayTime 0.4
+Save-Wav16Mono -samples $levelupSamples -path (Join-Path $soundsDir "levelup.wav") -sampleRate $wavSampleRate
+
 # ============================================================
 # 生成后自检：重新读盘校验全部 WAV 的头与时长
 # ============================================================
@@ -381,6 +395,9 @@ Assert-Wav16Mono -path (Join-Path $soundsDir "hit.wav") -expectedSeconds 0.15
 
 # 校验破纪录音：约 300ms（三段各 4410 个样本，合计恰好 0.3s）
 Assert-Wav16Mono -path (Join-Path $soundsDir "record.wav") -expectedSeconds 0.3
+
+# 校验升级音：约 400ms（四段各 4410 个样本，合计恰好 0.4s）
+Assert-Wav16Mono -path (Join-Path $soundsDir "levelup.wav") -expectedSeconds 0.4
 
 # 全部完成提示
 Write-Host "全部音效生成并校验完成。"
