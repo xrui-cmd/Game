@@ -15,6 +15,10 @@
 #         weapon.png               骑士剑（weapon_knight_sword，3 倍 -> 30x87）
 #         background.png           1280x720 地牢地板（floor 类 tile 3 倍 -> 一格 48px，
 #                                  固定种子掺少量变体砖，避免大面积死板重复）
+#         tiles_floor.png          世界地砖变体表：floor_1~floor_8 共 8 帧，每帧 48x48
+#                                  （批二世界系统逐格挑变体铺地板）
+#         tiles_wall.png           世界墙块单帧：wall_mid 3 倍 -> 48x48
+#         decor_sheet.png          世界装饰表：skull（48x48）+ crate（48x72）
 #
 # 设计原则：
 #   1. 幂等：可以重复运行，每次覆盖旧文件，输出结果一致（背景变体砖用固定
@@ -345,7 +349,62 @@ Save-Png -bitmap $bgBmp -path (Join-Path $assetsDir "background.png")
 $bgBmp.Dispose()
 
 # ============================================================
-# 6) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
+# 6) 世界地砖 / 墙体 / 装饰（批二·世界与相机）
+# ============================================================
+# 世界 = 16x16 格 x 48px 的区块拼成；格级素材规则：
+#   - 地板：8 张变体（floor_1~floor_8）横向拼成变体表，世界生成时逐格
+#     按坐标哈希挑一张（确定性）——大面积不平铺同一块砖，避免死板重复；
+#   - 墙体：wall_mid（石墙块）3 倍放大为 48x48——墙体碰撞格的可视面，
+#     世界边界一圈与内部随机墙簇都用它；
+#   - 装饰：不占格、无碰撞的纯视觉摆件（骷髅头 / 木箱）；两帧源尺寸不同
+#     （16x16 与 16x24），不能用等距 Compose-Sheet，改手排：
+#     skull 放 x=0（48x48），crate 放 x=48（48x72，比一格高，绘制时
+#     底部对齐格底——游戏侧 World 负责裁剪坐标）
+
+# ---- 6.1 世界地砖变体表：floor_1~floor_8，共 8 帧 x 48 = 384x48 ----
+Compose-Sheet -names @(
+    "floor_1", "floor_2", "floor_3", "floor_4",
+    "floor_5", "floor_6", "floor_7", "floor_8"
+) -frameWidth 16 -frameHeight 16 -outPath (Join-Path $assetsDir "tiles_floor.png")
+
+# ---- 6.2 世界墙块：wall_mid 单帧 3 倍 -> 48x48 ----
+Compose-Single -name "wall_mid" -outPath (Join-Path $assetsDir "tiles_wall.png")
+
+# ---- 6.3 世界装饰表：skull（48x48）+ crate（48x72）手排 ----
+# 画布宽 = (16 + 16) x 3 = 96；高 = max(16, 24) x 3 = 72（取较高帧）
+$decorBmp = New-Canvas -width 96 -height 72
+# 获取装饰画布的 Graphics 绘图对象（所有绘制都通过它进行）
+$decorG = [System.Drawing.Graphics]::FromImage($decorBmp)
+try {
+    # 第一帧：骷髅头（16x16 -> 48x48）落于 x=0（游戏侧裁剪源矩形 0,0,16,16）
+    $skullImg = Get-Frame "skull"
+    try {
+        # 放大绘制到画布左半区
+        Draw-ScaledAt -dstG $decorG -src $skullImg -dx 0 -dy 0 -scaleFactor $scale
+    } finally {
+        # 释放骷髅源图（关闭文件句柄）
+        $skullImg.Dispose()
+    }
+    # 第二帧：木箱（16x24 -> 48x72）落于 x=48（游戏侧裁剪源矩形 16,0,16,24）
+    $crateImg = Get-Frame "crate"
+    try {
+        # 放大绘制到画布右半区（72 高恰好到画布底边）
+        Draw-ScaledAt -dstG $decorG -src $crateImg -dx 48 -dy 0 -scaleFactor $scale
+    } finally {
+        # 释放木箱源图（关闭文件句柄）
+        $crateImg.Dispose()
+    }
+} finally {
+    # 释放装饰画布 Graphics（内部持有临时资源）
+    $decorG.Dispose()
+}
+# 保存装饰表（幂等覆盖）
+Save-Png -bitmap $decorBmp -path (Join-Path $assetsDir "decor_sheet.png")
+# 释放装饰画布位图
+$decorBmp.Dispose()
+
+# ============================================================
+# 7) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
 # ============================================================
 # 与代码常量的对应关系（任一处改动必须两边同步）：
 #   player_sheet: 5 帧 x 48 宽 = 240，高 84（Player 的 m_w=48 / m_h=84）
@@ -373,6 +432,11 @@ Assert-PngSize -path (Join-Path $assetsDir "weapon.png") -expectedWidth 30 -expe
 
 #   背景：1280x720（与初始窗口一致；绘制时按窗口实际尺寸拉伸）
 Assert-PngSize -path (Join-Path $assetsDir "background.png") -expectedWidth 1280 -expectedHeight 720
+
+#   世界素材（批二）：地砖 8 帧 x 48 = 384 宽、48 高；墙块 48x48；装饰表 96x72
+Assert-PngSize -path (Join-Path $assetsDir "tiles_floor.png") -expectedWidth 384 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "tiles_wall.png") -expectedWidth 48 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "decor_sheet.png") -expectedWidth 96 -expectedHeight 72
 
 # 全部完成提示
 Write-Host "全部成品素材组装并校验完成。"
