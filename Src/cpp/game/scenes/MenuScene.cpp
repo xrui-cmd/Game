@@ -63,6 +63,11 @@ void MenuScene::onEnter(SDL_Renderer* renderer, const Config& /*config*/, AudioS
         m_titleFont.load(fontPath, kTitlePtSize); // 大号标题
         m_hintFont.load(fontPath, kHintPtSize);   // 提示文字
     }
+
+    // 5) 读取最佳战绩（只读展示）：文件缺失/旧格式/损坏都按无记录处理并
+    //    记录警告，本函数永不失败——菜单不会因为存档问题开不了局
+    //   （容错契约见 SaveData.h；写盘只发生在对局侧的 GameOver 结算）
+    m_best = SaveData::load();
 }
 
 // 每帧更新：查询确认动作的按下边缘（Enter -> 进入对局）。
@@ -141,4 +146,21 @@ void MenuScene::render(float /*alpha*/)
     // 第三行：操作说明（白色，与上一行同字号）——本批起战斗为自动攻击：
     // 无需攻击键，靠近怪物即自动出手（冷却门控见 PlayScene/Player）
     m_hintFont.drawCentered(m_renderer, "WASD 移动 / 自动攻击 / ESC 暂停", screenW / 2.0f, screenH * 0.68f);
+
+    // 第四行：最佳战绩（柔和金灰色：与上方白色提示拉开层级）。
+    // 无记录（三项全 0）：整行显示「暂无」；有记录：三项数值一行展示——
+    // 数值来自 onEnter 读取的快照（上次对局结算写盘后的最新纪录）
+    SDL_SetRenderDrawColor(m_renderer, 210, 190, 140, 255);
+    if (m_best.empty())
+    {
+        m_hintFont.drawCentered(m_renderer, "最佳战绩: 暂无", screenW / 2.0f, screenH * 0.80f);
+    }
+    else
+    {
+        char recordText[96]; // 容纳三项纪录一行，绰绰有余
+        SDL_snprintf(recordText, sizeof(recordText),
+                     "最佳战绩: 击杀 %d · 等级 %d · 存活 %02d:%02d",
+                     m_best.kills, m_best.level, m_best.seconds / 60, m_best.seconds % 60);
+        m_hintFont.drawCentered(m_renderer, recordText, screenW / 2.0f, screenH * 0.80f);
+    }
 }

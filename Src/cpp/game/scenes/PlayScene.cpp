@@ -183,7 +183,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //     （单帧 PNG 解码开销很小）；未激活的槽位不更新、不渲染、不参与碰撞
     m_monsters.resize(static_cast<size_t>(kMonsterPoolSize));
 
-    // 12) 加载升级音效（可选增强）：素材缺失/无音频设备只警告，升级静默、
+    // 12) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
+    //     永不失败）。整局沿用这份快照——GameOver 结算时才比较与更新
+    m_best = SaveData::load();
+
+    // 13) 加载升级音效（可选增强）：素材缺失/无音频设备只警告，升级静默、
     //     流程照常（降级细节见 LevelupSfx.h 的契约）
     m_levelupSfx.load();
 }
@@ -473,6 +477,10 @@ void PlayScene::update(const UpdateContext& ctx)
         m_audio->play(SoundId::GameOver);
         // 冒烟观测点：日志标记本局结束（自动化测试据此确认 GameOver 已到达）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "生命归零，本局结束");
+
+        // 最佳战绩结算（仅完整对局走到这里）：比较三项纪录，破了就更新并
+        // 立即写盘、播 record 音效。中途 M 退出（Paused 分支）不经过本函数
+        settleRecords();
     }
 }
 
@@ -655,6 +663,56 @@ void PlayScene::spawnFloatingText(const char* text, float centerX, float topY,
     m_floatingTexts.back().spawn(text, centerX, topY, color, lifeSeconds); // 写入全部字段
 }
 
+// 最佳战绩结算：仅完整对局（生命归零）调用一次。比较三项纪录，任一被破
+// 就更新内存快照并立即写盘、播 record 音效；三项标记供结束界面逐项展示
+void PlayScene::settleRecords()
+{
+    // 存活比较取整秒口径：与 HUD/结算的 mm:ss 展示一致（展示即截断），
+    // 避免「界面还是 01:05、纪录却按 65.9 秒」这类不一致
+    const int survivalSeconds = static_cast<int>(m_survivalSeconds);
+
+    // 逐项比较：严格大于才算破纪录（平纪录不算）
+    m_newKillRecord = m_killCount > m_best.kills;        // 破最高击杀？
+    m_newLevelRecord = m_level > m_best.level;           // 破最高等级？
+    m_newTimeRecord = survivalSeconds > m_best.seconds;  // 破最长存活？
+
+    // 三项全平/未破：只记一条日志即可，不写盘、不播音效
+    if (!m_newKillRecord && !m_newLevelRecord && !m_newTimeRecord)
+    {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "本局未破最佳战绩（击杀 %d · 等级 %d · 存活 %d 秒）",
+                    m_killCount, m_level, survivalSeconds);
+        return;
+    }
+
+    // 只更新被破的项（未破项保留历史值）；日志先于赋值——能打出旧纪录对照
+    if (m_newKillRecord)
+    {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "新纪录！击杀 %d（旧纪录 %d）", m_killCount, m_best.kills);
+        m_best.kills = m_killCount; // 写入新纪录
+    }
+    if (m_newLevelRecord)
+    {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "新纪录！等级 %d（旧纪录 %d）", m_level, m_best.level);
+        m_best.level = m_level; // 写入新纪录
+    }
+    if (m_newTimeRecord)
+    {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "新纪录！存活 %d 秒（旧纪录 %d 秒）", survivalSeconds, m_best.seconds);
+        m_best.seconds = survivalSeconds; // 写入新纪录
+    }
+
+    // 立即写盘（规格硬要求：破纪录即时落盘）。失败只警告并在内存里保留
+    // 新纪录（SaveData::save 内部已记录原因），本局的展示不受影响
+    SaveData::save(m_best);
+
+    // 破纪录上行琶音（record，与游戏其他音效同一听觉体系）
+    m_audio->play(SoundId::Record);
+}
+
 // 存活怪物计数：刷新上限的门控依据（池最多 12 个槽位，遍历成本可忽略）
 int PlayScene::aliveMonsterCount() const
 {
@@ -704,6 +762,12 @@ void PlayScene::restart()
     m_levelFlashLeft = 0.0f;       // 清掉上一局残留的等级瞬闪状态
     m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
     m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
+
+    // 「新纪录」标记复位：上一局的破纪录展示不带到新一局。
+    //（m_best 快照保留不动——它是整局的比较基准，只在结算成功时更新）
+    m_newKillRecord = false;
+    m_newLevelRecord = false;
+    m_newTimeRecord = false;
 
     // 怪物刷新计时复位：局内秒清零、首刷时刻回到首刷延迟、累计生成数清零
     m_monsterElapsed = 0.0f;                   // 难度计时重新起算
@@ -990,7 +1054,8 @@ void PlayScene::renderHud()
     else if (m_state == PlayState::GameOver)
     {
         // GameOver 界面（结算）：游戏结束 + 本局成绩（等级/击杀/存活）+
-        // 两条操作提示，全部水平居中、围绕窗口中心排布
+        // 三项最佳战绩（被破项旁标「新纪录！」）+ 两条操作提示，
+        // 全部水平居中、围绕窗口中心排布
 
         // 水平中心与基准纵坐标：各行文字共用（基准取屏幕中心，行距 44 像素）
         const float screenCenterX = screenW / 2.0f;
@@ -1013,12 +1078,49 @@ void PlayScene::renderHud()
         SDL_snprintf(runText, sizeof(runText), "击杀: %d · %s", m_killCount, survivalText);
         m_hudFont.drawCentered(m_renderer, runText, screenCenterX, centerY - 10.0f);
 
-        // 第四行：重开提示（白色）
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, centerY + 100.0f);
+        // 第四~六行：三项最佳战绩（白色）；被破的项旁配金色「新纪录！」。
+        // 行内布局：先量正文宽度，正文居中绘制后把标记放在其右缘空 12 像素处
+        // ——「该项旁」的逐项标记（而不是全局一条）
+        const auto drawRecordLine = [&](const char* label, float y, bool newRecord)
+        {
+            // 正文（该项纪录）：白色绘制
+            SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+            m_hudFont.drawCentered(m_renderer, label, screenCenterX, y);
 
-        // 第五行：回菜单提示（白色）。行距与上一行保持一致
-        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, centerY + 160.0f);
+            // 未破的项：不画标记，直接结束本行
+            if (!newRecord)
+            {
+                return;
+            }
+
+            // 量出正文宽度：标记紧贴正文右侧（正文居中的右缘坐标 = 中心 + 半宽）
+            const SDL_FPoint size = m_hudFont.measure(label);
+            SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色：与升级飘字同一高光色
+            m_hudFont.draw(m_renderer, "新纪录！", screenCenterX + size.x / 2.0f + 12.0f, y);
+        };
+
+        // 最高击杀（纪录值来自 m_best——结算后已更新为最新值）
+        char bestKillText[64]; // 容纳 "最高击杀: " + 最长数字，绰绰有余
+        SDL_snprintf(bestKillText, sizeof(bestKillText), "最高击杀: %d", m_best.kills);
+        drawRecordLine(bestKillText, centerY + 50.0f, m_newKillRecord);
+
+        // 最高等级
+        char bestLevelText[64]; // 容纳 "最高等级: " + 最长数字，绰绰有余
+        SDL_snprintf(bestLevelText, sizeof(bestLevelText), "最高等级: %d", m_best.level);
+        drawRecordLine(bestLevelText, centerY + 94.0f, m_newLevelRecord);
+
+        // 最长存活（整秒 -> mm:ss；与 HUD 的存活展示同口径）
+        char bestTimeText[64]; // 容纳 "最长存活: mm:ss"，绰绰有余
+        SDL_snprintf(bestTimeText, sizeof(bestTimeText), "最长存活: %02d:%02d",
+                     m_best.seconds / 60, m_best.seconds % 60);
+        drawRecordLine(bestTimeText, centerY + 138.0f, m_newTimeRecord);
+
+        // 第七行：重开提示（白色）
+        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
+        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, centerY + 200.0f);
+
+        // 第八行：回菜单提示（白色）。行距与上一行保持一致
+        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, centerY + 244.0f);
     }
 }
 

@@ -10,6 +10,7 @@
 #include "game/LevelCurve.h"    // LevelCurve：升级经验曲线（纯逻辑，tests/xp_test.cpp 直测）
 #include "game/FloatingText.h"  // FloatingText：漂浮文字（伤害飘字与升级飘字共用）
 #include "game/LevelupSfx.h"    // LevelupSfx：升级音效（游戏层直读；引擎加 SoundId::LevelUp 前的过渡）
+#include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
 #include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
 #include <vector>               // std::vector：怪物对象池
 
@@ -21,7 +22,7 @@
 //   1. 资源：onEnter 加载背景图、玩家/怪物纹理与字体（背景可选，失败兜底；
 //      实体纹理各自析构兜底，玩家的武器素材由 Player 自持）；析构时释放
 //      场景自持的背景纹理
-//   2. 玩法（本批：成长闭环——经验升级与升级反馈）：
+//   2. 玩法（本批落全 M1 成长闭环 + 最佳战绩）：
 //      - WASD 移动（左右移动时水平翻转朝向，静止保持上次朝向）；
 //      - 自动攻击（无需按键）：每个固定步结算一次索敌——对攻击范围
 //        （attack_range，默认 96px，玩家中心与怪物中心的距离）内
@@ -41,10 +42,12 @@
 //        循环结算（溢出一枚可连升多级）-> 每级自动强化：生命上限 +10
 //        （并即时回血 10）、攻击伤害 +3、移速 +10；升级时「升级！」飘字
 //        （玩家上方）+ 等级数字瞬闪高亮 + levelup 音效（LevelupSfx 直读）；
-//      - 生命归零 -> GameOver；
-//      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键）。
+//      - 生命归零 -> GameOver；结算最佳战绩（最高击杀/最高等级/最长存活，
+//        仅完整对局比较更新并立即写盘；任一项被破播 record 音效 +「新纪录！」）；
+//      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键；
+//        中途 M 退出不计战绩——只有生命归零的完整对局参与纪录）。
 //   3. 音效：拾取播 coin、被撞播 hit、生命归零播 gameover、
-//      ESC 暂停/恢复播 pause（经 onEnter 注入的 AudioSystem；
+//      ESC 暂停/恢复播 pause、破纪录播 record（经 onEnter 注入的 AudioSystem；
 //      降级环境安全空操作）、升级播 levelup（LevelupSfx 游戏层直读，
 //      见该类头文件说明——引擎 SoundId 扩展前的过渡实现）
 //   4. 配置：onEnter 时读取玩家速度/生命/自动攻击参数、怪物速度成长/刷新参数/
@@ -62,8 +65,8 @@
 // 状态机（PlayState）：
 //   Playing  ：接受输入、推进战斗、检测碰撞与刷新、存活时间正计时
 //   Paused   ：世界冻结（含存活计时与飘字动画），ESC 恢复、M 回主菜单
-//   GameOver ：世界冻结（仅因玩家生命归零触发），显示本局等级/击杀/存活，
-//              等待 R 重开或 M 回主菜单
+//   GameOver ：世界冻结（仅因玩家生命归零触发），显示本局等级/击杀/存活与三项最佳战绩，
+//              被破项旁标「新纪录！」并播 record 音效；等待 R 重开或 M 回主菜单
 // ============================================================
 
 // 对局状态机：用枚举而不是布尔标志，状态互斥关系一眼可见
@@ -99,7 +102,7 @@ public:
 
 private:
     // 重开一局：生命/击杀/等级/经验复位、三项属性回基准、玩家归位、
-    // 回收全部怪物/宝石/飘字、刷新计时重排
+    // 回收全部怪物/宝石/飘字、刷新计时重排、清「新纪录」标记
     void restart();
 
     // 输入动作的按下边缘处理：暂停/恢复（Playing <-> Paused）、
@@ -125,6 +128,11 @@ private:
     // 先移除最老的一条（front），保证渲染开销有界、大量同屏不失控
     void spawnFloatingText(const char* text, float centerX, float topY, SDL_Color color,
                            float lifeSeconds = FloatingText::kDefaultLifeSeconds);
+
+    // 最佳战绩结算（生命归零进入 GameOver 时调用一次）：比较三项纪录、
+    // 更新内存快照并立即写盘、记录各项「新纪录」标记（结束界面展示用）。
+    // 仅完整对局走到这里——中途 M 退出（Paused 分支）不会调用本函数
+    void settleRecords();
 
     // 当前存活的怪物数（对象池中 alive 的槽位数；刷新上限的门控依据）
     int aliveMonsterCount() const;
@@ -277,6 +285,12 @@ private:
     int m_level = 1;                     // 当前等级（restart 复位为 1；升级只增不减）
     int m_xp = 0;                        // 当前级已积累经验（结算后恒小于本级需求；HUD 进度条）
     float m_levelFlashLeft = 0.0f;       // 等级数字瞬闪剩余时长（秒；升级时置满，仅 Playing 递减）
+
+    // ---- 最佳战绩（onEnter 读档快照；restart 不重读——本局比较基准从头到尾一致）----
+    BestRecord m_best;             // 开赛时的历史最佳；GameOver 结算后就地更新为最新纪录
+    bool m_newKillRecord = false;  // 本局破最高击杀（结束界面「新纪录！」标记；restart 清）
+    bool m_newLevelRecord = false; // 本局破最高等级（同上）
+    bool m_newTimeRecord = false;  // 本局破最长存活（同上）
 
     // 本局存活时间（秒）：仅 Playing 正计时（暂停/结束冻结），restart 清零。
     // 从「倒计时」改为「正向累积」——GameOver 仅由生命归零触发，存活时间
