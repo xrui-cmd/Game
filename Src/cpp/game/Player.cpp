@@ -2,7 +2,7 @@
 #include "engine/Input.h" // Input：经 ctx.input 查询移动动作的接口定义
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载武器素材（可选增强）
 #include <algorithm>      // std::min / std::max / std::clamp：速度逼近与边界
-#include <cmath>          // std::sqrt / std::sin / std::atan2：方向归一化与挥击曲线
+#include <cmath>          // std::sqrt / std::cos / std::sin / std::atan2：方向归一化与横扫曲线
 #include <string>         // std::string：拼接武器素材的绝对路径
 
 // 本编译单元私有的移动小工具（不对外暴露）
@@ -79,9 +79,9 @@ bool Player::load(SDL_Renderer* renderer)
         }
         else
         {
-            // 素材缺失/解码失败：记录原因后继续（挥剑画面跳过，命中照常）
+            // 素材缺失/解码失败：记录原因后继续（横扫画面跳过，命中照常）
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                        "加载武器素材 %s 失败（%s），挥剑表现将跳过", weaponPath.c_str(), SDL_GetError());
+                        "加载武器素材 %s 失败（%s），横扫表现将跳过", weaponPath.c_str(), SDL_GetError());
         }
     }
 
@@ -121,7 +121,7 @@ void Player::setMotion(float accel, float friction)
     m_friction = friction; // 覆盖摩擦减速度：无输入时的衰减速率随之更新
 }
 
-// 设置自动攻击冷却：配置驱动入口（对应 attack_cooldown）
+// 设置攻击冷却：配置驱动入口（对应 attack_cooldown）
 void Player::setAttackCooldown(float seconds)
 {
     // 负冷却无意义（会让冷却剩余出现反向拉扯），属于配置错误：忽略并警告；
@@ -133,10 +133,10 @@ void Player::setAttackCooldown(float seconds)
         return;
     }
 
-    m_attackCooldown = seconds; // 覆盖冷却总时长：其后的自动出手使用新值
+    m_attackCooldown = seconds; // 覆盖冷却总时长：其后的出手（tryAttack）使用新值
 }
 
-// 覆写更新：渐近加减速移动 + 朝向翻转 + 攻击计时与挥击表现推进 + 动画切换。
+// 覆写更新：渐近加减速移动 + 朝向跟随鼠标 + 攻击计时与横扫表现推进 + 动画切换。
 // 速度模型：目标速度 = 输入方向 x m_speed；当前速度以 accel（有输入）/
 // friction（无输入）逐轴逼近；位移 = 速度 x 固定步长（与帧率解耦）
 void Player::update(const UpdateContext& ctx)
@@ -145,7 +145,7 @@ void Player::update(const UpdateContext& ctx)
     // 覆写 update 会跳过 Entity::update，这条调用必须自己补上
     snapshotPreviousPosition();
 
-    // 攻击计时第一步收尾：冷却与挥击表现剩余时长递减（夹到 0）——
+    // 攻击计时第一步收尾：冷却与横扫表现剩余时长递减（夹到 0）——
     // 与固定步长同源，暂停时随 update 门控冻结
     if (m_attackCooldownLeft > 0.0f)
     {
@@ -183,16 +183,26 @@ void Player::update(const UpdateContext& ctx)
         }
     }
 
-    // 2) 朝向翻转（本批新增）：水平输入决定左右镜像——向左翻转、向右原样；
-    //    静止（水平输入为 0）时保持上一次朝向。setFlipped 是纯渲染层标记，
-    //    碰撞/插值/攻击索敌都按未翻转的数据计算，不影响任何玩法判定
-    if (inputX > 0.0f)
+    // 2) 朝向翻转（本批改版）：跟随鼠标——指针在玩家中心右侧朝右、左侧
+    //    朝左；贴近中心线（±kFlipDeadZone 像素死区）时保持上一次朝向，
+    //    避免指针压在中线上时来回抖动。setFlipped 是纯渲染层标记：
+    //    碰撞/插值/扇形判定都按未翻转的数据计算，不影响任何玩法判定。
+    //    鼠标位置经 ctx.input 读取（与移动动作同一输入系统；无输入系统
+    //    时保持朝向不变）
+    if (ctx.input != nullptr)
     {
-        setFlipped(false); // 向右：原始朝向（素材默认面向）
-    }
-    else if (inputX < 0.0f)
-    {
-        setFlipped(true); // 向左：水平镜像绘制
+        const Vec2 mouse = ctx.input->mousePosition();        // 本帧鼠标位置快照
+        const float centerX = m_x + m_w * 0.5f;               // 玩家几何中心 x
+        const float mouseOffsetX = mouse.x - centerX;         // 指针相对中心的横向差
+        if (mouseOffsetX > kFlipDeadZone)
+        {
+            setFlipped(false); // 指针在右侧：朝右（素材原始朝向）
+        }
+        else if (mouseOffsetX < -kFlipDeadZone)
+        {
+            setFlipped(true); // 指针在左侧：朝左（水平镜像绘制）
+        }
+        // 死区内：维持上一次朝向（不更新 = 不抖动）
     }
 
     // 3) 逐轴渐近更新速度（固定步长下的速度积分，结果与帧率无关）：
@@ -247,30 +257,38 @@ void Player::update(const UpdateContext& ctx)
     }
 }
 
-// 覆写渲染：本体（含翻转/插值/帧区间）之后叠加挥剑表现
+// 覆写渲染：本体（含翻转/插值/帧区间）之后叠加横扫表现
 void Player::render(SDL_Renderer* renderer, float alpha) const
 {
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
     Entity::render(renderer, alpha);
 
-    // 只有「挥击表现期内」且武器纹理已加载时才画剑；其余时刻直接结束
+    // 只有「横扫表现期内」且武器纹理已加载时才画剑；其余时刻直接结束
     if (m_swingLeft <= 0.0f || m_weaponTexture == nullptr)
     {
         return;
     }
 
-    // 挥击进度 t：0（出手瞬间）-> 1（表现结束）。
-    // 位移曲线用 sin(pi x t)：t=0 时 0（收回状态）、t=0.5 时最大（前探峰值）、
-    // t=1 时回到 0（收回）——一条曲线同时表达「前探 + 收回」的短促动作
+    // 横扫进度 t：0（出手瞬间）-> 1（表现结束）
     const float t = 1.0f - m_swingLeft / kSwingSeconds; // 归一化进度 [0,1]
-    const float along = kWeaponAlong + kWeaponExtend * std::sin(3.1415926535897932f * t); // 本帧前移量
+
+    // 本次挥砍的瞄准角（弧度）：由挥砍方向单位向量换算（atan2 在
+    // 屏幕坐标系下顺时针为正，与扫角的方向一致）
+    constexpr float kRadiansToDegrees = 57.29577951308232f; // 弧度 -> 度（180/π 数值）
+    const float aimAngleRad = std::atan2(m_swingDirY, m_swingDirX);
+
+    // 本帧扫到角 = 瞄准角 + (t - 0.5) x 总扫角：t=0 时瞄准角 −60°、
+    // t=0.5 时恰好压在中轴、t=1 时瞄准角 +60°——一条线性曲线表达
+    // 「约 0.15 秒扫过 120°」的横扫轨迹
+    const float halfSpanRad = kSweepSpanDegrees * 0.5f / kRadiansToDegrees; // 半扫角（弧度）
+    const float sweepAngleRad = aimAngleRad + (t - 0.5f) * (2.0f * halfSpanRad); // 本帧扫到角
 
     // 挂点：玩家插值中心（与本体同一平滑位置，快速移动时武器不脱节）
     const SDL_FPoint center = interpolatedCenter(alpha);
 
-    // 武器中心 = 玩家中心 + 挥击方向 x 前移量（从身体向外探出）
-    const float weaponX = center.x + m_swingDirX * along; // 武器中心 x
-    const float weaponY = center.y + m_swingDirY * along; // 武器中心 y
+    // 武器中心 = 玩家中心 + 扫角方向 x 旋转半径（剑身绕身体扫过）
+    const float weaponX = center.x + std::cos(sweepAngleRad) * kWeaponOrbit; // 武器中心 x
+    const float weaponY = center.y + std::sin(sweepAngleRad) * kWeaponOrbit; // 武器中心 y
 
     // 目标矩形：把武器中心作为矩形中心摆放（宽高 = 素材绘制尺寸常量）
     const SDL_FRect dst{ weaponX - kWeaponWidth * 0.5f,  // 左上角 x = 中心 - 半宽
@@ -278,14 +296,9 @@ void Player::render(SDL_Renderer* renderer, float alpha) const
                          kWeaponWidth,                    // 绘制宽（像素）
                          kWeaponHeight };                 // 绘制高（像素）
 
-    // 旋转角度 = 挥击方向角 + 90 度 + 轻微扫动：
-    //   - 方向角：atan2(y, x) 换算成度（屏幕坐标系、顺时针为正）；
-    //   - +90 度：素材剑尖朝上（基准姿态），旋转 90 度后剑尖指向方向角；
-    //   - 轻微扫动：+kSwingSway 度线性扫到 -kSwingSway 度（t: 0 -> 1），
-    //     让前探动作带一点点挥抡的味道
-    constexpr float kRadiansToDegrees = 57.29577951308232f; // 弧度 -> 度（180/π 数值）
-    const double angle = std::atan2(m_swingDirY, m_swingDirX) * kRadiansToDegrees + 90.0
-                         + kSwingSwayDegrees * (1.0 - 2.0 * t); // 角度（度）
+    // 旋转角度 = 本帧扫到角 + 90 度：素材剑尖朝上（基准姿态），旋转
+    // 90 度后剑尖指向扫角方向（屏幕坐标系、顺时针为正）
+    const double angle = sweepAngleRad * kRadiansToDegrees + 90.0;
 
     // 旋转绘制：center 传 nullptr = 绕目标矩形自身中心旋转（武器中心即挂点）
     SDL_RenderTextureRotated(renderer, m_weaponTexture, nullptr, &dst,
@@ -293,16 +306,21 @@ void Player::render(SDL_Renderer* renderer, float alpha) const
 }
 
 // 重开归位：委托基类的 setPosition 瞬间覆盖坐标（不经过速度/时间累积），
-// 并清零速度与攻击状态——否则重开后玩家会带着上一局的动量/冷却/挥剑继续
+// 并清零速度与攻击状态——否则重开后玩家会带着上一局的动量/冷却/横扫继续
 void Player::reset(float x, float y)
 {
     m_velocityX = 0.0f; // 水平速度清零：全新一局从静止开始
     m_velocityY = 0.0f; // 垂直速度清零：同上
 
-    // 攻击状态复位：冷却立即转好、挥剑清除——新一局第一帧就能出手，
-    // 且不残留上一局未播完的挥击表现
+    // 攻击状态复位：冷却立即转好、横扫清除——新一局第一帧就能出手，
+    // 且不残留上一局未播完的挥砍画面
     m_attackCooldownLeft = 0.0f; // 冷却清零：新一局立即可以出手
-    m_swingLeft = 0.0f;          // 挥击表现清零：清除未播完的挥剑画面
+    m_swingLeft = 0.0f;          // 横扫表现清零：清除未播完的挥砍画面
+
+    // 挥砍朝向回初始（向右）：新一局的第一个固定步会按鼠标位置重新
+    // 决定朝向与瞄准方向，这里只是把状态归到与构造时一致的起点
+    m_swingDirX = 1.0f; // 单位方向 x：初始向右
+    m_swingDirY = 0.0f; // 单位方向 y：初始水平
 
     // 动画区间先切回站立帧：重开后玩家静止，第一帧渲染就应显示站姿
     //（后续 update 会按实际速度重新切换区间）
@@ -311,8 +329,8 @@ void Player::reset(float x, float y)
     setPosition(x, y); // 复用基类实现：写入坐标并同步插值快照（防拉丝）
 }
 
-// 尝试对目标自动出手：冷却门控 + 挥击表现启动（命中结算在场景层）
-bool Player::tryAutoAttack(float targetCenterX, float targetCenterY)
+// 尝试朝瞄准方向出手：冷却门控 + 横扫表现启动（命中结算在场景层）
+bool Player::tryAttack(float aimDirX, float aimDirY)
 {
     // 冷却未到：本次不出手（不重置任何状态，冷却继续走）
     if (m_attackCooldownLeft > 0.0f)
@@ -320,36 +338,26 @@ bool Player::tryAutoAttack(float targetCenterX, float targetCenterY)
         return false;
     }
 
-    // 玩家当前中心：挥击方向的起点（与索敌用的中心算法一致）
-    const float centerX = m_x + m_w * 0.5f; // 中心 x = 左上角 + 半宽
-    const float centerY = m_y + m_h * 0.5f; // 中心 y = 左上角 + 半高
-
-    // 指向目标的位移向量与长度
-    const float dx = targetCenterX - centerX; // 水平分量（正右负左）
-    const float dy = targetCenterY - centerY; // 垂直分量（正下负上）
-    const float length = std::sqrt(dx * dx + dy * dy); // 两点距离（像素）
-
-    // 归一化为单位方向；距离过近（退化情形）退回默认向右——
-    // 避免除以接近 0 的长度产生 NaN 方向，污染旋转角度
+    // 方向归一化：传入向量不要求是单位长度（场景直接传未归一化的
+    // 「玩家中心 -> 鼠标」位移）。长度过小（零向量退化；场景已有一道
+    // 回退，这里是第二道防御）时保留上一次的挥砍方向——避免除以接近 0
+    // 的长度产生 NaN，污染旋转角与判定中轴
+    const float length = std::sqrt(aimDirX * aimDirX + aimDirY * aimDirY); // 方向长度（像素）
     if (length > kDirectionEpsilon)
     {
-        m_swingDirX = dx / length; // 单位方向 x：dx 占全长的比例
-        m_swingDirY = dy / length; // 单位方向 y：dy 占全长的比例
-    }
-    else
-    {
-        m_swingDirX = 1.0f; // 默认向右：与初始朝向一致
-        m_swingDirY = 0.0f; // 默认水平方向
+        m_swingDirX = aimDirX / length; // 单位方向 x：分量占全长的比例
+        m_swingDirY = aimDirY / length; // 单位方向 y：分量占全长的比例
     }
 
-    // 出手：重置冷却门 + 启动挥击表现计时（render 据此绘制挥剑）
+    // 出手：重置冷却门 + 启动横扫表现计时（render 据此绘制挥砍画面）。
+    // 不索敌：出手与场上有没有怪物无关——挥空也出招、也消耗冷却
     m_attackCooldownLeft = m_attackCooldown; // 冷却开始走：届时的后续出手被它门控
-    m_swingLeft = kSwingSeconds;             // 挥击表现从满时长开始（前探->收回）
+    m_swingLeft = kSwingSeconds;             // 横扫表现从满时长开始（−60° -> +60°）
 
-    return true; // 通知场景：本次出手成功，可以对目标结算命中
+    return true; // 通知场景：本次出手成功，可做扇形命中结算（可命中 0 只）
 }
 
-// 插值后的玩家中心点（渲染坐标）：挥剑表现挂点
+// 插值后的玩家中心点（渲染坐标）：横扫表现挂点
 SDL_FPoint Player::interpolatedCenter(float alpha) const
 {
     // 渲染位置 = 上一固定步位置与当前位置按 alpha 线性插值（与基类 render 同式），

@@ -128,7 +128,7 @@ public:
     // 被撞开/被击退：沿「(fromX, fromY) -> 怪物中心」的方向（即远离伤害
     // 来源的方向）瞬移 distance 像素，并 clamp 在视口内。
     // 距离由调用方给出：接触伤害用较远的弹开（拉开保护距离），
-    // 挥击命中用较短的击退（保持追击压力、方便补刀）。
+    // 横扫命中用较短的微击退（保持追击压力、方便连扫补刀）。
     // 瞬移类操作：内部同步插值快照（防拉丝）
     void knockback(float fromX, float fromY, float viewportW, float viewportH, float distance);
 

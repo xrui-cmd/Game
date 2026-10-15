@@ -4,7 +4,8 @@
 #include "engine/Scene.h"       // Scene：场景基类
 #include "engine/AudioSystem.h" // AudioSystem：音效系统（拾取/受击/结束/暂停/破纪录触发播放）
 #include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字/漂浮文字，支持中文）
-#include "game/Player.h"        // Player：玩家实体（移动 + 自动攻击 + 武器挥击表现）
+#include "game/AttackArc.h"     // AttackArc：横扫扇形判定（纯函数，tests/attack_arc_test.cpp 直测）
+#include "game/Player.h"        // Player：玩家实体（移动 + 主动攻击 + 武器横扫表现）
 #include "game/Monster.h"       // Monster：追击怪物（三变体、对象池）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
 #include "game/LevelCurve.h"    // LevelCurve：升级经验曲线（纯逻辑，tests/xp_test.cpp 直测）
@@ -22,26 +23,28 @@
 //   1. 资源：onEnter 加载背景图、玩家/怪物纹理与字体（背景可选，失败兜底；
 //      实体纹理各自析构兜底，玩家的武器素材由 Player 自持）；析构时释放
 //      场景自持的背景纹理
-//   2. 玩法（本批落全 M1 成长闭环 + 最佳战绩）：
-//      - WASD 移动（左右移动时水平翻转朝向，静止保持上次朝向）；
-//      - 自动攻击（无需按键）：每个固定步结算一次索敌——对攻击范围
-//        （attack_range，默认 96px，玩家中心与怪物中心的距离）内
-//        「最近的怪物」出手；冷却 attack_cooldown（默认 0.4s）门控，
-//        伤害 attack_damage（默认 25，随升级成长）；本批单目标；
-//        无目标不发招（索敌为空则整个结算流程直接结束）；
-//        出手时玩家朝目标方向播放武器挥击表现（0.12s 前探+收回）；
-//        命中瞬间在怪物位置弹出伤害飘字（-当前伤害值，上浮淡出）；
+//   2. 玩法（本批战斗改版落定「鼠标瞄准·左键横扫」）：
+//      - WASD 移动（朝向跟随鼠标——面向指针一侧，见 Player）；
+//      - 主动攻击（本批核心，取代自动索敌）：鼠标左键按住 = 按冷却节奏
+//        （attack_cooldown，默认 0.4s）连续横扫；单击挥一次；挥空也出招
+//        （播放挥砍表现、不索敌、也不做命中结算）；
+//      - 瞄准：攻击方向 = 玩家中心 -> 鼠标（零向量时回退到玩家面向）；
+//      - 横扫（本批核心）：扇形判定——以瞄准方向为中轴、总张角
+//        attack_arc（默认 120 度）、半径 attack_range（默认 96px），
+//        命中弧内「所有」怪物，各自结算伤害 attack_damage（默认 25，
+//        随升级成长）、闪白、飘字与击退 attack_knockback（默认 30px）；
+//        判定走 AttackArc 纯函数（单测覆盖边界）；
 //      - 怪物三变体等权随机刷新（史莱姆 20/90、哥布林 30/110、骷髅 18/140
 //        ——生命/基础速度，数值常量见 Monster.cpp 变体表），从窗口四边内侧
 //        持续刷新并随时间增强（数量上限初始 4、每 20s +2、封顶 12；
 //        刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s）；
 //        共同追踪玩家、接触伤害 10；
 //      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
-//      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开；
-//      - 成长闭环（本批新增）：拾取宝石 +10 经验 -> 按 LevelCurve 曲线
-//        循环结算（溢出一枚可连升多级）-> 每级自动强化：生命上限 +10
-//        （并即时回血 10）、攻击伤害 +3、移速 +10；升级时「升级！」飘字
-//        （玩家上方）+ 等级数字瞬闪高亮 + levelup 音效（LevelupSfx 直读）；
+//      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开（150px）；
+//      - 成长闭环：拾取宝石 +10 经验 -> 按 LevelCurve 曲线循环结算
+//        （溢出一枚可连升多级）-> 每级自动强化：生命上限 +10（并即时
+//        回血 10）、攻击伤害 +3、移速 +10；升级时「升级！」飘字（玩家
+//        上方）+ 等级数字瞬闪高亮 + levelup 音效（LevelupSfx 直读）；
 //      - 生命归零 -> GameOver；结算最佳战绩（最高击杀/最高等级/最长存活，
 //        仅完整对局比较更新并立即写盘；任一项被破播 record 音效 +「新纪录！」）；
 //      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键；
@@ -50,11 +53,12 @@
 //      ESC 暂停/恢复播 pause、破纪录播 record（经 onEnter 注入的 AudioSystem；
 //      降级环境安全空操作）、升级播 levelup（LevelupSfx 游戏层直读，
 //      见该类头文件说明——引擎 SoundId 扩展前的过渡实现）
-//   4. 配置：onEnter 时读取玩家速度/生命/自动攻击参数、怪物速度成长/刷新参数/
-//      接触伤害、升级曲线（xp_level_base/xp_level_growth）与每级强化
+//   4. 配置：onEnter 时读取玩家速度/生命/攻击参数（冷却/伤害/半径/张角/
+//      击退）、怪物速度成长/刷新参数/接触伤害、升级曲线
+//      （xp_level_base/xp_level_growth）与每级强化
 //      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
 //      缺键/坏值自动回退内置默认值
-//   5. 渲染：背景 -> 玩家（含挥剑表现）-> 怪物 -> 经验宝石 -> 漂浮文字
+//   5. 渲染：背景 -> 玩家（含横扫表现）-> 怪物 -> 经验宝石 -> 漂浮文字
 //      -> 生存 HUD（左上：HP 血条+文字；其下：等级（升级时瞬闪）/经验条
 //      （当前级进度/所需）/击杀/存活；左下角 FPS/帧时间，F3 切换显隐）
 //
@@ -96,7 +100,7 @@ public:
     // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移
     void update(const UpdateContext& ctx) override;
 
-    // 每帧渲染：清屏、背景、玩家（含挥剑表现）、怪物、宝石、漂浮文字、HUD。
+    // 每帧渲染：清屏、背景、玩家（含横扫表现）、怪物、宝石、漂浮文字、HUD。
     // alpha 是插值系数，原样转发给实体
     void render(float alpha) override;
 
@@ -111,10 +115,14 @@ private:
     // 保证每次按下恰好触发一次（行为与事件式完全一致）
     void handleInputEdges(const UpdateContext& ctx);
 
-    // 自动攻击结算（每个固定步调用一次）：索敌 -> 出手 -> 单体命中结算。
-    // 「场景选目标、玩家管出手」：本函数找出攻击范围内最近的怪物后调用
-    // Player::tryAutoAttack；出手成功才扣血/击退/掉宝（每次出手单体命中）
-    void resolveAutoAttack(const SDL_FRect& playerRect);
+    // 主动攻击结算（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扇形命中」。
+    // 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
+    //   1. 左键没按住：本步不结算（主动攻击——不按不挥）；
+    //   2. 瞄准方向 = 玩家中心 -> 鼠标（零向量时回退到玩家面向，见实现）；
+    //   3. 调 Player::tryAttack 出手（冷却门控在玩家侧；挥空也出招）；
+    //   4. 出手成功才做扇形结算：对每只存活怪物跑 AttackArc 判定，命中者
+    //      各自扣血/飘字/掉落或击退（多目标）
+    void resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& playerRect);
 
     // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位
     void dropGemAt(float x, float y);
@@ -155,8 +163,10 @@ private:
 private:
     // ---- 配置项缺省值（与 config/game.ini 对应键一致；缺键/坏值回退）----
     static constexpr int kDefaultPlayerHp = 100;                // 玩家生命上限
-    static constexpr int kDefaultAttackDamage = 25;             // 自动攻击伤害（attack_damage，点）
-    static constexpr float kDefaultAttackRange = 96.0f;         // 自动攻击范围（attack_range，像素）
+    static constexpr int kDefaultAttackDamage = 25;             // 横扫伤害（attack_damage，点）：弧内每只各扣
+    static constexpr float kDefaultAttackRange = 96.0f;         // 横扫半径（attack_range，像素）
+    static constexpr float kDefaultAttackArc = 120.0f;          // 横扫总张角（attack_arc，度）：中轴两侧各一半
+    static constexpr float kDefaultAttackKnockback = 30.0f;     // 横扫命中击退（attack_knockback，像素）
     static constexpr float kDefaultMonsterSpeedGrowth = 2.5f;   // 怪物速度成长（像素/秒²，按局内秒数叠加）
     static constexpr float kDefaultMonsterSpawnInterval = 2.5f; // 刷新间隔初始值（秒）
     static constexpr int kDefaultMonsterMaxCount = 4;           // 数量上限初始值（只）
@@ -194,17 +204,18 @@ private:
     // 配合 0.8s 无敌构成「受击保护窗口」
     static constexpr float kContactKnockbackDistance = 150.0f;
 
-    // 自动攻击命中的怪物击退距离（像素）：比接触弹开短——保持追击压力，
-    // 让玩家在冷却窗口内仍有下一击的牵制（多数变体两击内可杀）
-    static constexpr float kAttackKnockbackDistance = 60.0f;
+    // 瞄准零向量的判定阈值（像素²）：鼠标与玩家中心的距离比它更近时视为
+    // 零向量（没有方向可言），攻击方向回退到玩家面向（见 resolvePlayerAttack）。
+    // 1e-6 = (0.001 像素)²，远小于任何真实瞄准距离
+    static constexpr float kAimEpsilonSquared = 1e-6f;
 
     // 每颗经验宝石的经验值（代码常量，不进配置）：10 点 = 默认曲线第 1 级
     // 需求（30）的三分之一——升到 2 级需要拾取 3 颗
     static constexpr int kGemXpValue = 10;
 
     // 漂浮文字同屏上限（条）：超过上限时移除最老一条。数量级参考——默认
-    // 节奏下命中冷却 0.4s、飘字寿命 0.8s，稳定同屏只有寥寥几条；上限只是
-    // 「大量同屏」（如未来多目标攻击）时的兜底，保证绘制开销有界不失控
+    // 节奏下命中冷却 0.4s、飘字寿命 0.8s，稳定同屏只有寥寥几条；上限是
+    // 「横扫多目标同帧多飘字」这类大量同屏时的兜底，保证绘制开销有界不失控
     static constexpr int kMaxFloatingTexts = 64;
 
     // 升级时等级数字的高亮时长（秒）：窗口内数字颜色金白交替闪烁（瞬闪效果）
@@ -267,7 +278,9 @@ private:
     int m_attackDamage = kDefaultAttackDamage;       // 当前攻击伤害（受 levelup_damage_bonus 增长）
     float m_playerSpeed = Player::kDefaultSpeed;     // 当前移速（受 levelup_speed_bonus 增长；经 setSpeed 注入）
 
-    float m_attackRange = kDefaultAttackRange;            // 自动攻击范围（attack_range，像素）
+    float m_attackRange = kDefaultAttackRange;        // 横扫半径（attack_range，像素）
+    float m_attackArc = kDefaultAttackArc;            // 横扫总张角（attack_arc，度）
+    float m_attackKnockback = kDefaultAttackKnockback; // 横扫命中击退（attack_knockback，像素）
     float m_monsterSpeedGrowth = kDefaultMonsterSpeedGrowth; // 速度成长（monster_speed_growth）
     float m_monsterSpawnInterval = kDefaultMonsterSpawnInterval; // 刷新间隔初始值（monster_spawn_interval）
     int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）

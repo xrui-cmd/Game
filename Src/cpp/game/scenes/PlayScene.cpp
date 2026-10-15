@@ -63,9 +63,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      player_friction         玩家摩擦减速度（像素/秒²）
     //      player_anim_interval    玩家行走动画每帧时长（秒）
     //      player_hp               玩家生命上限
-    //      attack_cooldown         自动攻击冷却（秒）
-    //      attack_damage           自动攻击伤害（点）
-    //      attack_range            自动攻击范围（像素；索敌距离）
+    //      attack_cooldown         攻击冷却（秒）——左键按住时的横扫节奏
+    //      attack_damage           横扫伤害（点，弧内每只各扣）
+    //      attack_range            横扫半径（像素）
+    //      attack_arc              横扫总张角（度）
+    //      attack_knockback        横扫命中击退（像素）
     //      monster_speed_growth    怪物速度成长（像素/秒²，按局内秒数叠加）
     //      monster_spawn_interval  刷新间隔初始值（秒，随局内时间收紧）
     //      monster_max_count       数量上限初始值（只，随局内时间 +2）
@@ -83,6 +85,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     const float attackCooldown =
         config.getFloat("attack_cooldown", Player::kDefaultAttackCooldown);
     m_attackRange = config.getFloat("attack_range", kDefaultAttackRange);
+    // 张角与击退距离做下限夹取（负张角/负距离没有玩法语义，同 levelup_* 的
+    // 防御写法）；张角上界交由 AttackArc 归一化（超整圆按整圆处理）
+    m_attackArc = std::max(0.0f, config.getFloat("attack_arc", kDefaultAttackArc));
+    m_attackKnockback = std::max(0.0f, config.getFloat("attack_knockback", kDefaultAttackKnockback));
     m_monsterSpeedGrowth = config.getFloat("monster_speed_growth", kDefaultMonsterSpeedGrowth);
     m_monsterSpawnInterval =
         config.getFloat("monster_spawn_interval", kDefaultMonsterSpawnInterval);
@@ -160,7 +166,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
-    // 8) 注入玩家配置：速度、加减速、行走动画节奏与自动攻击冷却。
+    // 8) 注入玩家配置：速度、加减速、行走动画节奏与攻击冷却。
     //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
     //    配置值晚一步落定才能覆盖它（各 set 对非法值会忽略并警告）。
     //    速度注入的是「当前值」字段（= 基准起步；升级成长改的也是它）
@@ -330,9 +336,9 @@ void PlayScene::update(const UpdateContext& ctx)
     // 玩家矩形只取一次：本步的碰撞检测与怪物追踪共用一个快照
     const SDL_FRect playerRect = m_player.rect();
 
-    // 自动攻击结算：每个固定步尝试一次「索敌 -> 出手 -> 命中」——
-    // 没有目标不发招、冷却未到不出手（两道门都在 resolveAutoAttack 内）
-    resolveAutoAttack(playerRect);
+    // 主动攻击结算：每个固定步按「左键按住 + 冷却就绪」尝试一次横扫——
+    // 方向取鼠标瞄准（不索敌、挥空也出招），命中由扇形判定逐只结算
+    resolvePlayerAttack(ctx, playerRect);
 
     // 怪物刷新（边缘持续刷新 + 随时间增强）：局内秒数累计 + 到点生成。
     // 存活计时与怪物难度计时共用同一时间基准（固定步长，暂停时冻结）
@@ -484,24 +490,68 @@ void PlayScene::update(const UpdateContext& ctx)
     }
 }
 
-// 自动攻击结算（每个固定步调用一次）：「索敌 -> 出手 -> 单体命中」。
-// 「场景选目标、玩家管出手」的分工：玩家实体不知道怪物存在，本函数找出
-// 攻击范围内「最近的存活怪物」后调用 Player::tryAutoAttack；出手成功
-// （冷却就绪）才结算——每次出手只命中这一个目标（多目标扩展留后续批次）
-void PlayScene::resolveAutoAttack(const SDL_FRect& playerRect)
+// 主动攻击结算（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扇形命中」。
+// 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
+//   1. 左键没按住：本步不结算（主动攻击——不按不挥）；
+//   2. 瞄准方向 = 玩家中心 -> 鼠标；零向量（鼠标压在玩家中心）时回退到
+//      玩家当前面向（左/右），保证方向可预期、不出 NaN；
+//   3. Player::tryAttack 出手（冷却门控在玩家侧；挥空也出招）；
+//   4. 出手成功才做扇形结算：对每只存活怪物跑 AttackArc 判定，命中者
+//      各自扣血/飘字/掉落或微击退（本批核心的「横扫多目标」）
+void PlayScene::resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& playerRect)
 {
-    // 玩家中心：索敌距离的基准点（与怪物中心之间按「中心距」比较——
-    // 距离既定的两个方块，中心距与边缘距只差一个常量偏移）
-    const float playerCenterX = playerRect.x + playerRect.w * 0.5f; // 中心 x = 左上角 + 半宽
-    const float playerCenterY = playerRect.y + playerRect.h * 0.5f; // 中心 y = 左上角 + 半高
+    // 无输入系统（旧调用方）：既没有鼠标位置也没有攻击动作，本步不结算
+    if (ctx.input == nullptr)
+    {
+        return;
+    }
 
-    // 索敌半径的平方：比较用平方距离（每步都要遍历池，省一次 sqrt）
-    const float rangeSq = m_attackRange * m_attackRange;
+    // 主动攻击门控：左键没按住就不出手——「不按不挥」是本批与自动攻击的
+    // 根本区别。held 同时覆盖「单击挥一次」（按住的那一个固定步）与
+    // 「按住连扫」（节奏由 Player 的冷却门控制）
+    if (!ctx.input->held("attack"))
+    {
+        return;
+    }
 
-    Monster* nearest = nullptr; // 范围内最近的存活怪物（nullptr = 无目标不发招）
-    float nearestDistSq = 0.0f; // 最近距离平方（仅当 nearest 非空时有意义）
+    // 玩家中心：瞄准向量的起点，也是扇形判定的圆心
+    const float centerX = playerRect.x + playerRect.w * 0.5f; // 中心 x = 左上角 + 半宽
+    const float centerY = playerRect.y + playerRect.h * 0.5f; // 中心 y = 左上角 + 半高
 
-    // 逐只扫描存活怪物找最近者；池上限 12，线性遍历成本可忽略
+    // 瞄准向量 = 玩家中心 -> 鼠标位置（鼠标为窗口客户区坐标，与游戏世界
+    // 同一坐标系；ctx.input 的位置是「本渲染帧的采样快照」，整帧共享）
+    const Vec2 mouse = ctx.input->mousePosition();
+    float aimX = mouse.x - centerX; // 水平分量（正右负左）
+    float aimY = mouse.y - centerY; // 垂直分量（正下负上）
+
+    // 零向量防御（鼠标恰好压在玩家中心）：没有方向可言，回退到玩家当前
+    // 面向（右为 +1、左为 -1），保证横扫方向可预期且不产生 NaN
+    if (aimX * aimX + aimY * aimY < kAimEpsilonSquared)
+    {
+        aimX = m_player.flipped() ? -1.0f : 1.0f; // 面向左侧/右侧
+        aimY = 0.0f;                              // 水平方向
+    }
+
+    // 出手尝试：冷却未到返回 false（不结算）；「按住 + 冷却就绪」才走到
+    // 下面的扇形结算——有没有怪物不在这次判断里（挥空也出招）
+    if (!m_player.tryAttack(aimX, aimY))
+    {
+        return;
+    }
+
+    // 判定中轴取「表现所用的同一方向」（归一化单位向量）：tryAttack 内已
+    // 归一化并保存，判定与画面因此严格同轴，不会因两次计算产生偏差
+    const Vec2 swingDir = m_player.swingDirection();
+
+    // 弧内判定参数：圆心 = 玩家中心；半径 = attack_range、总张角 =
+    // attack_arc（纯函数见 game/AttackArc.h，边界行为有单测覆盖）
+    const Vec2 attackOrigin{ centerX, centerY };
+
+    // 命中统计：全弧扫完统一报告（挥空也记日志——「挥空也出招」的证据点）
+    int hitCount = 0;
+
+    // 逐只扫描存活怪物：命中弧内「所有」目标（本批多目标语义——不再是
+    // 旧版的最近单体；每只独立结算，互不影响）
     for (Monster& monster : m_monsters)
     {
         if (!monster.isAlive())
@@ -509,70 +559,63 @@ void PlayScene::resolveAutoAttack(const SDL_FRect& playerRect)
             continue; // 空槽位跳过
         }
 
-        // 怪物中心到玩家中心的位移与平方距离（比较用平方，等效且更快）
-        const float dx = monster.rect().x + monster.width() * 0.5f - playerCenterX;
-        const float dy = monster.rect().y + monster.height() * 0.5f - playerCenterY;
-        const float distSq = dx * dx + dy * dy;
+        // 怪物矩形只取一次：本只的中心点与后续掉落位置共用同一份快照
+        const SDL_FRect monsterRect = monster.rect();
+        const float monsterCenterX = monsterRect.x + monsterRect.w * 0.5f; // 中心 x
+        const float monsterCenterY = monsterRect.y + monsterRect.h * 0.5f; // 中心 y
 
-        if (distSq > rangeSq)
+        // 弧内判定：距离 ≤ 半径 且 与中轴夹角 ≤ 半张角（含边界；零向量
+        // 防御等边界行为都在纯函数内，见 AttackArc.h）
+        if (!isPointInAttackArc(attackOrigin, swingDir,
+                                Vec2{ monsterCenterX, monsterCenterY },
+                                m_attackRange, m_attackArc))
         {
-            continue; // 攻击范围外：不参与索敌（更近的候选也不可能是它）
+            continue; // 弧外：本只不结算，继续检查下一只
         }
 
-        // 首个范围内目标直接当选；其后只接受更近者（严格小于保证稳定）
-        if (nearest == nullptr || distSq < nearestDistSq)
+        ++hitCount; // 命中一只（同一只怪在一次出手里至多命中一次）
+
+        // 1) 扣血（闪白在 takeDamage 内自动触发；返回是否致死）
+        const bool died = monster.takeDamage(m_attackDamage);
+
+        // 2) 伤害飘字：在怪物位置弹出「-当前伤害值」（上浮+淡出）。
+        //    多目标同帧命中时逐只各弹一条——同帧多飘字正是横扫的观感
+        char damageText[32]; // 容纳 "-" + 最长伤害数字，绰绰有余
+        SDL_snprintf(damageText, sizeof(damageText), "-%d", m_attackDamage);
+        spawnFloatingText(damageText, monsterCenterX, monsterCenterY - 20.0f,
+                          SDL_Color{ 255, 255, 255, 255 }); // 白色：与金色升级飘字区分
+
+        // 冒烟观测点：横扫命中日志（含剩余生命与局内时间——自动化测试据
+        // 它断言多目标命中与连扫节奏；t 为局内秒数，同一次出手共享同一 t）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "横扫命中（剩余生命 %d，t=%.2f）", monster.hp(), m_survivalSeconds);
+
+        if (died)
         {
-            nearest = &monster;   // 记住这一只：当前最近候选
-            nearestDistSq = distSq; // 更新最近距离
+            // 击杀结算：计数 +1、原地掉落经验宝石（位置取目标怪物的中心）
+            ++m_killCount; // 本局击杀 +1（HUD/结算使用）
+            dropGemAt(monsterCenterX, monsterCenterY); // 掉落：坐标即怪物中心
+
+            // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
+        }
+        else
+        {
+            // 未死：微击退（沿「玩家中心 -> 怪物中心」方向远离玩家）。
+            // 距离来自 attack_knockback（默认 30——由原 60 减半的「微」
+            // 击退，保持追击压力、方便下一轮连扫补刀）
+            monster.knockback(centerX, centerY,
+                              static_cast<float>(m_width), static_cast<float>(m_height),
+                              m_attackKnockback);
         }
     }
 
-    // 无目标：本步不发招（「无目标不出手」的兑现点——冷却也不会被消耗）
-    if (nearest == nullptr)
+    // 挥空也出招的日志证据：本次出手成功但一只也没命中怪（此时也不索敌、
+    // 不做任何命中结算——挥砍表现已在 Player 内照常播放）
+    if (hitCount == 0)
     {
-        return;
-    }
-
-    // 目标中心：出手方向与掉宝位置的参照点
-    const float targetCenterX = nearest->rect().x + nearest->width() * 0.5f; // 目标中心 x
-    const float targetCenterY = nearest->rect().y + nearest->height() * 0.5f; // 目标中心 y
-
-    // 出手尝试：冷却未到返回 false（不出手也不结算）；出手成功才继续
-    if (!m_player.tryAutoAttack(targetCenterX, targetCenterY))
-    {
-        return;
-    }
-
-    // 命中结算（单体）：扣血（闪白在 takeDamage 内自动触发）+ 死亡判定
-    const bool died = nearest->takeDamage(m_attackDamage);
-
-    // 伤害飘字（本批新增）：在怪物位置弹出「-当前伤害值」（上浮+淡出）。
-    // 无论是否致死都展示——命中即反馈。位置取目标中心、上移 20 像素：
-    // 32 号字高约 40 像素，上移半字高让数字视觉上居中挂在怪物身上
-    char damageText[32]; // 容纳 "-" + 最长伤害数字，绰绰有余
-    SDL_snprintf(damageText, sizeof(damageText), "-%d", m_attackDamage);
-    spawnFloatingText(damageText, targetCenterX, targetCenterY - 20.0f,
-                      SDL_Color{ 255, 255, 255, 255 }); // 白色：与金色升级飘字区分
-
-    // 冒烟观测点：自动攻击命中日志（含剩余生命——击杀这一击记为 0）
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "自动攻击命中（剩余生命 %d）", nearest->hp());
-
-    if (died)
-    {
-        // 击杀结算：计数 +1、原地掉落经验宝石（位置取目标怪物的中心）
-        ++m_killCount; // 本局击杀 +1（HUD/结算使用）
-        dropGemAt(targetCenterX, targetCenterY); // 掉落：坐标即怪物中心
-
-        // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
-    }
-    else
-    {
-        // 未死：短距击退（沿「玩家中心 -> 怪物中心」方向远离玩家），
-        // 保持追击压力、给冷却窗口留出下一次出手的空间
-        nearest->knockback(playerCenterX, playerCenterY,
-                           static_cast<float>(m_width), static_cast<float>(m_height),
-                           kAttackKnockbackDistance);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "横扫挥空（未命中任何怪物，t=%.2f）", m_survivalSeconds);
     }
 }
 
@@ -617,7 +660,7 @@ void PlayScene::grantXp(int amount)
         m_playerMaxHp += m_levelupHpBonus; // 上限抬高
         m_playerHp = std::min(m_playerHp + m_levelupHpBonus, m_playerMaxHp); // 即时回血并夹取
 
-        // 2) 攻击伤害 +bonus（此后自动攻击结算用新值，伤害飘字同步变大）
+        // 2) 攻击伤害 +bonus（此后横扫结算用新值，伤害飘字同步变大）
         m_attackDamage += m_levelupDamageBonus;
 
         // 3) 移速 +bonus 并注入玩家实体（下一固定步的移动立即使用新速度）
@@ -802,7 +845,7 @@ void PlayScene::restart()
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "重开一局");
 }
 
-// 每帧渲染：清屏 -> 背景 -> 玩家（含挥剑表现）-> 怪物 -> 宝石 -> HUD。
+// 每帧渲染：清屏 -> 背景 -> 玩家（含横扫表现）-> 怪物 -> 宝石 -> HUD。
 // 不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
 // alpha 是插值系数，原样传给各实体——它们据此在上一固定步位置与当前
 // 固定步位置之间平滑绘制
@@ -861,8 +904,9 @@ void PlayScene::render(float alpha)
         }
     }
 
-    // 说明：原「挥击弧光」特效已随本批改版退役——攻击表现改由 Player
-    // 在自身 render 里绘制武器素材（挥剑前探+收回），此处不再有场景层特效
+    // 说明：原「挥击弧光」特效已退役——攻击表现改由 Player 在自身 render
+    // 里绘制武器素材（绕玩家中心 −60° 扫到 +60° 的横扫轨迹），
+    // 此处不再有场景层特效
 
     // 经验宝石：逐颗按插值位置绘制（最上层——拾取目标永远清晰可辨）
     for (const XpGem& gem : m_gems)
