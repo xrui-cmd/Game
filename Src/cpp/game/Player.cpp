@@ -1,5 +1,6 @@
 #include "game/Player.h"
 #include "game/AttackArc.h" // bladeAngleAt：刀锋角共享曲线（判定与渲染同款）；缓出注释见该文件
+#include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与可走查询
 #include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
 #include "engine/Input.h"   // Input：经 ctx.input 查询移动动作的接口定义
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载武器素材（可选增强）
@@ -266,11 +267,26 @@ void Player::update(const UpdateContext& ctx)
     }
 
     // 4) 位置积分：本步位移 = 当前速度 x 固定步长（速度单位：像素/秒）。
-    //    批二：世界坐标下的直接积分——旧「窗口边框 clamp」随「窗口即世界」
-    //    的时代一并移除；墙体与边界碰撞（撞墙滑动）由世界系统接管
-    //    （World::slideMove，见后续接入笔）
-    m_x += m_velocityX * dt; // 直接推进 x（世界坐标）
-    m_y += m_velocityY * dt; // 直接推进 y（世界坐标）
+    //    自批二起改为「世界碰撞滑动」：分轴尝试 + 撞墙停该轴 + 子步防穿透
+    //    （取代旧版「窗口边框 clamp」——玩家活动范围 = 世界边界，由边界墙
+    //    自然形成；判定在实体内部、按注入的 World 执行）
+    const float stepDX = m_velocityX * dt; // 本步期望水平位移（像素）
+    const float stepDY = m_velocityY * dt; // 本步期望垂直位移（像素）
+
+    if (m_world != nullptr)
+    {
+        // 世界在位：整段位移交给纯函数（内部拆分小步、逐轴试走）——
+        // 一轴被墙挡住、另一轴照常推进，天然产生「贴墙滑动」的手感
+        const SDL_FPoint moved = m_world->slideMove(m_x, m_y, m_w, m_h, stepDX, stepDY);
+        m_x = moved.x; // 落定后的世界坐标 x（可能被墙截停）
+        m_y = moved.y; // 落定后的世界坐标 y
+    }
+    else
+    {
+        // 世界未注入（防御分支）：退化为无碰撞位移——不限制、不崩溃
+        m_x += stepDX; // 直接推进 x
+        m_y += stepDY; // 直接推进 y
+    }
 
     // 5) 行走动画推进与子区间切换（固定帧时长与渲染帧率解耦）：
     //    判据是「有没有速度」——移动时循环跑动帧 [kRunFirst, kRunLast]；

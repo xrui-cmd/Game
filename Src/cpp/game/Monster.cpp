@@ -1,4 +1,5 @@
 #include "game/Monster.h"
+#include "game/World.h"    // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
 #include "engine/Camera.h" // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
 #include <algorithm> // std::clamp / std::max：闪白计时与战斗数值的上下界
 #include <cmath>     // std::sqrt：归一化方向与距离计算
@@ -166,13 +167,38 @@ void Monster::knockback(float fromX, float fromY, float distance)
         dirY = dy / length; // 单位方向 y：dy 占全长的比例
     }
 
-    // 新中心 = 现中心 + 单位方向 x 击退距离；再换算回左上角坐标写入落点
-    // （批二：世界坐标下的纯位移——落点的世界可走校验见后续接入笔）
-    m_x = centerX + dirX * distance - m_w * 0.5f; // 左上角 x = 新中心 - 半宽
-    m_y = centerY + dirY * distance - m_h * 0.5f; // 左上角 y = 新中心 - 半高
+    // 世界未注入（防御）：退化为无校验位移——直接按全距离瞬移
+    if (m_world == nullptr)
+    {
+        m_x = centerX + dirX * distance - m_w * 0.5f; // 左上角 x = 新中心 - 半宽
+        m_y = centerY + dirY * distance - m_h * 0.5f; // 左上角 y = 新中心 - 半高
+        snapshotPreviousPosition();                    // 瞬移收尾：快照对齐防拉丝
+        return;
+    }
 
-    // 瞬移类操作的插值收尾：落点定稿后快照 prev=cur，渲染不拉丝
-    snapshotPreviousPosition();
+    // 落点校验（本批新增）：从全距离开始，被墙挡则按 1/2、1/4 逐级缩短重试。
+    // 「贴墙可接受」的口径下不允许落点推进墙内——否则怪物会卡在墙里
+    // 两轴都出不来（而贴墙边站位是允许的：矩形与墙格相交才被拒）
+    for (float factor = 1.0f; factor >= 0.25f; factor *= 0.5f)
+    {
+        // 候选落点（左上角坐标）：中心 + 方向 x 距离 x 比例 - 半尺寸
+        const float candidateX = centerX + dirX * distance * factor - m_w * 0.5f;
+        const float candidateY = centerY + dirY * distance * factor - m_h * 0.5f;
+
+        // 候选矩形可走：采用并结束（候选矩形 = 怪物尺寸的 AABB）
+        const SDL_FRect candidate{ candidateX, candidateY, m_w, m_h };
+        if (m_world->isRectWalkable(candidate))
+        {
+            m_x = candidateX; // 采用候选落点 x
+            m_y = candidateY; // 采用候选落点 y
+            // 瞬移类操作的插值收尾：落点定稿后快照 prev=cur，渲染不拉丝
+            snapshotPreviousPosition();
+            return;
+        }
+    }
+
+    // 全距离档位都不可走（贴墙死角/被包围）：原地不动——
+    // 比「卡进墙里出不来」好；位置未变，插值区间保持原样（无需快照）
 }
 
 // 覆写更新：帧动画 + 受击闪白计时 + 朝目标点的直线追踪
@@ -212,12 +238,69 @@ void Monster::update(const UpdateContext& ctx)
         return;
     }
 
-    // 沿归一化方向 x 速度移动（固定步长积分）。与玩家「逐轴独立」不同：
-    // 怪物是直线追击，归一化保证任意方向合速度恒等于注入的速度值。
-    // 速度由 PlayScene 按「变体基础速度 + 难度成长」注入。
-    // 批二：世界坐标下的直接积分——墙体碰撞滑动（分轴 + 侧滑）见后续接入笔
-    m_x += (dx / distance) * m_chaseSpeed * ctx.deltaTime; // 水平分量：单位方向 x 速度 x 步长
-    m_y += (dy / distance) * m_chaseSpeed * ctx.deltaTime; // 垂直分量：同上（y 轴向下为正）
+    // 沿归一化方向 x 速度的「期望位移」（固定步长积分）。与玩家「逐轴独立」
+    // 不同：怪物是直线追击，归一化保证任意方向合速度恒等于注入的速度值。
+    // 速度由 PlayScene 按「变体基础速度 + 难度成长」注入
+    const float stepDX = (dx / distance) * m_chaseSpeed * ctx.deltaTime; // 期望水平位移
+    const float stepDY = (dy / distance) * m_chaseSpeed * ctx.deltaTime; // 期望垂直位移
+
+    // 世界未注入（防御分支）：无碰撞直接位移，不做任何阻挡
+    if (m_world == nullptr)
+    {
+        m_x += stepDX; // 直接推进 x
+        m_y += stepDY; // 直接推进 y
+        return;        // 本步移动结束
+    }
+
+    // ---- 主方向：分轴滑动（本批新增）----
+    // 一轴被墙挡住、另一轴照走——「贴墙滑行」的手感来源；内部还带子步
+    // 拆分防高速穿透（与玩家移动共用同一个纯函数，行为一致）
+    const SDL_FPoint moved = m_world->slideMove(m_x, m_y, m_w, m_h, stepDX, stepDY);
+    const float movedDX = moved.x - m_x; // 碰撞后的实际水平位移
+    const float movedDY = moved.y - m_y; // 碰撞后的实际垂直位移
+
+    // 卡住检测：期望位移² vs 实际位移²（比较用平方，省一次开方）
+    const float expectedSq = stepDX * stepDX + stepDY * stepDY;  // 期望位移平方
+    const float movedSq = movedDX * movedDX + movedDY * movedDY; // 实际位移平方
+
+    if (expectedSq > 0.0f && movedSq < expectedSq * kStuckMoveRatioSquared)
+    {
+        // ---- 轻量侧滑（本批过渡版）：正面撞墙「几乎没动」时，把期望位移
+        // 旋转 90 度（先右后左）再试——每步独立决策、无状态记忆：能滑就
+        // 沿墙爬行、两侧皆堵就原地。完整绕墙/寻路留批三评估 ----
+        const SDL_FPoint slideRight = m_world->slideMove(m_x, m_y, m_w, m_h, -stepDY, stepDX); // 右侧滑（顺时针 90°）
+        const SDL_FPoint slideLeft = m_world->slideMove(m_x, m_y, m_w, m_h, stepDY, -stepDX);  // 左侧滑（逆时针 90°）
+
+        // 两候选侧滑的实际位移平方：评判「哪一侧更能动」
+        const float rightMovedSq = (slideRight.x - m_x) * (slideRight.x - m_x) +
+                                   (slideRight.y - m_y) * (slideRight.y - m_y); // 右滑位移²
+        const float leftMovedSq = (slideLeft.x - m_x) * (slideLeft.x - m_x) +
+                                  (slideLeft.y - m_y) * (slideLeft.y - m_y);    // 左滑位移²
+
+        // 选择规则：在「比主方向结果更能动」的候选中取更优者；
+        // 两侧都不如主方向（凹角死角）则落回主方向结果（基本原地）
+        if (rightMovedSq > movedSq && rightMovedSq >= leftMovedSq)
+        {
+            m_x = slideRight.x; // 采用右侧滑结果 x
+            m_y = slideRight.y; // 采用右侧滑结果 y
+        }
+        else if (leftMovedSq > movedSq)
+        {
+            m_x = slideLeft.x; // 采用左侧滑结果 x
+            m_y = slideLeft.y; // 采用左侧滑结果 y
+        }
+        else
+        {
+            m_x = moved.x; // 两侧皆堵：落回主方向结果（截停后的位置）
+            m_y = moved.y;
+        }
+    }
+    else
+    {
+        // 正常推进（含单轴贴墙滑动的常见情形）
+        m_x = moved.x; // 采用主方向滑动结果 x
+        m_y = moved.y; // 采用主方向滑动结果 y
+    }
 }
 
 // 覆写渲染：常规帧与受击闪白帧（均经相机世界->屏幕换算）

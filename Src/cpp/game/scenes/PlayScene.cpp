@@ -193,6 +193,9 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     const SDL_FPoint spawn = m_world.spawnPointFor(m_player.width(), m_player.height());
     m_player.reset(spawn.x, spawn.y);
 
+    // 玩家注入世界指针：移动由「分轴位移 + 撞墙滑动」（World::slideMove）执行
+    m_player.setWorld(&m_world);
+
     // 11) 相机（批二核心）：视口 = 窗口尺寸、世界尺寸来自 World、镜头立即
     //     对准玩家中心（进局不做「从别处滑过来」的动画——snapTo 瞬移对齐）。
     //     然后立即刷一次区块激活窗口：第一帧渲染前的 3x3 区块就位
@@ -208,6 +211,13 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //     变体在「刷新时刻」才等权随机决定，纹理随变体由 loadVariant 按需加载
     //     （单帧 PNG 解码开销很小）；未激活的槽位不更新、不渲染、不参与碰撞
     m_monsters.resize(static_cast<size_t>(kMonsterPoolSize));
+
+    // 池内槽位统一注入世界指针（碰撞滑动与击退落点校验用）；
+    // 进程内改造完成前的防御语义：未注入 = 无墙世界（不会卡死实体）
+    for (Monster& monster : m_monsters)
+    {
+        monster.setWorld(&m_world);
+    }
 
     // 13) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
     //     永不失败）。整局沿用这份快照——GameOver 结算时才比较与更新
@@ -361,9 +371,9 @@ void PlayScene::update(const UpdateContext& ctx)
         m_player.setAimTarget(mouseWorld.x, mouseWorld.y);                             // 注入：翻转判定参考它
     }
 
-    // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动（批二：
-    // 世界坐标下的直接积分——旧窗口 clamp 已移除，墙体碰撞滑动见后续
-    // 接入笔）、按注入的瞄准点切换朝向翻转，并推进攻击计时
+    // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动（批二起经
+    // World::slideMove 的「分轴 + 撞墙滑动」，不再做窗口 clamp）、按注入的
+    // 瞄准点切换朝向翻转，并推进攻击计时
     m_player.update(ctx);
 
     // 玩家矩形只取一次：本步的碰撞检测、怪物追踪与相机跟随共用一个快照
