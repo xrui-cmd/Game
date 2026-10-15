@@ -414,7 +414,7 @@ void Monster::moveWithCollision(float stepDX, float stepDY, float /*dt*/)
     }
 }
 
-// 覆写渲染：常规帧与受击闪白帧（均经相机世界->屏幕换算）
+// 覆写渲染：常规帧 + 受击闪白帧 + 头顶血条（均经相机世界->屏幕换算）
 void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) const
 {
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
@@ -422,18 +422,62 @@ void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) 
     Entity::render(renderer, alpha, camera);
 
     // 闪白叠加：只有「正在闪白」且纹理已加载时执行
-    if (m_flashLeft <= 0.0f || m_texture == nullptr)
+    if (m_flashLeft > 0.0f && m_texture != nullptr)
     {
-        return;
+        // 受击闪白 = 用加色混合（ADD）把同一帧再画一遍：像素颜色与自身相加后
+        // 整体提亮，各变体本体色被推亮成偏白的高光（史莱姆的绿、骷髅的白骨
+        // 都会明显「发光」一下）。
+        // 为什么不用颜色调制（SDL_SetTextureColorMod）：乘法调制只能压暗，
+        // 无法把本体「提亮成白光」；叠加混合才能做出闪光效果
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);
+        Entity::render(renderer, alpha, camera); // 第二次绘制：叠加提亮（同一相机换算）
+        // 还原默认混合模式：纹理状态若残留 ADD，会污染后续普通绘制
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
     }
 
-    // 受击闪白 = 用加色混合（ADD）把同一帧再画一遍：像素颜色与自身相加后
-    // 整体提亮，各变体本体色被推亮成偏白的高光（史莱姆的绿、骷髅的白骨
-    // 都会明显「发光」一下）。
-    // 为什么不用颜色调制（SDL_SetTextureColorMod）：乘法调制只能压暗，
-    // 无法把本体「提亮成白光」；叠加混合才能做出闪光效果
-    SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);
-    Entity::render(renderer, alpha, camera); // 第二次绘制：叠加提亮（同一相机换算）
-    // 还原默认混合模式：纹理状态若残留 ADD，会污染后续普通绘制
-    SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
+    // ---- 头顶血条（批三）：受损后显示、满血隐藏 ----
+    // 满血（或异常上限）不画：轻量读血只在「需要关心血量」时占用画面
+    if (m_hp >= m_maxHp || m_maxHp <= 0)
+    {
+        return; // 满血：无血条
+    }
+
+    // 插值位置：与本体绘制使用同一条「prev -> cur 按 alpha 线性插值」公式
+    //（血条跟着精灵走，快速移动/相机跟随都不脱节）
+    const float interpX = m_prevX + (m_x - m_prevX) * alpha; // 插值左上角 x
+    const float interpY = m_prevY + (m_y - m_prevY) * alpha; // 插值左上角 y
+
+    // 血条几何（世界坐标）：水平居中于怪物、悬在头顶上方（留 kHpBarGapY 间隙）
+    const float barCenterX = interpX + m_w * 0.5f;             // 血条水平中心
+    const float barTopY = interpY - kHpBarGapY - kHpBarHeight; // 血条顶边 y
+
+    // 世界 -> 屏幕换算（血条是屏幕空间绘制：在当前无缩放的相机下与
+    // 世界空间尺寸一致，换算后直接按像素绘制矩形）
+    const Vec2 screen = camera.worldToScreen(barCenterX, barTopY);
+
+    // 血条外沿（近黑色描边）：让血条在深色地板/墙上仍有轮廓可辨
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255); // 近黑：描边色
+    const SDL_FRect barOutline{ screen.x - kHpBarWidth * 0.5f - 1.0f, // 外扩 1 像素
+                                screen.y - 1.0f,                       // 上沿外扩 1 像素
+                                kHpBarWidth + 2.0f,                    // 宽度两侧各 1 像素
+                                kHpBarHeight + 2.0f };                 // 高度上下各 1 像素
+    SDL_RenderFillRect(renderer, &barOutline);
+
+    // 血条底色（深色底）：满宽铺底——剩余生命的比例对照背景读出
+    SDL_SetRenderDrawColor(renderer, 45, 32, 34, 255); // 深红灰：底色
+    const SDL_FRect barBack{ screen.x - kHpBarWidth * 0.5f, // 左边界（居中）
+                             screen.y,                       // 顶边界
+                             kHpBarWidth,                    // 满宽 40
+                             kHpBarHeight };                 // 高 5
+    SDL_RenderFillRect(renderer, &barBack);
+
+    // 血条前景（红色）：宽度 = 满宽 x 生命比例（比例夹到 [0,1] 防御异常值）
+    const float ratio = std::clamp(static_cast<float>(m_hp) / static_cast<float>(m_maxHp),
+                                   0.0f, 1.0f); // 生命比例
+    SDL_SetRenderDrawColor(renderer, 220, 60, 60, 255); // 亮红：生命前景
+    const SDL_FRect barFill{ barBack.x,        // 与底色同左边界
+                             barBack.y,        // 与底色同顶边界
+                             barBack.w * ratio, // 按比例缩宽
+                             barBack.h };      // 与底色同高
+    SDL_RenderFillRect(renderer, &barFill);
 }

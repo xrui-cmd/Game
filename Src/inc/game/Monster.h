@@ -60,6 +60,9 @@ class Camera;
 //   7. 出生（批三正式版）：PlayScene 在「激活区块内随机 walkable 位置、
 //      离玩家 >= 500px」选好落点后经 spawnAt 写入——出生点即「巢」，
 //      怪物从此绕它巡逻（落点规则属玩法层，场景负责选择）
+//   8. 头顶血条（批三新增）：受损后（hp < maxHp）在头顶绘制小血条
+//      （40x5、深色底 + 红色按比例填充；屏幕空间绘制经相机换算）；
+//      满血隐藏——「看一眼血量、不看面板」的轻量读血方式
 // ============================================================
 
 // 怪物变体枚举：等权随机刷新的取值范围（Count 恒为变体数量，用作随机上界）
@@ -207,6 +210,11 @@ private:
     // 触发一次轻量侧滑尝试（见 moveWithCollision）——密度取 0.25 让两类
     // 情形的判别留有充分余量
     static constexpr float kStuckMoveRatioSquared = 0.25f;
+
+    // ---- 头顶血条（批三）：受伤后显示 ----
+    static constexpr float kHpBarWidth = 40.0f;  // 血条宽（像素；约 40 与规格一致）
+    static constexpr float kHpBarHeight = 5.0f;  // 血条高（像素；规格 5）
+    static constexpr float kHpBarGapY = 6.0f;    // 头顶与血条底边的间隙（像素）
 
     static constexpr int kFrameCount = 4; // 每个变体精灵表的总帧数（4 帧 x 48px = 192px 宽）
 
