@@ -10,8 +10,11 @@
 #         monster_goblin_sheet.png 哥布林（goblin run）4 帧，每帧 48x48
 #         monster_skelet_sheet.png 骷髅（skelet run）4 帧，每帧 48x48
 #         monster_*.png            三个变体的单帧回退（各自动画 f0）
-#         gem_sheet.png            经验宝石（coin_anim）4 帧，每帧 18x21
-#         gem.png                  宝石单帧回退（coin_anim f0）
+#         coin_sheet.png           金币（coin_anim）4 帧，每帧 18x21——素材包原色
+#         coin.png                 金币单帧回退（coin_anim f0）
+#         gem_sheet.png            经验宝石（coin_anim）4 帧，每帧 18x21——
+#                                  R<->B 换道「染色」为青蓝调（与金币区分）
+#         gem.png                  宝石单帧回退（coin_anim f0，同样染色）
 #         weapon.png               骑士剑（weapon_knight_sword，3 倍 -> 30x87）
 #         background.png           1280x720 地牢地板（floor 类 tile 3 倍 -> 一格 48px，
 #                                  固定种子掺少量变体砖，避免大面积死板重复）
@@ -144,12 +147,40 @@ function Assert-PngSize {
 }
 
 # ------------------------------------------------------------
+# 工具函数：R<->B 换道（红蓝通道互换）——批三「宝石染色」的实现
+# 参数：src 源图；返回同尺寸的新位图（调用方负责 Dispose）
+# 说明：金币原色是「橙边/金身/白高光」（R>G>B），换道后变成
+#       「蓝边/青身/白高光」（B>G>R）——青蓝调、与金币一眼可分。
+#       为什么在组装期染色而不是渲染期颜色调制（SDL_SetTextureColorMod）：
+#       乘法调制只能压暗通道（金身 B=0x3E 封顶），无法把金色推成青蓝；
+#       通道互换是像素级重排，组装期一次完成、零运行开销
+# ------------------------------------------------------------
+function Convert-SwapRedBlue {
+    param([System.Drawing.Image]$src)
+    # 目标画布：与源图同尺寸、带透明通道
+    $dst = New-Canvas -width $src.Width -height $src.Height
+    # 逐像素换道（源帧仅 6x7 像素级，全表也不过百余像素，无需优化）
+    for ($y = 0; $y -lt $src.Height; $y++) {
+        for ($x = 0; $x -lt $src.Width; $x++) {
+            # 取源像素（ARGB 各分量）
+            $p = $src.GetPixel($x, $y)
+            # 写入换道像素：R 与 B 互换、G/A 原样（透明像素保持全透明）
+            $dst.SetPixel($x, $y, [System.Drawing.Color]::FromArgb($p.A, $p.B, $p.G, $p.R))
+        }
+    }
+    # 返回新位图（源图不动）
+    return $dst
+}
+
+# ------------------------------------------------------------
 # 工具函数：把一串帧横向拼成精灵表（每帧放大 $scale 倍）
 # 参数：names 帧文件名数组（顺序即帧序）；width/height 单帧原始尺寸；outPath 输出路径
+#       swapRedBlue 是否对每帧做 R<->B 换道（批三宝石染色用）
 # 返回：无（直接写盘）
 # ------------------------------------------------------------
 function Compose-Sheet {
-    param([string[]]$names, [int]$frameWidth, [int]$frameHeight, [string]$outPath)
+    param([string[]]$names, [int]$frameWidth, [int]$frameHeight, [string]$outPath,
+          [switch]$swapRedBlue)
     # 单帧放大后的宽高（整数倍：源尺寸 x 全局倍数）
     $fw = $frameWidth * $scale
     $fh = $frameHeight * $scale
@@ -162,12 +193,21 @@ function Compose-Sheet {
         for ($i = 0; $i -lt $names.Count; $i++) {
             # 加载本帧原始图
             $img = Get-Frame $names[$i]
+            # 需要染色时先换道出一张副本（原图仍负责释放；副本绘制后释放）
+            $useImg = $img
+            if ($swapRedBlue) {
+                $useImg = Convert-SwapRedBlue $img
+            }
             try {
                 # 本帧在表中的横向起点（帧内所有像素都落在这段区间里）
                 $dx = $i * $fw
                 # 放大绘制到画布上（最近邻 + 像素对齐，细节见 Draw-ScaledAt）
-                Draw-ScaledAt -dstG $g -src $img -dx $dx -dy 0 -scaleFactor $scale
+                Draw-ScaledAt -dstG $g -src $useImg -dx $dx -dy 0 -scaleFactor $scale
             } finally {
+                # 染色副本（若创建过）先释放——它不属于 Get-Frame 的调用方
+                if ($swapRedBlue) {
+                    $useImg.Dispose()
+                }
                 # 无论绘制成败都释放本帧的源图（关闭文件句柄）
                 $img.Dispose()
             }
@@ -184,22 +224,27 @@ function Compose-Sheet {
 
 # ------------------------------------------------------------
 # 工具函数：把单帧组装为「单帧回退素材」（放大 $scale 倍后另存）
-# 参数：name 帧文件名；outPath 输出路径
+# 参数：name 帧文件名；outPath 输出路径；swapRedBlue 是否 R<->B 换道
 # ------------------------------------------------------------
 function Compose-Single {
-    param([string]$name, [string]$outPath)
+    param([string]$name, [string]$outPath, [switch]$swapRedBlue)
     # 加载唯一一帧原始图
     $img = Get-Frame $name
+    # 需要染色时先换道出一张副本
+    $useImg = $img
+    if ($swapRedBlue) {
+        $useImg = Convert-SwapRedBlue $img
+    }
     try {
         # 画布尺寸 = 单帧放大后的宽高
-        $w = $img.Width * $scale
-        $h = $img.Height * $scale
+        $w = $useImg.Width * $scale
+        $h = $useImg.Height * $scale
         # 创建透明画布
         $single = New-Canvas -width $w -height $h
         # 获取画布 Graphics 并绘制放大帧
         $g = [System.Drawing.Graphics]::FromImage($single)
         try {
-            Draw-ScaledAt -dstG $g -src $img -dx 0 -dy 0 -scaleFactor $scale
+            Draw-ScaledAt -dstG $g -src $useImg -dx 0 -dy 0 -scaleFactor $scale
         } finally {
             # 释放 Graphics
             $g.Dispose()
@@ -209,6 +254,10 @@ function Compose-Single {
         # 释放画布位图
         $single.Dispose()
     } finally {
+        # 释放染色副本（若创建过）
+        if ($swapRedBlue) {
+            $useImg.Dispose()
+        }
         # 释放源图
         $img.Dispose()
     }
@@ -258,15 +307,28 @@ Compose-Sheet -names @(
 Compose-Single -name "skelet_run_anim_f0" -outPath (Join-Path $assetsDir "monster_skelet.png")
 
 # ============================================================
-# 3) 经验宝石（coin_anim，4 帧旋转金币 + 单帧回退）
+# 3) 金币（素材包原色）与经验宝石（同源帧换道染色：青蓝调）
 # ============================================================
 # 源帧只有 6x7 像素：3 倍放大后为 18x21——小尺寸拾取物，与代码里
-# XpGem 的碰撞盒尺寸严格一致（18x21）
+# Coin / XpGem 的碰撞盒尺寸严格一致（18x21）。
+# 批三起两者同源不同色（「一眼可分」）：
+#   - 金币 = coin_anim 原始配色（橙边/金身/白高光）；
+#   - 经验宝石 = coin_anim 经 R<->B 换道（蓝边/青身/白高光）。
+# 不引入新素材：区分手段是染色（详见 Convert-SwapRedBlue 注释）
+
+# ---- 3.1 金币（原色，4 帧旋转 + 单帧回退）----
 Compose-Sheet -names @(
     "coin_anim_f0", "coin_anim_f1", "coin_anim_f2", "coin_anim_f3"
-) -frameWidth 6 -frameHeight 7 -outPath (Join-Path $assetsDir "gem_sheet.png")
+) -frameWidth 6 -frameHeight 7 -outPath (Join-Path $assetsDir "coin_sheet.png")
 # 单帧回退：旋转首帧
-Compose-Single -name "coin_anim_f0" -outPath (Join-Path $assetsDir "gem.png")
+Compose-Single -name "coin_anim_f0" -outPath (Join-Path $assetsDir "coin.png")
+
+# ---- 3.2 经验宝石（同源帧 R<->B 换道 -> 青蓝调）----
+Compose-Sheet -names @(
+    "coin_anim_f0", "coin_anim_f1", "coin_anim_f2", "coin_anim_f3"
+) -frameWidth 6 -frameHeight 7 -outPath (Join-Path $assetsDir "gem_sheet.png") -swapRedBlue
+# 单帧回退：旋转首帧（同样染色）
+Compose-Single -name "coin_anim_f0" -outPath (Join-Path $assetsDir "gem.png") -swapRedBlue
 
 # ============================================================
 # 4) 武器（weapon_knight_sword）：自动攻击的挥剑表现素材
@@ -421,6 +483,11 @@ Assert-PngSize -path (Join-Path $assetsDir "monster_skelet_sheet.png") -expected
 Assert-PngSize -path (Join-Path $assetsDir "monster_slime.png") -expectedWidth 48 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "monster_goblin.png") -expectedWidth 48 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "monster_skelet.png") -expectedWidth 48 -expectedHeight 48
+
+#   金币精灵表：4 帧 x 18 宽 = 72，高 21（Coin 的 m_w=18 / m_h=21）
+Assert-PngSize -path (Join-Path $assetsDir "coin_sheet.png") -expectedWidth 72 -expectedHeight 21
+#   金币单帧回退：18x21
+Assert-PngSize -path (Join-Path $assetsDir "coin.png") -expectedWidth 18 -expectedHeight 21
 
 #   宝石精灵表：4 帧 x 18 宽 = 72，高 21（XpGem 的 m_w=18 / m_h=21）
 Assert-PngSize -path (Join-Path $assetsDir "gem_sheet.png") -expectedWidth 72 -expectedHeight 21

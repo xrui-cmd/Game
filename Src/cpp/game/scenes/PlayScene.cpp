@@ -351,6 +351,10 @@ void PlayScene::update(const UpdateContext& ctx)
         {
             gem.snapshotPreviousPosition(); // 经验宝石：逐颗对齐
         }
+        for (Coin& coin : m_coins)
+        {
+            coin.snapshotPreviousPosition(); // 金币：逐枚对齐（批三）
+        }
         return;
     }
 
@@ -521,6 +525,33 @@ void PlayScene::update(const UpdateContext& ctx)
     }
     // 统一清理已被拾取的宝石（保持其余元素的地址不变）
     std::erase_if(m_gems, [](const XpGem& gem) { return gem.isPicked(); });
+
+    // 金币（批三）：推进旋转动画 -> 拾取判定 -> 统一清理（与宝石同一套流程）
+    for (Coin& coin : m_coins)
+    {
+        // 播放旋转动画（基类默认 update：推进帧时间轴，与渲染帧率解耦）
+        coin.update(ctx);
+
+        // AABB 相交即拾取：标记 + 局内货币累计 + 播放「叮」音效；
+        // 实际移除放在循环之后统一做（避免边遍历边删除）
+        if (!coin.isPicked() && rectsOverlap(playerRect, coin.rect()))
+        {
+            coin.markPicked(); // 标记：本次遍历结束后统一清理
+
+            // 局内货币累计：本局 +1（本批只储备不消费——为将来商店/
+            // 强化体系铺路；restart 清零）
+            ++m_coinCount;
+
+            // 拾取音效沿用 coin.wav（与宝石拾取同一听觉反馈，语义恰好吻合）
+            m_audio->play(SoundId::Coin);
+
+            // 冒烟观测点：拾取金币日志（本局累计——冒烟断言 HUD 计数增长）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "拾取金币（本局累计 %d）", m_coinCount);
+        }
+    }
+    // 统一清理已被拾取的金币（保持其余元素的地址不变）
+    std::erase_if(m_coins, [](const Coin& coin) { return coin.isPicked(); });
 
     // 接触伤害：仅玩家非无敌时整段检测（无敌期 = 保护窗口，跳过判定）。
     // 命中结算：扣生命、播 hit 音效、玩家进入无敌、怪物弹开；
@@ -739,12 +770,18 @@ void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
 
         if (died)
         {
-            // 击杀结算：计数 +1、原地掉落经验宝石（位置取目标怪物的中心）
+            // 击杀结算：计数 +1、原地掉落经验宝石与金币（批三双掉落）。
+            // 金币数按变体查表（史莱姆 1 / 哥布林 2 / 骷髅 1）
             ++m_killCount; // 本局击杀 +1（HUD/结算使用）
-            dropGemAt(monsterCenterX, monsterCenterY); // 掉落：坐标即怪物中心
+            dropGemAt(monsterCenterX, monsterCenterY);           // 掉落宝石：坐标即怪物中心
+            const int coinCount = monster.coinDrop();            // 本变体的金币掉落数
+            dropCoinsAt(monsterCenterX, monsterCenterY, coinCount); // 掉落金币（散开可见）
 
             // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
+            // 冒烟观测点：金币掉落日志（数量按变体——冒烟对照断言用）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "金币掉落（%d 枚，%s）", coinCount, monsterTypeName(monster.type()));
         }
         else
         {
@@ -794,6 +831,41 @@ void PlayScene::dropGemAt(float x, float y)
 
     // 落位：坐标以怪物中心给出，换算到宝石左上角；setPosition 内部同步插值快照
     gem.setPosition(x - gem.width() * 0.5f, y - gem.height() * 0.5f);
+}
+
+// 掉落 count 枚金币到 (x, y) 周围（批三）：坐标指「怪物中心」
+void PlayScene::dropCoinsAt(float x, float y, int count)
+{
+    // 非正数（未来改表/调用方错误）：无掉落，直接返回（防御）
+    if (count <= 0)
+    {
+        return;
+    }
+
+    for (int i = 0; i < count; ++i)
+    {
+        // 在链表尾部原位构造（与宝石同一原因：节点式容器不搬动既有元素，
+        // 实体的纹理指针绝不会因扩容被复制）
+        m_coins.emplace_back();
+        Coin& coin = m_coins.back(); // 引用新金币：完成加载与落位
+
+        // 纹理加载（三级回退在实体内部；失败只记录不中断——该金币渲染时跳过）
+        if (!coin.load(m_renderer))
+        {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建金币纹理失败：%s", SDL_GetError());
+        }
+
+        // 散开落位：多枚金币绕掉落中心均匀分布在小半径圆上（2 枚时
+        // 左右各一、一眼数得清）；单枚（count==1）时半径取 0 = 落中心
+        const float angle = 6.283185307179586f * static_cast<float>(i) / static_cast<float>(count); // 每枚的方位角
+        const float offsetX = std::cos(angle) * kCoinDropScatter; // 横向偏移
+        const float offsetY = std::sin(angle) * kCoinDropScatter; // 纵向偏移
+
+        // 落位：坐标以怪物中心给出（含散开偏移），换算到金币左上角；
+        // setPosition 内部同步插值快照（瞬移类操作防拉丝）
+        coin.setPosition(x + offsetX - coin.width() * 0.5f,
+                         y + offsetY - coin.height() * 0.5f);
+    }
 }
 
 // 经验结算：把 amount 点经验并入当前进度，按升级曲线循环结算（一枚宝石
@@ -1060,6 +1132,11 @@ void PlayScene::restart()
     // 场上经验宝石清空（析构各自释放纹理；renderer 尚在，安全）
     m_gems.clear();
 
+    // 场上金币清空 + 局内货币清零（批三）：新一局的货币从 0 开始累计
+    //（「本局累计、restart 清零」的规格语义）
+    m_coins.clear();
+    m_coinCount = 0;
+
     // 刀锋扫程状态清零：上一局未扫完的刀锋（含命中记录）不带进新一局——
     // Player::reset 已清零表现计时（swingActive 随之为 false），这里把
     // 场景侧推进标记与命中记录一并复位
@@ -1078,7 +1155,7 @@ void PlayScene::restart()
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "重开一局");
 }
 
-// 每帧渲染：清屏 -> 世界区块 -> 玩家（含横扫表现）-> 怪物 -> 宝石 ->
+// 每帧渲染：清屏 -> 世界区块 -> 玩家（含横扫表现）-> 怪物 -> 宝石 -> 金币 ->
 // 漂浮文字 -> HUD。不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
 // alpha 是插值系数，原样传给各实体——它们据此在上一固定步位置与当前
 // 固定步位置之间平滑绘制，再经相机换算到屏幕（批二）
@@ -1141,10 +1218,17 @@ void PlayScene::render(float alpha)
     // 里绘制武器素材（绕玩家中心 −60° 扫到 +60° 的横扫轨迹），
     // 此处不再有场景层特效
 
-    // 经验宝石：逐颗按插值位置绘制（经相机换算；最上层——拾取目标清晰可辨）
+    // 经验宝石：逐颗按插值位置绘制（经相机换算；青蓝调——与金币一眼可分）
     for (const XpGem& gem : m_gems)
     {
         gem.render(m_renderer, alpha, m_camera);
+    }
+
+    // 金币（批三）：逐枚按插值位置绘制（经相机换算；素材包原色——金黄色，
+    // 与青蓝宝石同屏可辨）
+    for (const Coin& coin : m_coins)
+    {
+        coin.render(m_renderer, alpha, m_camera);
     }
 
     // 漂浮文字（伤害/升级共用）：世界层最上层——叠加在实体之上、HUD 之下。
@@ -1298,7 +1382,7 @@ void PlayScene::renderHud()
         SDL_snprintf(xpText, sizeof(xpText), "经验 %d/%d", m_xp, xpNeeded);
         m_hudFont.draw(m_renderer, xpText, kBarX + kBarW + 12.0f, 100.0f);
 
-        // 第 4/5 行：击杀 / 存活（白色，行距 44 像素——32 号字留 12 像素行间隔）
+        // 第 4/5/6 行：击杀 / 存活 / 金币（白色，行距 44 像素——32 号字留 12 像素行间隔）
         char killText[48]; // 容纳 "击杀: " + 最长数字，绰绰有余
         SDL_snprintf(killText, sizeof(killText), "击杀: %d", m_killCount);
         m_hudFont.draw(m_renderer, killText, 20.0f, 146.0f);
@@ -1306,6 +1390,12 @@ void PlayScene::renderHud()
         char survivalText[48]; // 容纳「存活: mm:ss」，绰绰有余
         formatSurvivalText(survivalText, sizeof(survivalText), m_survivalSeconds);
         m_hudFont.draw(m_renderer, survivalText, 20.0f, 190.0f);
+
+        // 金币行（批三局内货币）：本局累计的拾取金币数——「击杀—掉落—
+        // 拾取—计数」闭环的可视终点（冒烟观测点）
+        char coinText[48]; // 容纳 "金币: " + 最长数字，绰绰有余
+        SDL_snprintf(coinText, sizeof(coinText), "金币: %d", m_coinCount);
+        m_hudFont.draw(m_renderer, coinText, 20.0f, 234.0f);
     }
 
     if (m_state == PlayState::Paused)

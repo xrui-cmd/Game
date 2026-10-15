@@ -8,8 +8,9 @@
 #include "game/AttackArc.h"     // AttackArc：横扫扇形判定（纯函数，tests/attack_arc_test.cpp 直测）
 #include "game/World.h"         // World：世界（确定性生成 + 区块 + 格级碰撞；批二）
 #include "game/Player.h"        // Player：玩家实体（移动 + 主动攻击 + 武器横扫表现）
-#include "game/Monster.h"       // Monster：追击怪物（三变体、对象池）
+#include "game/Monster.h"       // Monster：追击怪物（三变体、对象池、批三 AI 生态）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
+#include "game/Coin.h"          // Coin：怪物掉落的金币（批三局内货币）
 #include "game/LevelCurve.h"    // LevelCurve：升级经验曲线（纯逻辑，tests/xp_test.cpp 直测）
 #include "game/FloatingText.h"  // FloatingText：漂浮文字（伤害飘字与升级飘字共用）
 #include "game/LevelupSfx.h"    // LevelupSfx：升级音效（游戏层直读；引擎加 SoundId::LevelUp 前的过渡）
@@ -67,7 +68,10 @@
 //        刷新节奏与难度曲线沿用（数量上限初始 4、每 20s +2、封顶 12；
 //        刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s）；
 //        接触伤害 10；
-//      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
+//      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石
+//        与金币（批三：金币数按变体——史莱姆 1 / 哥布林 2 / 骷髅 1）；
+//        金币为「局内货币」：拾取计数（音效沿用 coin.wav）、本局累计、
+//        R 重开清零；本批只储备不消费（为将来商店/强化体系铺路）；
 //      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开（150px）；
 //      - 成长闭环：拾取宝石 +10 经验 -> 按 LevelCurve 曲线循环结算
 //        （溢出一枚可连升多级）-> 每级自动强化：生命上限 +10（并即时
@@ -90,9 +94,10 @@
 //      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
 //      缺键/坏值自动回退内置默认值
 //   6. 渲染：世界区块（地板/墙/装饰，经相机）-> 玩家（含横扫表现）-> 怪物
-//      -> 经验宝石 -> 漂浮文字（全部世界坐标，绘制处经相机换算）
+//      -> 经验宝石 -> 金币 -> 漂浮文字（全部世界坐标，绘制处经相机换算）
 //      -> 生存 HUD（屏幕空间：左上 HP 血条+文字；其下等级（升级时瞬闪）/
-//      经验条（当前级进度/所需）/击杀/存活；左下角 FPS/帧时间，F3 切换显隐）
+//      经验条（当前级进度/所需）/击杀/存活/金币；左下角 FPS/帧时间，
+//      F3 切换显隐）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
 // 数据成员的默认值就是初始状态；onEnter 把玩家与怪物池布置到位，
@@ -173,6 +178,10 @@ private:
 
     // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位
     void dropGemAt(float x, float y);
+
+    // 掉落 count 枚金币到 (x, y) 周围（批三）：数量按变体（Monster::coinDrop()），
+    // 多枚时绕掉落中心小半径散开（避免完全重叠、一眼可见数量）
+    void dropCoinsAt(float x, float y, int count);
 
     // 经验结算（拾取宝石时调用）：按升级曲线循环结算，并逐级发放强化与反馈
     // （生命上限+回血、攻击伤害、移速、日志、「升级！」飘字、HUD 瞬闪、音效）。
@@ -289,6 +298,10 @@ private:
     // 需求（30）的三分之一——升到 2 级需要拾取 3 颗
     static constexpr int kGemXpValue = 10;
 
+    // 金币掉落的散开半径（像素；批三）：同一次掉落的多枚金币绕中心
+    // 均匀分布在这个半径上（2 枚时左右各一、更容易数清）；单枚直接落中心
+    static constexpr float kCoinDropScatter = 12.0f;
+
     // 漂浮文字同屏上限（条）：超过上限时移除最老一条。数量级参考——默认
     // 节奏下命中冷却 0.4s、飘字寿命 0.8s，稳定同屏只有寥寥几条；上限是
     // 「横扫多目标同帧多飘字」这类大量同屏时的兜底，保证绘制开销有界不失控
@@ -339,6 +352,7 @@ private:
     Player m_player;                 // 玩家实体
     std::vector<Monster> m_monsters; // 怪物对象池（预创建 kMonsterPoolSize 个槽位）
     std::list<XpGem> m_gems;         // 场上未被拾取的经验宝石
+    std::list<Coin> m_coins;         // 场上未被拾取的金币（批三局内货币）
     std::list<FloatingText> m_floatingTexts; // 场上存活的漂浮文字（伤害/升级共用）
 
     // 升级音效播放器（游戏层直读 assets/sounds/levelup.wav）：
@@ -388,6 +402,7 @@ private:
     // ---- 战斗运行时状态（restart 复位）----
     int m_playerHp = kDefaultPlayerHp;   // 玩家当前生命（归零 -> GameOver）
     int m_killCount = 0;                 // 本局累计击杀数（击杀日志/HUD/结算使用）
+    int m_coinCount = 0;                 // 局内货币：本局累计金币数（批三；restart 清零，本批不消费）
     int m_level = 1;                     // 当前等级（restart 复位为 1；升级只增不减）
     int m_xp = 0;                        // 当前级已积累经验（结算后恒小于本级需求；HUD 进度条）
     float m_levelFlashLeft = 0.0f;       // 等级数字瞬闪剩余时长（秒；升级时置满，仅 Playing 递减）
