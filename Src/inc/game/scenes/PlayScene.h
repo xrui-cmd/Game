@@ -3,8 +3,10 @@
 
 #include "engine/Scene.h"       // Scene：场景基类
 #include "engine/AudioSystem.h" // AudioSystem：音效系统（拾取/受击/结束/暂停/破纪录触发播放）
+#include "engine/Camera.h"      // Camera：相机（平滑跟随 + 世界↔屏幕换算；批二）
 #include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字/漂浮文字，支持中文）
 #include "game/AttackArc.h"     // AttackArc：横扫扇形判定（纯函数，tests/attack_arc_test.cpp 直测）
+#include "game/World.h"         // World：世界（确定性生成 + 区块 + 格级碰撞；批二）
 #include "game/Player.h"        // Player：玩家实体（移动 + 主动攻击 + 武器横扫表现）
 #include "game/Monster.h"       // Monster：追击怪物（三变体、对象池）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
@@ -21,10 +23,24 @@
 // ============================================================
 //
 // 职责：
-//   1. 资源：onEnter 加载背景图、玩家/怪物纹理与字体（背景可选，失败兜底；
-//      实体纹理各自析构兜底，玩家的武器素材由 Player 自持）；析构时释放
-//      场景自持的背景纹理
-//   2. 玩法（本批战斗改版落定「鼠标瞄准·左键横扫」）：
+//   1. 资源：onEnter 生成世界（按 world_chunks_x/y/seed）、加载世界素材、
+//      玩家/怪物纹理与字体（实体纹理各自析构兜底，玩家的武器素材由
+//      Player 自持，世界纹理由 World 自持并在析构时释放；背景图自批二起
+//      不再用于对局——区块地板取代，MenuScene 仍继续使用 background.png）
+//   2. 世界与相机（批二核心）：
+//      - 世界 3072x3072（4x4 区块；区块 768px = 16 格 x 48px），确定性
+//        生成（坐标哈希 + 种子；seed=0 时每局随机）；世界边界一圈墙 +
+//        每区块随机墙簇（区块交界与出生保护区保证可通行）；
+//      - 玩家/怪物移动为世界坐标下的直接积分（旧「窗口 clamp」移除；
+//        墙体碰撞滑动由世界系统接管，见后续接入笔——本质行为不变，
+//        完整绕墙/寻路留批三）；
+//      - 相机每固定步 follow 玩家中心（指数平滑 camera_smooth_time）、
+//        进局/重开 snapTo；暂停/结束冻结（相机不更新）；鼠标瞄准经
+//        screenToWorld 换算后计算方向（零向量回退保留）；
+//      - 区块激活窗口（相机所在区块 ±1）内才更新/渲染怪物——非激活区
+//        怪物暂停更新不删除；进入/离开窗口时烘焙/卸载区块纹理（日志
+//        「区块 (x,y) 加载 / 卸载」供冒烟断言）；
+//   3. 玩法（沿袭「鼠标瞄准·左键横扫」）：
 //      - WASD 移动（朝向跟随鼠标——面向指针一侧，见 Player）；
 //      - 主动攻击（本批核心，取代自动索敌）：鼠标左键按住 = 按冷却节奏
 //        （attack_cooldown，默认 0.4s）连续横扫；单击挥一次；挥空也出招
@@ -41,8 +57,10 @@
 //        已命中不重复。判定与渲染共用 AttackArc.h 的缓出曲线纯函数
 //        （bladeAngleAt / isAngleInSweep 等，单测覆盖边界）；
 //      - 怪物三变体等权随机刷新（史莱姆 20/90、哥布林 30/110、骷髅 18/140
-//        ——生命/基础速度，数值常量见 Monster.cpp 变体表），从窗口四边内侧
-//        持续刷新并随时间增强（数量上限初始 4、每 20s +2、封顶 12；
+//        ——生命/基础速度，数值常量见 Monster.cpp 变体表）；批二过渡版
+//        出生规则：由「窗口边缘」改为「玩家周围 550~750px 圆环内、激活
+//        区块内、可走、且离玩家 >=500px」随机（批三大改前保持可玩）；
+//        刷新节奏与难度曲线沿用（数量上限初始 4、每 20s +2、封顶 12；
 //        刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s）；
 //        共同追踪玩家、接触伤害 10；
 //      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
@@ -55,18 +73,20 @@
 //        仅完整对局比较更新并立即写盘；任一项被破播 record 音效 +「新纪录！」）；
 //      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键；
 //        中途 M 退出不计战绩——只有生命归零的完整对局参与纪录）。
-//   3. 音效：拾取播 coin、被撞播 hit、生命归零播 gameover、
+//   4. 音效：拾取播 coin、被撞播 hit、生命归零播 gameover、
 //      ESC 暂停/恢复播 pause、破纪录播 record（经 onEnter 注入的 AudioSystem；
 //      降级环境安全空操作）、升级播 levelup（LevelupSfx 游戏层直读，
 //      见该类头文件说明——引擎 SoundId 扩展前的过渡实现）
-//   4. 配置：onEnter 时读取玩家速度/生命/攻击参数（冷却/伤害/半径/张角/
+//   5. 配置：onEnter 时读取玩家速度/生命/攻击参数（冷却/伤害/半径/张角/
 //      击退/扫程时长 attack_swing_time）、怪物速度成长/刷新参数/接触伤害、
+//      世界（world_chunks_x/y、world_seed）与相机（camera_smooth_time）、
 //      升级曲线（xp_level_base/xp_level_growth）与每级强化
 //      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
 //      缺键/坏值自动回退内置默认值
-//   5. 渲染：背景 -> 玩家（含横扫表现）-> 怪物 -> 经验宝石 -> 漂浮文字
-//      -> 生存 HUD（左上：HP 血条+文字；其下：等级（升级时瞬闪）/经验条
-//      （当前级进度/所需）/击杀/存活；左下角 FPS/帧时间，F3 切换显隐）
+//   6. 渲染：世界区块（地板/墙/装饰，经相机）-> 玩家（含横扫表现）-> 怪物
+//      -> 经验宝石 -> 漂浮文字（全部世界坐标，绘制处经相机换算）
+//      -> 生存 HUD（屏幕空间：左上 HP 血条+文字；其下等级（升级时瞬闪）/
+//      经验条（当前级进度/所需）/击杀/存活；左下角 FPS/帧时间，F3 切换显隐）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
 // 数据成员的默认值就是初始状态；onEnter 把玩家与怪物池布置到位，
@@ -91,10 +111,11 @@ class PlayScene : public Scene
 {
 public:
     PlayScene() = default; // 成员默认值即初始局面，无需自定义构造
-    ~PlayScene() override;  // 析构释放场景自持纹理（此时 renderer 尚在，安全）
+    // 析构：场景自持纹理（世界区块/素材）随成员（World）析构自动释放——
+    // SceneManager 先析构场景、后销毁 renderer，释放时机安全；无需自定义析构
 
-    // 进入场景：保存 renderer 与音效系统、读取配置、加载全部纹理、
-    // 布置玩家与怪物对象池
+    // 进入场景：保存 renderer 与音效系统、读取配置、生成世界并加载素材、
+    // 加载字体与实体纹理、布置玩家与怪物对象池、初始化相机
     void onEnter(SDL_Renderer* renderer, const Config& config, AudioSystem& audio) override;
 
     // 事件：仅 F3 切换 FPS 显示（维持事件式调试开关）。
@@ -103,16 +124,19 @@ public:
 
     // 每帧更新：先处理输入动作边缘（暂停/重开/回菜单，任何状态都响应），
     // 再仅 Playing 状态推进战斗（Paused/GameOver 冻结）。
-    // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移
+    // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移；
+    // 相机只在 Playing 分支推进（暂停/结束自动冻结——规格要求）
     void update(const UpdateContext& ctx) override;
 
-    // 每帧渲染：清屏、背景、玩家（含横扫表现）、怪物、宝石、漂浮文字、HUD。
-    // alpha 是插值系数，原样转发给实体
+    // 每帧渲染：清屏、世界区块（地板/墙/装饰，经相机）、玩家（含横扫表现）、
+    // 怪物、宝石、漂浮文字、HUD（屏幕空间）。alpha 是插值系数，转发给实体；
+    // 世界与实体的世界坐标都经场景持有的相机换算到屏幕
     void render(float alpha) override;
 
 private:
-    // 重开一局：生命/击杀/等级/经验复位、三项属性回基准、玩家归位、
-    // 回收全部怪物/宝石/飘字、刷新计时重排、清「新纪录」标记
+    // 重开一局：生命/击杀/等级/经验复位、三项属性回基准、玩家归位（世界
+    // 中心）、回收全部怪物/宝石/飘字、刷新计时重排、清「新纪录」标记；
+    // 相机 snapTo 玩家并立即刷新区块激活窗口（新一局从干净的 3x3 开始）
     void restart();
 
     // 输入动作的按下边缘处理：暂停/恢复（Playing <-> Paused）、
@@ -124,7 +148,8 @@ private:
     // 主动攻击入口（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扫程推进」。
     // 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
     //   1. 左键没按住：本步不尝试出手（主动攻击——不按不挥）；
-    //   2. 瞄准方向 = 玩家中心 -> 鼠标（零向量时回退到玩家面向，见实现）；
+    //   2. 瞄准方向 = 玩家中心 -> 鼠标（批二：鼠标屏幕坐标经相机
+    //      screenToWorld 换算到世界坐标；零向量时回退到玩家面向，见实现）；
     //   3. 调 Player::tryAttack 出手（冷却门控在玩家侧；挥空也出招）；
     //      出手成功：开启新扫程（清命中记录、对齐刀锋起点角）并记出手日志；
     //   4. 无论本步是否出手，都调用 advanceSwingSweep 推进已开启的扫程
@@ -168,6 +193,16 @@ private:
     // 下限 1s
     float currentSpawnInterval() const;
 
+    // 为指定空槽位寻找落点并生成怪物（批二过渡版出生规则）：
+    // 变体等权随机；落点在「玩家中心周围 kMonsterSpawnRadiusMin ~
+    // kMonsterSpawnRadiusMax 圆环内」，需同时满足：
+    //   1. 处于当前激活区块内（非激活区不生怪）；
+    //   2. 怪物矩形可走（walkable——不生进墙里）；
+    //   3. 离玩家中心 >= kMonsterSpawnMinPlayerDistance（防贴脸刷新）。
+    // 落点重试上限内找不到（极少：玩家贴墙死角等）返回 false，本步不生；
+    // 成功则 loadVariant（换皮）-> spawnAt（落位）并返回 true
+    bool spawnMonsterAtSlot(Monster& monster);
+
     // 绘制 HUD 文字/条（生存 HUD：HP 条、等级+经验条、击杀/存活；
     // FPS 调试行；暂停/结束叠层与结算界面）
     void renderHud();
@@ -192,6 +227,8 @@ private:
     static constexpr int kDefaultLevelupHpBonus = 10;           // 每级生命上限强化（levelup_max_hp_bonus）
     static constexpr int kDefaultLevelupDamageBonus = 3;        // 每级攻击伤害强化（levelup_damage_bonus）
     static constexpr float kDefaultLevelupSpeedBonus = 10.0f;   // 每级移速强化（levelup_speed_bonus，像素/秒）
+    static constexpr int kDefaultWorldChunks = 4;               // 世界区块数缺省值（world_chunks_x/y）：4x4 = 3072x3072
+    static constexpr float kDefaultCameraSmoothTime = 0.12f;    // 相机平滑时间常数缺省值（camera_smooth_time，秒）
 
     // ---- 玩法常量（代码固定，不进配置；改动须连同注释一起审视）----
     static constexpr int kMonsterPoolSize = 12;          // 怪物对象池槽位数 = 数量上限封顶值
@@ -219,6 +256,21 @@ private:
     // 接触伤害的怪物弹开距离（像素）：沿用既有机制 150——把怪物弹远，
     // 配合 0.8s 无敌构成「受击保护窗口」
     static constexpr float kContactKnockbackDistance = 150.0f;
+
+    // ---- 怪物出生（批二过渡版：玩家周围圆环内刷新；批三大改前保持可玩）----
+    // 出生环的半径范围（像素）：内径 550 在视口半对角（约 734）以内——
+    // 一部分出生在屏幕内可见、一部分从屏外走入；外径 750 < 区块边长 768，
+    // 从「相机所在区块 ±1」的激活区内一定能取到（无需再扩窗口）
+    static constexpr float kMonsterSpawnRadiusMin = 550.0f; // 出生环内径（像素）
+    static constexpr float kMonsterSpawnRadiusMax = 750.0f; // 出生环外径（像素）
+
+    // 与玩家的最小中心距离（像素）：规格冗余保险——内径 550 已保证
+    //（保留显式校验：将来调整内径时这条底线不被无声破坏）
+    static constexpr float kMonsterSpawnMinPlayerDistance = 500.0f;
+
+    // 找落点的重试上限（次）：随机撞墙/撞非激活区的放弃阈值——
+    // 上限内找不到就本步不生（下一刷新时刻再试），不会死循环
+    static constexpr int kMonsterSpawnAttempts = 30;
 
     // 瞄准零向量的判定阈值（像素²）：鼠标与玩家中心的距离比它更近时视为
     // 零向量（没有方向可言），攻击方向回退到玩家面向（见 resolvePlayerAttack）。
@@ -258,13 +310,19 @@ private:
     // 暂停/恢复（handleInputEdges）
     AudioSystem* m_audio = nullptr;
 
-    // 由 renderer 反查的窗口指针：玩法边界/刷新范围需要窗口整数尺寸
-    // （与渲染基元无关的「逻辑尺寸」沿用窗口坐标系，保持既有数值）
+    // 由 renderer 反查的窗口指针：相机视口（setViewport）需要窗口整数尺寸；
+    // 窗口尺寸变化时每帧重新查询并喂给相机（与渲染基元无关的「逻辑尺寸」）
     SDL_Window* m_window = nullptr;
 
-    // 背景纹理：加载失败时为 nullptr，render 阶段会跳过，
-    // 露出清屏深蓝色兜底（背景不是游戏必需品，加载失败不阻塞启动）
-    SDL_Texture* m_background = nullptr;
+    // 世界（批二核心）：确定性生成（区块/墙/装饰）、格级碰撞查询、
+    // 区块激活窗口的纹理烘焙与渲染。onEnter 生成一次；R 重开不重生成
+    //（同一局同一世界——确定性冒烟「走远再回头内容一致」由此保证）
+    World m_world;
+
+    // 相机（批二核心）：每固定步 follow 玩家中心（camera_smooth_time 平滑）、
+    // 进局/重开 snapTo；实体与区块渲染在绘制处经它换算到屏幕。
+    // 暂停/结束不推进（冻结）
+    Camera m_camera;
 
     // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
     Font m_hudFont; // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
@@ -301,6 +359,10 @@ private:
     float m_monsterSpawnInterval = kDefaultMonsterSpawnInterval; // 刷新间隔初始值（monster_spawn_interval）
     int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）
     int m_monsterDamage = kDefaultMonsterDamage;          // 接触伤害（monster_damage）
+
+    // 相机平滑时间常数（秒；camera_smooth_time，默认 0.12）：
+    // 越大越「拖」、越小越「贴」——onEnter 读取后整局沿用（restart 不重读）
+    float m_cameraSmoothTime = kDefaultCameraSmoothTime;
 
     // ---- 升级配置与曲线（onEnter 读取；R 重开不重读）----
     LevelCurve m_levelCurve;                              // 经验曲线（base/growth 从 xp_* 键注入）
@@ -363,8 +425,8 @@ private:
     // 初值 0 表示「尚无参照」，第一次 render 只记录不计算
     Uint64 m_lastFrameCounter = 0;
 
-    // 窗口实际尺寸缓存（每次查询窗口后更新）：
-    // 刷新范围这类需要整数的场合直接用它
+    // 窗口实际尺寸缓存（每次查询窗口后更新）：相机 setViewport 与
+    // 视口相关的整数换算直接用它们（自批二起出生/边界规则都归世界与相机）
     int m_width = 0;
     int m_height = 0;
 };

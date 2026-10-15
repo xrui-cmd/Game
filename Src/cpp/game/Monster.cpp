@@ -1,5 +1,6 @@
 #include "game/Monster.h"
-#include <algorithm> // std::clamp / std::max：移动边界、出生范围与闪白计时的上下界
+#include "engine/Camera.h" // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
+#include <algorithm> // std::clamp / std::max：闪白计时与战斗数值的上下界
 #include <cmath>     // std::sqrt：归一化方向与距离计算
 
 // 本编译单元私有的变体数值表与工具（不对外暴露）
@@ -56,7 +57,7 @@ const char* monsterTypeName(MonsterType type)
 // 按指定变体加载/重载纹理
 bool Monster::loadVariant(SDL_Renderer* renderer, MonsterType type)
 {
-    // 记录变体类型：baseSpeed()/spawnEdge 的出生生命都从它查表
+    // 记录变体类型：baseSpeed()/spawnAt 的出生生命都从它查表
     m_type = type;
 
     // 取出本变体的规格（路径、帧参数外的数值、回退色）
@@ -109,7 +110,7 @@ bool Monster::takeDamage(int amount)
     // 闪白计时重置为满值：连续受击时白光从本次受击重新起算（视觉连续）
     m_flashLeft = kHitFlashSeconds;
 
-    // 生命归零：转入「未激活」——不再更新/渲染/碰撞，槽位等 spawnEdge 复用
+    // 生命归零：转入「未激活」——不再更新/渲染/碰撞，槽位等 spawnAt 复用
     if (m_hp == 0)
     {
         m_alive = false;     // 本对象退场（调用方负责击杀计数与掉落结算）
@@ -120,82 +121,30 @@ bool Monster::takeDamage(int amount)
     return false; // 仍有生命：调用方通常接着施加击退
 }
 
-// 生成（边缘刷新）：窗口四边随机一边的内侧落位，激活并按变体写入生命值
-void Monster::spawnEdge(int winW, int winH, const SDL_FRect& avoidRect)
+// 生成（批二过渡版）：在调用方选好的可信落点上激活本对象
+void Monster::spawnAt(float centerX, float centerY)
 {
-    // 玩家矩形中心：出生避让的参照点（与 setTarget 同一取中心算法）
-    const float avoidCenterX = avoidRect.x + avoidRect.w * 0.5f;
-    const float avoidCenterY = avoidRect.y + avoidRect.h * 0.5f;
-
-    // 随机坐标的上界：窗口尺寸减去怪物自身大小。用 std::max 兜底，
-    // 防止窗口异常小时出现「上界小于下界」（与既有生成逻辑同一防护写法）
-    const float maxX = std::max(static_cast<float>(winW) - m_w, 0.0f);
-    const float maxY = std::max(static_cast<float>(winH) - m_h, 0.0f);
-
-    // 最多尝试 kSpawnMaxTries 次：某次落点与玩家中心距离达标即采用——
-    // 避免玩家站在屏幕边缘时被「贴脸刷新」（刷新点纯粹随机的公平性保护）
-    for (int tryCount = 0; tryCount < kSpawnMaxTries; ++tryCount)
-    {
-        // 四条边随机挑一条：0=上边 1=下边 2=左边 3=右边（SDL_rand(4) 取 [0,4)）
-        const int edge = static_cast<int>(SDL_rand(4));
-
-        if (edge == 0)
-        {
-            // 上边：x 随机、y 贴边内侧（kEdgeInset 向内收，保证整只可见）
-            m_x = SDL_randf() * maxX;
-            m_y = kEdgeInset;
-        }
-        else if (edge == 1)
-        {
-            // 下边：x 随机、y 贴底边内侧
-            m_x = SDL_randf() * maxX;
-            m_y = maxY - kEdgeInset;
-        }
-        else if (edge == 2)
-        {
-            // 左边：y 随机、x 贴左边内侧
-            m_x = kEdgeInset;
-            m_y = SDL_randf() * maxY;
-        }
-        else
-        {
-            // 右边：y 随机、x 贴右边内侧
-            m_x = maxX - kEdgeInset;
-            m_y = SDL_randf() * maxY;
-        }
-
-        // 怪物中心到玩家中心的位移：用「距离平方」比较，省一次开方
-        //（两侧同为非负值，比值关系不变）
-        const float dx = m_x + m_w * 0.5f - avoidCenterX;
-        const float dy = m_y + m_h * 0.5f - avoidCenterY;
-        if (dx * dx + dy * dy >= kMinSpawnDistance * kMinSpawnDistance)
-        {
-            break; // 距离达标，采用该位置并结束重试
-        }
-    }
-    // 若重试耗尽仍靠得太近（玩家恰好卡在四边中央等极端情况），接受最后一次结果：
-    // 设计目标是「尽量远离」而非「绝对远离」，避免极端情况下的死循环
-
-    // 落在窗口内：随机范围本身已在窗口内，这行是防御「未来改动破坏
-    // 前置假设」的兜底（与既有生成逻辑同一纪律）
-    m_x = std::clamp(m_x, 0.0f, maxX);
-    m_y = std::clamp(m_y, 0.0f, maxY);
+    // 落点换算：入参是「怪物中心」的世界坐标，转成左上角存内部
+    //（位置成员一直是左上角语义——与 rect()/渲染同一口径）
+    m_x = centerX - m_w * 0.5f; // 左上角 x = 中心 - 半宽
+    m_y = centerY - m_h * 0.5f; // 左上角 y = 中心 - 半高
 
     // 激活 + 按变体数值表写入战斗数值：出生生命取自当前变体
     //（stale 防护：至少 1 点——表内数值恒为正，这里的 max 是防未来改表的兜底）
-    m_alive = true;                                            // 本对象进入战场：更新/渲染/碰撞自此生效
-    m_hp = std::max(kVariants[variantIndex(m_type)].hp, 1);    // 出生生命（变体表；0 血出生会在首帧判定为已死）
-    m_flashLeft = 0.0f;                                        // 新生怪物不带受击光效
-    m_hasTarget = false;                                       // 追踪目标等场景下个固定步注入
+    m_alive = true;                                         // 本对象进入战场：更新/渲染/碰撞自此生效
+    m_hp = std::max(kVariants[variantIndex(m_type)].hp, 1); // 出生生命（变体表；0 血出生会在首帧判定为已死）
+    m_flashLeft = 0.0f;                                     // 新生怪物不带受击光效
+    m_hasTarget = false;                                    // 追踪目标等场景下个固定步注入
 
     // 瞬移类操作的插值收尾（重点）：出生是「瞬间换位」，必须把插值快照
     // 对齐到新落点，否则渲染会从上一位置向新落点拉丝（延续既有纪律）
+    //（落点的「激活区块内 + 可走」校验由调用方完成——见 PlayScene）
     snapshotPreviousPosition();
 }
 
 // 被撞开/被击退：从 (fromX, fromY)（伤害来源中心）指向怪物中心的方向
-// 瞬移 distance 像素，并把左上角 clamp 在视口内
-void Monster::knockback(float fromX, float fromY, float viewportW, float viewportH, float distance)
+// 瞬移 distance 像素（落点经世界可走校验，逐级缩短重试）
+void Monster::knockback(float fromX, float fromY, float distance)
 {
     // 怪物当前中心：击退位移以「中心」为参照计算，避免用左上角坐标推位移时
     // 把尺寸差带进方向判定（两者对方向的影响相同，但对落点更直观）
@@ -218,17 +167,11 @@ void Monster::knockback(float fromX, float fromY, float viewportW, float viewpor
     }
 
     // 新中心 = 现中心 + 单位方向 x 击退距离；再换算回左上角坐标写入落点
-    m_x = centerX + dirX * distance - m_w * 0.5f;
-    m_y = centerY + dirY * distance - m_h * 0.5f;
+    // （批二：世界坐标下的纯位移——落点的世界可走校验见后续接入笔）
+    m_x = centerX + dirX * distance - m_w * 0.5f; // 左上角 x = 新中心 - 半宽
+    m_y = centerY + dirY * distance - m_h * 0.5f; // 左上角 y = 新中心 - 半高
 
-    // clamp 到视口内：贴边被撞时怪物会退到「边界上最近的有效点」，
-    // 不会飞出屏幕（用 max 兜底窗口异常小的情形，同 spawnEdge）
-    const float maxX = std::max(viewportW - m_w, 0.0f);
-    const float maxY = std::max(viewportH - m_h, 0.0f);
-    m_x = std::clamp(m_x, 0.0f, maxX);
-    m_y = std::clamp(m_y, 0.0f, maxY);
-
-    // 瞬移类操作的插值收尾：落点定稿后快照 prev=cur，渲染不拉丝（同 spawnEdge）
+    // 瞬移类操作的插值收尾：落点定稿后快照 prev=cur，渲染不拉丝
     snapshotPreviousPosition();
 }
 
@@ -271,20 +214,18 @@ void Monster::update(const UpdateContext& ctx)
 
     // 沿归一化方向 x 速度移动（固定步长积分）。与玩家「逐轴独立」不同：
     // 怪物是直线追击，归一化保证任意方向合速度恒等于注入的速度值。
-    // 速度由 PlayScene 按「变体基础速度 + 难度成长」注入
+    // 速度由 PlayScene 按「变体基础速度 + 难度成长」注入。
+    // 批二：世界坐标下的直接积分——墙体碰撞滑动（分轴 + 侧滑）见后续接入笔
     m_x += (dx / distance) * m_chaseSpeed * ctx.deltaTime; // 水平分量：单位方向 x 速度 x 步长
     m_y += (dy / distance) * m_chaseSpeed * ctx.deltaTime; // 垂直分量：同上（y 轴向下为正）
-
-    // 左上角 clamp 在视口内（与玩家边界规则一致：右/下界 = 视口尺寸 - 自身尺寸）
-    m_x = std::clamp(m_x, 0.0f, ctx.viewportWidth - m_w);
-    m_y = std::clamp(m_y, 0.0f, ctx.viewportHeight - m_h);
 }
 
-// 覆写渲染：常规帧与受击闪白帧
-void Monster::render(SDL_Renderer* renderer, float alpha) const
+// 覆写渲染：常规帧与受击闪白帧（均经相机世界->屏幕换算）
+void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) const
 {
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
-    Entity::render(renderer, alpha);
+    //（基类内部完成世界坐标 -> 屏幕坐标的相机换算）
+    Entity::render(renderer, alpha, camera);
 
     // 闪白叠加：只有「正在闪白」且纹理已加载时执行
     if (m_flashLeft <= 0.0f || m_texture == nullptr)
@@ -298,7 +239,7 @@ void Monster::render(SDL_Renderer* renderer, float alpha) const
     // 为什么不用颜色调制（SDL_SetTextureColorMod）：乘法调制只能压暗，
     // 无法把本体「提亮成白光」；叠加混合才能做出闪光效果
     SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);
-    Entity::render(renderer, alpha); // 第二次绘制：叠加提亮
+    Entity::render(renderer, alpha, camera); // 第二次绘制：叠加提亮（同一相机换算）
     // 还原默认混合模式：纹理状态若残留 ADD，会污染后续普通绘制
     SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
 }

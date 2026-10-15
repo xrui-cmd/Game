@@ -4,9 +4,8 @@
 #include "engine/Input.h"          // Input：ctx.input->pressed 查询暂停/重开/回菜单边缘
 #include "engine/Rect.h"           // rectsOverlap：接触伤害/拾取的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
-#include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载 assets/background.png
 #include <algorithm>               // std::max / std::min：生命夹取、难度曲线封顶
-#include <cmath>                   // std::fmod：无敌闪烁的相位取模
+#include <cmath>                   // std::fmod / std::cos / std::sin：闪烁相位与出生环取点
 #include <memory>                  // std::make_unique：构造 MenuScene
 #include <string>                  // std::string：拼接素材与字体的绝对路径
 
@@ -25,22 +24,11 @@ void formatSurvivalText(char* buffer, size_t size, float seconds)
 
 } // 匿名命名空间结束
 
-// 析构：释放场景自持的背景纹理（本批起挥击弧光已退役——攻击表现改由
-// Player 自持的武器素材绘制）。
-// 关键时机：SceneManager 先 onExit + 析构旧场景、后销毁 renderer，
-// 因此这里释放纹理时 renderer 尚在，安全；
-// 玩家/怪物/宝石的纹理由各自 Entity 的析构函数兜底释放；
-// 升级音效播放器（LevelupSfx 成员）与本类其余成员一样随析构自动收尾
-// （关闭音频流、释放 PCM——同为 RAII，见该类头文件）
-PlayScene::~PlayScene()
-{
-    // 只有纹理确实存在时才销毁，避免对空指针调用 SDL_DestroyTexture
-    if (m_background != nullptr)
-    {
-        SDL_DestroyTexture(m_background); // 释放背景图占用的显存
-        m_background = nullptr;           // 置空：即使重复调用也不会二次销毁
-    }
-}
+// 析构说明（批二后不再需要自定义析构）：场景自持资源已全部收敛到成员
+// 的 RAII——世界区块/素材纹理由 World 析构兜底释放，玩家/怪物/宝石纹理
+// 由各自 Entity 析构兜底释放，升级音效播放器（LevelupSfx）随成员收尾。
+// 关键时机不变：SceneManager 先析构旧场景、后销毁 renderer，
+// 上述释放发生时 renderer 尚在，安全
 
 // 进入场景：保存 renderer 与音效系统、读取配置、加载资源、布置初始局面。
 // 每次进入都是新构造的 PlayScene 对象 => 天然是「全新一局」
@@ -78,6 +66,9 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      levelup_max_hp_bonus    每级生命上限强化（并即时回血等值）
     //      levelup_damage_bonus    每级攻击伤害强化（点）
     //      levelup_speed_bonus     每级移速强化（像素/秒）
+    //      world_chunks_x/y        世界区块数（横向/纵向；世界 = 区块 x 768px）
+    //      world_seed              世界种子（0 = 每局随机；非 0 = 固定可复现）
+    //      camera_smooth_time      相机平滑时间常数（秒）
     const float playerSpeed = config.getFloat("player_speed", Player::kDefaultSpeed);
     const float playerAccel = config.getFloat("player_accel", Player::kDefaultAccel);
     const float playerFriction = config.getFloat("player_friction", Player::kDefaultFriction);
@@ -96,6 +87,21 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_monsterSpawnInterval =
         config.getFloat("monster_spawn_interval", kDefaultMonsterSpawnInterval);
     m_monsterDamage = config.getInt("monster_damage", kDefaultMonsterDamage);
+
+    // 批二新增：世界与相机配置。
+    // 世界尺寸做下界钳制（至少 1x1 区块——World::generate 内还有一道同样的
+    // 防御）；种子 0 = 「每局随机」哨兵：在 1..INT32_MAX 取一个非 0 随机值
+    // （非 0 值都是固定种子——同一布局完全可复现，供调试与确定性冒烟）；
+    // 相机平滑时间夹到非负（0 = 立即到位——显式配置的「无平滑」语义）
+    const int worldChunksX = std::max(1, config.getInt("world_chunks_x", kDefaultWorldChunks));
+    const int worldChunksY = std::max(1, config.getInt("world_chunks_y", kDefaultWorldChunks));
+    const int worldSeedConfig = config.getInt("world_seed", 0);
+    // 种子换算：非 0 原样使用；0 时取 [1, INT32_MAX] 的随机值（+1 避开 0）
+    const uint32_t worldSeed = (worldSeedConfig != 0)
+        ? static_cast<uint32_t>(worldSeedConfig)
+        : static_cast<uint32_t>(SDL_rand(0x7FFFFFFF)) + 1u;
+    m_cameraSmoothTime =
+        std::max(0.0f, config.getFloat("camera_smooth_time", kDefaultCameraSmoothTime));
 
     // 三项「基准值」= 配置里的初始值（restart 复位目标）；三项「当前值」
     // 从基准起步，局内升级由 grantXp 逐级追加，重开时再回到基准重新累积
@@ -130,26 +136,22 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
 
-    // 5) 加载可选的场景级纹理：背景图（拼 <exe目录>/assets/... 路径）。
-    //    它不是游戏必需品——加载失败只记录警告并继续：背景缺失露出
-    //    清屏深蓝兜底（玩家的武器素材由 Player::load 自行加载管理）
-    const char* basePath = SDL_GetBasePath();
-    if (basePath != nullptr)
-    {
-        // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
-        const std::string bgPath = std::string(basePath) + "assets/background.png";
-        // IMG_LoadTexture：读文件 -> 解码 PNG -> 一步创建 GPU 纹理
-        m_background = IMG_LoadTexture(m_renderer, bgPath.c_str());
-    }
-    // 背景失败（拿不到基路径或图片读取失败）统一走这条警告
-    if (m_background == nullptr)
-    {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "加载背景图失败（%s），使用纯色背景兜底", SDL_GetError());
-    }
+    // 5) 生成世界（批二核心）：默认 4x4 区块 x 768px = 3072x3072（config 可调）。
+    //    确定性生成：同一 (种子, 区块) 永远得到同一布局；world_seed=0 时
+    //    每局换新随机种子（R 重开不换——整个对局共享同一张图，「走远再
+    //    回头内容一致」由此保证）。素材（地砖/墙/装饰）加载失败只降级为
+    //    纯色色块，不阻塞可玩性（World::loadAssets 内部逐张警告）
+    const char* basePath = SDL_GetBasePath(); // exe 目录：字体等素材路径的基准
+    m_world.generate(worldChunksX, worldChunksY, worldSeed);
+    m_world.loadAssets(m_renderer);
+    // 冒烟观测点：世界生成日志（尺寸与种子——确定性复现与断言依据）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "世界生成（%d x %d 区块，%u 像素见方，种子 %u）",
+                m_world.chunksX(), m_world.chunksY(),
+                static_cast<unsigned>(m_world.pixelWidth()), m_world.seed());
 
     // 6) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
-    //    路径拼装模式与背景图一致：以 exe 所在目录为基准。
+    //    路径拼装以 exe 所在目录为基准（与其余素材一致）。
     //    HUD 与标题各加载一份（字号不同）；Font::load 内部会记录失败警告，
     //    失败后对应文字安全跳过，玩法完全不受影响
     if (basePath != nullptr)
@@ -182,25 +184,36 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_player.setSwingTime(attackSwingTime);
     m_player.setAttackArc(m_attackArc);
 
-    // 9) 查询窗口实际尺寸并缓存：刷新出生和后续边界计算都基于它
+    // 9) 查询窗口实际尺寸并缓存：相机视口与后续换算都基于它
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
-    // 10) 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
+    // 10) 玩家出生在世界中心（批二：世界取代窗口成为边界）。出生点周围
+    //     保护区由 World 生成时保证——该处（中心 ±3 格）绝无墙体、必定可走。
     //     每次进入 PlayScene 都从这里开始 => 与「按 R 重开」的初始状态一致
-    m_player.reset(m_width / 2.0f - m_player.width() / 2.0f,
-                   m_height / 2.0f - m_player.height() / 2.0f);
+    const SDL_FPoint spawn = m_world.spawnPointFor(m_player.width(), m_player.height());
+    m_player.reset(spawn.x, spawn.y);
 
-    // 11) 预创建怪物对象池：resize 按池大小（kMonsterPoolSize = 数量上限封顶 12）
+    // 11) 相机（批二核心）：视口 = 窗口尺寸、世界尺寸来自 World、镜头立即
+    //     对准玩家中心（进局不做「从别处滑过来」的动画——snapTo 瞬移对齐）。
+    //     然后立即刷一次区块激活窗口：第一帧渲染前的 3x3 区块就位
+    //     （主循环首帧可能不补步，不能依赖 update 里的那次刷新）
+    m_camera.setViewport(static_cast<float>(m_width), static_cast<float>(m_height));
+    m_camera.setWorldSize(m_world.pixelWidth(), m_world.pixelHeight());
+    m_camera.snapTo(spawn.x + m_player.width() * 0.5f,
+                    spawn.y + m_player.height() * 0.5f);
+    m_world.updateActiveChunks(m_renderer, m_camera);
+
+    // 12) 预创建怪物对象池：resize 按池大小（kMonsterPoolSize = 数量上限封顶 12）
     //     构造槽位（此刻纹理为空、均为未激活）。注意：纹理不在创建时预加载——
     //     变体在「刷新时刻」才等权随机决定，纹理随变体由 loadVariant 按需加载
     //     （单帧 PNG 解码开销很小）；未激活的槽位不更新、不渲染、不参与碰撞
     m_monsters.resize(static_cast<size_t>(kMonsterPoolSize));
 
-    // 12) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
+    // 13) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
     //     永不失败）。整局沿用这份快照——GameOver 结算时才比较与更新
     m_best = SaveData::load();
 
-    // 13) 加载升级音效（可选增强）：素材缺失/无音频设备只警告，升级静默、
+    // 14) 加载升级音效（可选增强）：素材缺失/无音频设备只警告，升级静默、
     //     流程照常（降级细节见 LevelupSfx.h 的契约）
     m_levelupSfx.load();
 }
@@ -310,9 +323,11 @@ void PlayScene::update(const UpdateContext& ctx)
         return;
     }
 
-    // 每帧查询窗口实际尺寸并缓存：玩家边界、刷新范围都基于它，
-    // 窗口尺寸一旦变化，本帧逻辑立即跟随
+    // 每帧查询窗口实际尺寸并缓存，并喂给相机视口（窗口尺寸一旦变化，
+    // 本帧的相机换算与区块裁剪立即跟随；相机自身位置由 setViewport
+    // 内部的回钳保证仍合法）
     SDL_GetWindowSize(m_window, &m_width, &m_height);
+    m_camera.setViewport(static_cast<float>(m_width), static_cast<float>(m_height));
 
     // 玩家无敌计时：递减剩余无敌时间并夹到 0。受击瞬间会在下面的碰撞
     // 分支重置为满值；暂停/结束时本函数提前返回，计时自然冻结——恢复后
@@ -336,19 +351,43 @@ void PlayScene::update(const UpdateContext& ctx)
     // 统一清理已到期的飘字（寿命归零 = 已淡尽，保留其余元素的遍历语义）
     std::erase_if(m_floatingTexts, [](const FloatingText& text) { return text.isExpired(); });
 
-    // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动、按
-    // ctx.viewport* 做边界 clamp、按水平移动切换朝向翻转，并推进攻击计时
+    // 鼠标世界坐标（批二）：把本帧鼠标的「屏幕位置」经相机换算到世界，
+    // 注入玩家作为朝向翻转的基准——屏幕->世界的换算收敛在场景层，
+    // 玩家与相机互不认识（无输入系统时保持朝向不动，与旧行为等价）
+    if (ctx.input != nullptr)
+    {
+        const Vec2 mouseScreen = ctx.input->mousePosition();                           // 鼠标屏幕坐标快照
+        const Vec2 mouseWorld = m_camera.screenToWorld(mouseScreen.x, mouseScreen.y);  // 换算到世界坐标
+        m_player.setAimTarget(mouseWorld.x, mouseWorld.y);                             // 注入：翻转判定参考它
+    }
+
+    // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动（批二：
+    // 世界坐标下的直接积分——旧窗口 clamp 已移除，墙体碰撞滑动见后续
+    // 接入笔）、按注入的瞄准点切换朝向翻转，并推进攻击计时
     m_player.update(ctx);
 
-    // 玩家矩形只取一次：本步的碰撞检测与怪物追踪共用一个快照
+    // 玩家矩形只取一次：本步的碰撞检测、怪物追踪与相机跟随共用一个快照
     const SDL_FRect playerRect = m_player.rect();
+
+    // 相机（批二核心）：平滑跟随玩家中心（指数平滑 camera_smooth_time）。
+    // 位置在固定步更新（渲染直接用当前相机位置）；暂停/结束时本函数提前
+    // 返回，相机随世界一起冻结——规格的「冻结（相机不更新）」由此保证
+    m_camera.follow(playerRect.x + playerRect.w * 0.5f, // 目标中心 x（玩家中心）
+                    playerRect.y + playerRect.h * 0.5f, // 目标中心 y
+                    ctx.deltaTime,                      // 固定步长（秒）
+                    m_cameraSmoothTime);                // 平滑时间常数（秒）
+
+    // 区块激活窗口推进（相机移动后）：进入窗口的区块立即烘焙（日志
+    // 「区块 (x,y) 加载」）、滑出窗口的区块释放（日志「区块 (x,y) 卸载」）
+    m_world.updateActiveChunks(m_renderer, m_camera);
 
     // 主动攻击结算：每个固定步按「左键按住 + 冷却就绪」尝试一次横扫——
     // 方向取鼠标瞄准（不索敌、挥空也出招），命中由扇形判定逐只结算
     resolvePlayerAttack(ctx, playerRect);
 
-    // 怪物刷新（边缘持续刷新 + 随时间增强）：局内秒数累计 + 到点生成。
-    // 存活计时与怪物难度计时共用同一时间基准（固定步长，暂停时冻结）
+    // 怪物刷新（批二过渡版：玩家周围圆环内持续刷新 + 随时间增强）：
+    // 局内秒数累计 + 到点生成。存活计时与怪物难度计时共用同一时间基准
+    // （固定步长，暂停时冻结）
     m_survivalSeconds += ctx.deltaTime; // 存活时间正计时（HUD/结算展示）
     m_monsterElapsed += ctx.deltaTime;  // 局内秒数：难度曲线与刷新节奏的计时基准
     if (m_monsterElapsed >= m_monsterNextSpawnTime)
@@ -368,25 +407,20 @@ void PlayScene::update(const UpdateContext& ctx)
                     continue; // 在场的槽位跳过，继续找空位
                 }
 
-                // 等权随机变体（Slime/Goblin/Skelet 各 1/3）：SDL_rand(n) 取
-                // [0,n) 的均匀整数——先定变体、再换皮、最后落位生成
-                const auto variant = static_cast<MonsterType>(
-                    SDL_rand(static_cast<int>(MonsterType::Count)));
+                // 找落点 + 换皮 + 落位（规则见 spawnMonsterAtSlot 注释）。
+                // 找不到落点（重试上限内）：本步不生——刷新时刻表已推进，
+                // 不会因此卡住（下一次刷新时刻自然再试）
+                if (spawnMonsterAtSlot(monster))
+                {
+                    ++m_monsterSpawnedTotal; // 累计生成数 +1（日志编号自增）
 
-                // 槽位复用换皮：按变体加载对应纹理（内部先释放旧纹理，
-                // 无论上一个住户是哪个变体都不会泄漏）；失败自动走三级回退
-                monster.loadVariant(m_renderer, variant);
-
-                // 边缘内侧随机落位（避让玩家近旁），出生生命取自变体数值表
-                monster.spawnEdge(m_width, m_height, playerRect);
-                ++m_monsterSpawnedTotal; // 累计生成数 +1（日志编号自增）
-
-                // 冒烟观测点：怪物出现日志（含变体名，自动化测试据此断言
-                // 等权随机与三变体生效）
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "怪物出现（第 %d 只，%s）",
-                            m_monsterSpawnedTotal, monsterTypeName(variant));
-                break; // 本步至多生成一只
+                    // 冒烟观测点：怪物出现日志（含变体名，自动化测试据此断言
+                    // 等权随机与三变体生效）
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "怪物出现（第 %d 只，%s）",
+                                m_monsterSpawnedTotal, monsterTypeName(monster.type()));
+                }
+                break; // 本步至多生成一只（无论成功与否）
             }
         }
     }
@@ -396,12 +430,25 @@ void PlayScene::update(const UpdateContext& ctx)
     // 并统一封顶 kMonsterMaxSpeed（260——低于玩家速度，保证跑得掉）
 
     // 怪物追踪：每个存活怪物注入「本步目标 + 本步速度」后更新。
-    // 「场景注入、实体执行」的分工让难度规则完全留在本层
+    // 「场景注入、实体执行」的分工让难度规则完全留在本层。
+    // 批二门控：非激活区块内的怪物「暂停更新」（不删除、位置冻结——
+    // 玩家回到该区域时恢复；激活窗口最多 3x3，遍历 12 槽位的开销可忽略）
     for (Monster& monster : m_monsters)
     {
         if (!monster.isAlive())
         {
             continue; // 空槽位不更新（也不渲染/碰撞）
+        }
+
+        // 怪物中心：激活门控与命中判定的共同参照
+        const SDL_FRect monsterRect = monster.rect();                        // 本步怪物矩形快照
+        const float monsterCenterX = monsterRect.x + monsterRect.w * 0.5f;   // 中心 x
+        const float monsterCenterY = monsterRect.y + monsterRect.h * 0.5f;   // 中心 y
+
+        // 非激活区：跳过本步更新（动画/移动/闪白计时全部冻结——暂停语义）
+        if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY))
+        {
+            continue; // 非激活：本步不推进（渲染端同样跳过）
         }
 
         // 本步速度 = 变体基础速度 + 成长 x 局内秒数（逐只计算：三变体基础值不同），
@@ -412,7 +459,7 @@ void PlayScene::update(const UpdateContext& ctx)
 
         monster.setTarget(playerRect); // 注入追踪目标（玩家矩形 → 中心点）
         monster.setChaseSpeed(speed);  // 注入本步速度（难度曲线：随时间爬升）
-        monster.update(ctx);           // 执行：移动 + 动画 + 闪白计时
+        monster.update(ctx);           // 执行：移动（碰撞滑动）+ 动画 + 闪白计时
     }
 
     // 经验宝石：推进旋转动画 -> 拾取判定 -> 统一清理
@@ -471,11 +518,11 @@ void PlayScene::update(const UpdateContext& ctx)
             m_playerInvincibleLeft = kPlayerInvincibleSeconds;
 
             // 4) 怪物弹开：沿「玩家中心 -> 怪物中心」方向瞬移 150px（沿用机制）。
-            //    knockback 是瞬移类操作，内部已快照 prev=cur 防止插值拉丝
+            //    knockback 是瞬移类操作：内部对落点做世界可走校验（被墙挡
+            //    逐级缩短）并快照 prev=cur 防止插值拉丝
             const float playerCenterX = playerRect.x + playerRect.w * 0.5f;
             const float playerCenterY = playerRect.y + playerRect.h * 0.5f;
             monster.knockback(playerCenterX, playerCenterY,
-                              static_cast<float>(m_width), static_cast<float>(m_height),
                               kContactKnockbackDistance);
 
             break; // 玩家已进入无敌：本步的其余怪物不再判定
@@ -515,14 +562,18 @@ void PlayScene::resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& p
     if (ctx.input->held("attack"))
     {
         // 玩家中心：瞄准向量的起点（扇形判定的圆心在扫程推进内按步取）
-        const float centerX = playerRect.x + playerRect.w * 0.5f; // 中心 x
-        const float centerY = playerRect.y + playerRect.h * 0.5f; // 中心 y
+        const float centerX = playerRect.x + playerRect.w * 0.5f; // 中心 x（世界坐标）
+        const float centerY = playerRect.y + playerRect.h * 0.5f; // 中心 y（世界坐标）
 
-        // 瞄准向量 = 玩家中心 -> 鼠标位置（鼠标为窗口客户区坐标，与游戏
-        // 世界同一坐标系；ctx.input 的位置是「本渲染帧的采样快照」）
-        const Vec2 mouse = ctx.input->mousePosition();
-        float aimX = mouse.x - centerX; // 水平分量（正右负左）
-        float aimY = mouse.y - centerY; // 垂直分量（正下负上）
+        // 鼠标世界坐标（批二）：输入系统给的是「屏幕坐标」，经相机
+        // screenToWorld 换算到世界——「鼠标对准屏幕哪一点、刀就扫向
+        // 世界上哪一点」，相机滚动多少都准确（瞄准与画面同一变换）
+        const Vec2 mouseScreen = ctx.input->mousePosition();                          // 鼠标屏幕坐标快照
+        const Vec2 mouseWorld = m_camera.screenToWorld(mouseScreen.x, mouseScreen.y); // 换算到世界坐标
+
+        // 瞄准向量 = 玩家中心 -> 鼠标位置（世界坐标）：
+        float aimX = mouseWorld.x - centerX; // 水平分量（正右负左）
+        float aimY = mouseWorld.y - centerY; // 垂直分量（正下负上）
 
         // 零向量防御（鼠标恰好压在玩家中心）：没有方向可言，回退到玩家
         // 当前面向（右为 +1、左为 -1），保证横扫方向可预期且不产生 NaN
@@ -668,10 +719,8 @@ void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
         {
             // 未死：微击退（沿「玩家中心 -> 怪物中心」方向远离玩家）。
             // 距离来自 attack_knockback（默认 30——由原 60 减半的「微」
-            // 击退，保持追击压力、方便下一轮连扫补刀）
-            monster.knockback(centerX, centerY,
-                              static_cast<float>(m_width), static_cast<float>(m_height),
-                              m_attackKnockback);
+            // 击退，保持追击压力、方便下一轮连扫补刀）；落点经世界可走校验
+            monster.knockback(centerX, centerY, m_attackKnockback);
         }
     }
 
@@ -867,6 +916,65 @@ float PlayScene::currentSpawnInterval() const
                     kSpawnIntervalFloor);
 }
 
+// 为指定空槽位寻找落点并生成怪物（批二过渡版出生规则，契约见头文件）
+bool PlayScene::spawnMonsterAtSlot(Monster& monster)
+{
+    // 玩家中心：出生环的圆心（每步重取——玩家在移动，环随人走）
+    const SDL_FRect playerRect = m_player.rect();                   // 玩家矩形快照
+    const float playerCenterX = playerRect.x + playerRect.w * 0.5f; // 玩家中心 x（世界坐标）
+    const float playerCenterY = playerRect.y + playerRect.h * 0.5f; // 玩家中心 y（世界坐标）
+
+    for (int attempt = 0; attempt < kMonsterSpawnAttempts; ++attempt)
+    {
+        // 极坐标取点：随机方位角 + 随机半径（圆环 [内径, 外径) 内一点）。
+        // 圆环上点的分布密度略偏向内圈（无心处理均匀性——过渡版只需
+        // 「玩家附近但不在脸上」的观感；批三接巡逻/巢穴体系时重做）
+        const float angle = SDL_randf() * 6.283185307179586f; // 随机方位角（弧度，[0, 2π)）
+        const float radius = kMonsterSpawnRadiusMin +
+            SDL_randf() * (kMonsterSpawnRadiusMax - kMonsterSpawnRadiusMin); // 随机半径
+        const float spawnCenterX = playerCenterX + std::cos(angle) * radius; // 候选中心 x
+        const float spawnCenterY = playerCenterY + std::sin(angle) * radius; // 候选中心 y
+
+        // 条件一：离玩家中心 >= kMonsterSpawnMinPlayerDistance（内径 550 已
+        // 保证，这里是显式冗余——将来调内径时这条底线不被无声破坏）
+        const float dx = spawnCenterX - playerCenterX; // 与玩家的水平差
+        const float dy = spawnCenterY - playerCenterY; // 与玩家的垂直差
+        if (dx * dx + dy * dy <
+            kMonsterSpawnMinPlayerDistance * kMonsterSpawnMinPlayerDistance)
+        {
+            continue; // 离玩家太近：换一个候选
+        }
+
+        // 条件二：处于激活区块内（非激活区不生怪——出生即冻结没有意义）
+        if (!m_world.isPointInActiveChunks(spawnCenterX, spawnCenterY))
+        {
+            continue; // 激活窗口外：换一个候选
+        }
+
+        // 条件三：怪物矩形可走（候选矩形 = 怪物尺寸 AABB；世界边界墙与
+        // 内部墙簇均会在查询中被挡下——不会把怪生进墙里）
+        const SDL_FRect monsterRect{ spawnCenterX - monster.width() * 0.5f,  // 候选左上角 x
+                                     spawnCenterY - monster.height() * 0.5f, // 候选左上角 y
+                                     monster.width(),                        // 宽（48）
+                                     monster.height() };                     // 高（48）
+        if (!m_world.isRectWalkable(monsterRect))
+        {
+            continue; // 落点是墙：换一个候选
+        }
+
+        // 三轮校验全过：等权随机变体 -> 槽位换皮 -> 落位生成
+        const auto variant = static_cast<MonsterType>(
+            SDL_rand(static_cast<int>(MonsterType::Count))); // 等权三变体（各 1/3）
+        monster.loadVariant(m_renderer, variant);            // 复用槽位换皮（先释放旧纹理）
+        monster.spawnAt(spawnCenterX, spawnCenterY);         // 落位（内部写生命并快照防拉丝）
+        return true; // 生成成功：调用方接着写日志/累计
+    }
+
+    // 重试耗尽（玩家贴墙死角等极端情形）：本步不生成。刷新时刻表已在
+    // 调用方推进——下一次刷新时刻自然再试，不会死循环也不阻塞其余逻辑
+    return false;
+}
+
 // 重开一局：把整局相关的数据全部恢复到初始状态
 void PlayScene::restart()
 {
@@ -899,10 +1007,18 @@ void PlayScene::restart()
     // 刷新窗口实际尺寸缓存：重开时窗口可能已被调整过大小
     SDL_GetWindowSize(m_window, &m_width, &m_height);
 
-    // 玩家归位到窗口中心：坐标指左上角，所以要减去自身宽高的一半。
+    // 玩家归位到世界中心（批二：世界取代窗口作边界；出生保护区保证可走）。
     // reset 同时清零速度与攻击状态（冷却/挥剑表现），并把动画切回站姿
-    m_player.reset(m_width / 2.0f - m_player.width() / 2.0f,
-                   m_height / 2.0f - m_player.height() / 2.0f);
+    const SDL_FPoint spawn = m_world.spawnPointFor(m_player.width(), m_player.height());
+    m_player.reset(spawn.x, spawn.y);
+
+    // 相机对新玩家 + 立即刷新激活窗口（玩家可能死在远角，重开后镜头
+    // 直接回世界中心；先把窗口刷干净——若等下一个固定步，第一帧可能
+    // 画的是旧区域的区块）
+    m_camera.setViewport(static_cast<float>(m_width), static_cast<float>(m_height));
+    m_camera.snapTo(spawn.x + m_player.width() * 0.5f,
+                    spawn.y + m_player.height() * 0.5f);
+    m_world.updateActiveChunks(m_renderer, m_camera);
 
     // 怪物池全部回收：槽位标记未激活（不再更新/渲染/碰撞），
     // 等刷新时刻从空槽位重新生成；despawn 同时清掉追踪目标与闪白残留
@@ -932,16 +1048,17 @@ void PlayScene::restart()
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "重开一局");
 }
 
-// 每帧渲染：清屏 -> 背景 -> 玩家（含横扫表现）-> 怪物 -> 宝石 -> HUD。
-// 不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
+// 每帧渲染：清屏 -> 世界区块 -> 玩家（含横扫表现）-> 怪物 -> 宝石 ->
+// 漂浮文字 -> HUD。不调用 SDL_RenderPresent（提交由应用外壳统一负责）。
 // alpha 是插值系数，原样传给各实体——它们据此在上一固定步位置与当前
-// 固定步位置之间平滑绘制
+// 固定步位置之间平滑绘制，再经相机换算到屏幕（批二）
 void PlayScene::render(float alpha)
 {
     // 采样本渲染帧的间隔并更新 FPS 平滑值（只统计，不影响绘制内容）
     sampleFrameTime();
 
-    // 设置清屏颜色。深蓝是背景图缺失时的兜底底色
+    // 设置清屏颜色。深蓝是相机贴世界边缘时的窗外兜底色
+    //（正常游玩看不到——相机钳制在世界内）
     if (!SDL_SetRenderDrawColor(m_renderer, 20, 30, 50, 255))
     {
         // 设置颜色失败不影响继续绘制：记录后继续（最终由提交环节兜底判定）
@@ -955,57 +1072,57 @@ void PlayScene::render(float alpha)
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "清屏失败：%s", SDL_GetError());
     }
 
-    // 背景作为最底层画面绘制：目标矩形 = 渲染输出实际尺寸，保持尺寸无关——
-    // 无论窗口多大，背景总是铺满。纹理缺失（加载失败）时整块跳过，
-    // 清屏的深蓝色即为兜底背景
-    if (m_background != nullptr)
-    {
-        // 查询渲染输出尺寸，得到背景目标矩形
-        int outW = 0;
-        int outH = 0;
-        SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
-        // srcRect 传 nullptr 表示使用整张背景纹理
-        const SDL_FRect bgDst{ 0.0f, 0.0f,
-                               static_cast<float>(outW), static_cast<float>(outH) };
-        SDL_RenderTexture(m_renderer, m_background, nullptr, &bgDst);
-    }
+    // 世界（批二）：激活窗口内的区块纹理（地板/墙/装饰已烘焙成整块）。
+    // 「世界 -> 屏幕」换算与视口裁剪都在 World::render 内部完成；
+    // 背景图自批二起退役（区块地板取代；MenuScene 仍继续使用 background.png）
+    m_world.render(m_renderer, m_camera);
 
-    // 玩家按插值位置绘制；无敌期间每 0.1 秒显/隐交替（闪烁提示保护中）。
-    // 相位判定：剩余无敌时间对「两倍半周期」取模，模值小于半周期时显示——
-    // 随剩余时间递减自然交替。暂停/结束时剩余值冻结，相位一并冻结，
-    // 画面保持静止（与「暂停=完全冻结」的承诺一致）
+    // 玩家按插值位置绘制（经相机换算）；无敌期间每 0.1 秒显/隐交替
+    //（闪烁提示保护中）。相位判定：剩余无敌时间对「两倍半周期」取模，
+    // 模值小于半周期时显示——随剩余时间递减自然交替。暂停/结束时剩余值
+    // 冻结，相位一并冻结，画面保持静止（与「暂停=完全冻结」的承诺一致）
     const bool playerVisible =
         m_playerInvincibleLeft <= 0.0f ||
         std::fmod(m_playerInvincibleLeft, kPlayerBlinkHalfPeriod * 2.0f) < kPlayerBlinkHalfPeriod;
     if (playerVisible)
     {
-        m_player.render(m_renderer, alpha);
+        m_player.render(m_renderer, alpha, m_camera);
     }
 
-    // 怪物：只绘制存活槽位（与 update 同一门控——空槽位不可见）
+    // 怪物：只绘制「存活 + 激活区」槽位（与 update 同一门控——空槽位与
+    // 非激活区都不可见，渲染开销随活跃区域有界）
     for (const Monster& monster : m_monsters)
     {
-        if (monster.isAlive())
+        if (!monster.isAlive())
         {
-            monster.render(m_renderer, alpha);
+            continue; // 空槽位：不可见
         }
+        // 非激活区怪物：暂停渲染（update 侧也冻结——两侧门控一致）
+        const SDL_FRect monsterRect = monster.rect(); // 怪物矩形快照
+        if (!m_world.isPointInActiveChunks(monsterRect.x + monsterRect.w * 0.5f,
+                                           monsterRect.y + monsterRect.h * 0.5f))
+        {
+            continue; // 激活窗口外：跳过绘制
+        }
+        monster.render(m_renderer, alpha, m_camera); // 存活且激活：绘制（含闪白叠加）
     }
 
     // 说明：原「挥击弧光」特效已退役——攻击表现改由 Player 在自身 render
     // 里绘制武器素材（绕玩家中心 −60° 扫到 +60° 的横扫轨迹），
     // 此处不再有场景层特效
 
-    // 经验宝石：逐颗按插值位置绘制（最上层——拾取目标永远清晰可辨）
+    // 经验宝石：逐颗按插值位置绘制（经相机换算；最上层——拾取目标清晰可辨）
     for (const XpGem& gem : m_gems)
     {
-        gem.render(m_renderer, alpha);
+        gem.render(m_renderer, alpha, m_camera);
     }
 
     // 漂浮文字（伤害/升级共用）：世界层最上层——叠加在实体之上、HUD 之下。
+    // 批二起存世界坐标，绘制时经相机换算（相机滚动时飘字随世界点移动）；
     // 暂停/结束时寿命已冻结，这里照常绘制即「静止画面」（位置/透明度不变）
     for (const FloatingText& text : m_floatingTexts)
     {
-        text.render(m_renderer, m_hudFont);
+        text.render(m_renderer, m_hudFont, m_camera);
     }
 
     // 游戏世界画完后再叠加 HUD 文字
@@ -1028,7 +1145,7 @@ void PlayScene::renderHud()
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    // Paused / GameOver 叠层加半透明暗化遮罩：把游戏世界（背景/玩家/怪物）
+    // Paused / GameOver 叠层加半透明暗化遮罩：把游戏世界（区块/玩家/怪物）
     // 整体压暗，让叠层文字从画面中浮出来。绘制顺序：遮罩放在最前——
     // 之后绘制的 FPS 行与叠层文字都压在遮罩之上，保持全亮
     if (m_state == PlayState::Paused || m_state == PlayState::GameOver)

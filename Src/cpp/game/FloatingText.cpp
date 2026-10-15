@@ -1,6 +1,7 @@
 #include "game/FloatingText.h"
-#include "engine/Font.h" // Font：TTF 绘制/测量（drawCentered）
-#include <algorithm>     // std::clamp：alpha 换算的边界夹取
+#include "engine/Font.h"   // Font：TTF 绘制/测量（drawCentered）
+#include "engine/Camera.h" // Camera：绘制前「世界坐标 -> 屏幕坐标」的换算
+#include <algorithm>       // std::clamp：alpha 换算的边界夹取
 
 // ============================================================
 // FloatingText 的实现：时间轴推进 + 按进度上浮/淡出渲染。
@@ -38,8 +39,9 @@ void FloatingText::update(float deltaTime)
     m_lifeLeft = std::max(m_lifeLeft - deltaTime, 0.0f);
 }
 
-// 绘制：按「寿命进度」计算上浮位置与淡出透明度，再交给 Font 居中绘制
-void FloatingText::render(SDL_Renderer* renderer, const Font& font) const
+// 绘制：按「寿命进度」计算上浮位置（世界坐标）与淡出透明度，
+// 经相机换算到屏幕后交给 Font 居中绘制
+void FloatingText::render(SDL_Renderer* renderer, const Font& font, const Camera& camera) const
 {
     // 未激活/已到期（寿命为 0）或空文案：不产生任何绘制
     if (m_lifeLeft <= 0.0f || m_text.empty())
@@ -50,8 +52,11 @@ void FloatingText::render(SDL_Renderer* renderer, const Font& font) const
     // 进度 progress：0（刚出生）-> 1（寿命耗尽）。用于上浮与淡出的统一时间参数
     const float progress = 1.0f - m_lifeLeft / m_lifeTotal;
 
-    // 当前顶边 y：从出生点线性上浮（进度越大、位置越高）
-    const float currentY = m_topY - kRiseDistance * progress;
+    // 当前顶边 y（世界坐标）：从出生点线性上浮（进度越大、位置越高）
+    const float worldTopY = m_topY - kRiseDistance * progress;
+
+    // 世界 -> 屏幕换算（批二：飘字锚定世界——相机滚动时飘字随世界点移动）
+    const Vec2 screenPos = camera.worldToScreen(m_centerX, worldTopY); // 屏幕系出生点
 
     // 淡出透明度：剩余寿命比例 x 255（出生时全亮、到点恰好淡尽），
     // 夹到 [0,255] 后转字节——浮点舍入不会产生越界的颜色分量
@@ -65,6 +70,6 @@ void FloatingText::render(SDL_Renderer* renderer, const Font& font) const
         return;
     }
 
-    // Font 水平居中绘制（字体未加载时其内部安全跳过，不崩）
-    font.drawCentered(renderer, m_text.c_str(), m_centerX, currentY);
+    // Font 水平居中绘制（屏幕坐标；字体未加载时其内部安全跳过，不崩）
+    font.drawCentered(renderer, m_text.c_str(), screenPos.x, screenPos.y);
 }

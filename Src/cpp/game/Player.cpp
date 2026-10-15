@@ -1,6 +1,7 @@
 #include "game/Player.h"
 #include "game/AttackArc.h" // bladeAngleAt：刀锋角共享曲线（判定与渲染同款）；缓出注释见该文件
-#include "engine/Input.h" // Input：经 ctx.input 查询移动动作的接口定义
+#include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
+#include "engine/Input.h"   // Input：经 ctx.input 查询移动动作的接口定义
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载武器素材（可选增强）
 #include <algorithm>      // std::min / std::max / std::clamp：速度逼近与边界
 #include <cmath>          // std::sqrt / std::cos / std::sin / std::atan2：方向归一化与横扫曲线
@@ -214,17 +215,16 @@ void Player::update(const UpdateContext& ctx)
         }
     }
 
-    // 2) 朝向翻转（本批改版）：跟随鼠标——指针在玩家中心右侧朝右、左侧
+    // 2) 朝向翻转（批二改版）：跟随鼠标——指针在玩家中心右侧朝右、左侧
     //    朝左；贴近中心线（±kFlipDeadZone 像素死区）时保持上一次朝向，
     //    避免指针压在中线上时来回抖动。setFlipped 是纯渲染层标记：
     //    碰撞/插值/扇形判定都按未翻转的数据计算，不影响任何玩法判定。
-    //    鼠标位置经 ctx.input 读取（与移动动作同一输入系统；无输入系统
-    //    时保持朝向不变）
-    if (ctx.input != nullptr)
+    //    鼠标位置由场景注入「世界坐标」（setAimTarget）——屏幕->世界的
+    //    换算收敛在场景层；从未注入过（无输入系统等）时保持朝向不变
+    if (m_hasAim)
     {
-        const Vec2 mouse = ctx.input->mousePosition();        // 本帧鼠标位置快照
-        const float centerX = m_x + m_w * 0.5f;               // 玩家几何中心 x
-        const float mouseOffsetX = mouse.x - centerX;         // 指针相对中心的横向差
+        const float centerX = m_x + m_w * 0.5f;               // 玩家几何中心 x（世界坐标）
+        const float mouseOffsetX = m_aimX - centerX;          // 指针相对中心的横向差（世界坐标）
         if (mouseOffsetX > kFlipDeadZone)
         {
             setFlipped(false); // 指针在右侧：朝右（素材原始朝向）
@@ -233,7 +233,9 @@ void Player::update(const UpdateContext& ctx)
         {
             setFlipped(true); // 指针在左侧：朝左（水平镜像绘制）
         }
-        // 死区内：维持上一次朝向（不更新 = 不抖动）
+        // 死区内：维持上一次朝向（不更新 = 不抖动）。
+        // 注：m_aimY（纵轴分量）当前不参与翻转判定——水平镜像只需要横向
+        // 差值；保留完整点位是「瞄准点」语义的完整性（后续朝向细节可用）
     }
 
     // 3) 逐轴渐近更新速度（固定步长下的速度积分，结果与帧率无关）：
@@ -263,14 +265,12 @@ void Player::update(const UpdateContext& ctx)
         m_velocityY = approach(m_velocityY, 0.0f, m_friction, dt);
     }
 
-    // 4) 位置积分：本步位移 = 当前速度 x 固定步长（速度单位：像素/秒）
-    m_x += m_velocityX * dt;
-    m_y += m_velocityY * dt;
-
-    // 边界限制基于上下文里的视口实际尺寸：右边界 = 视口宽 - 自身宽，
-    // 下边界 = 视口高 - 自身高（与既有移动边界规则一致）
-    m_x = std::clamp(m_x, 0.0f, ctx.viewportWidth - m_w);
-    m_y = std::clamp(m_y, 0.0f, ctx.viewportHeight - m_h);
+    // 4) 位置积分：本步位移 = 当前速度 x 固定步长（速度单位：像素/秒）。
+    //    批二：世界坐标下的直接积分——旧「窗口边框 clamp」随「窗口即世界」
+    //    的时代一并移除；墙体与边界碰撞（撞墙滑动）由世界系统接管
+    //    （World::slideMove，见后续接入笔）
+    m_x += m_velocityX * dt; // 直接推进 x（世界坐标）
+    m_y += m_velocityY * dt; // 直接推进 y（世界坐标）
 
     // 5) 行走动画推进与子区间切换（固定帧时长与渲染帧率解耦）：
     //    判据是「有没有速度」——移动时循环跑动帧 [kRunFirst, kRunLast]；
@@ -290,10 +290,11 @@ void Player::update(const UpdateContext& ctx)
 
 // 覆写渲染：本体（含翻转/插值/帧区间）之后叠加横扫表现
 //（主体剑 + 3 道渐隐残影；扫程位置走共享缓出曲线，与判定同一相位）
-void Player::render(SDL_Renderer* renderer, float alpha) const
+void Player::render(SDL_Renderer* renderer, float alpha, const Camera& camera) const
 {
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
-    Entity::render(renderer, alpha);
+    //（基类内部完成世界坐标 -> 屏幕坐标的相机换算）
+    Entity::render(renderer, alpha, camera);
 
     // 只有「横扫表现期内」且武器纹理已加载时才画剑；其余时刻直接结束
     //（早退不触碰纹理 alpha 状态——上一帧的绘制末尾已恢复 255）
@@ -316,11 +317,16 @@ void Player::render(SDL_Renderer* renderer, float alpha) const
     const float bladeAngleRad = bladeAngleAt(aimAngleRad, progress, m_sweepArcDegrees);
     const float startAngleRad = bladeAngleAt(aimAngleRad, 0.0f, m_sweepArcDegrees);
 
-    // 旋转锚点：玩家插值中心下移 kOrbitPivotOffsetY（支点修正）——
-    // 剑绕「略低于身体中心」的点扫过，观感上更接近手持剑的挥动支点；
-    // 插值中心与本体共用同一条平滑公式，快速移动时武器不脱节
-    SDL_FPoint pivot = interpolatedCenter(alpha); // 玩家插值中心（本体的绘制锚点）
-    pivot.y += kOrbitPivotOffsetY;                // 下移到旋转锚点
+    // 旋转锚点（批二：双层换算）：先在「世界坐标」下取玩家插值中心、
+    // 下移 kOrbitPivotOffsetY（支点修正——剑绕「略低于身体中心」的点扫过，
+    // 观感上更接近手持剑的挥动支点），再经相机换算到屏幕。
+    // 武器与本体共用同一条插值公式 + 同一台相机——快速移动不脱节、
+    // 相机平滑跟随时武器也不会与本体漂移分离
+    SDL_FPoint pivot = interpolatedCenter(alpha); // 玩家插值中心（世界坐标）
+    pivot.y += kOrbitPivotOffsetY;                // 世界坐标下移到旋转锚点
+    const Vec2 pivotScreen = camera.worldToScreen(pivot.x, pivot.y); // 锚点的屏幕坐标
+    pivot.x = pivotScreen.x; // 锚点横坐标切换为屏幕系（后续绘制全用屏幕系）
+    pivot.y = pivotScreen.y; // 锚点纵坐标切换为屏幕系
 
     // 单道剑的绘制（主体与残影共用）：给定刀锋角与透明度，把武器中心
     // 摆在「锚点 + 刀锋方向 x 轨道半径」处、绕矩形自身中心旋转绘制
@@ -435,12 +441,13 @@ float Player::swingProgress01() const
     return std::clamp(progress, 0.0f, 1.0f); // 夹取：0=刚出手、1=扫程结束
 }
 
-// 插值后的玩家中心点（渲染坐标）：横扫表现挂点
+// 插值后的玩家中心点（世界坐标）：横扫表现挂点
 SDL_FPoint Player::interpolatedCenter(float alpha) const
 {
-    // 渲染位置 = 上一固定步位置与当前位置按 alpha 线性插值（与基类 render 同式），
-    // 再换算到中心点——武器因此与玩家本体画在同一个平滑位置上
-    const float renderX = m_prevX + (m_x - m_prevX) * alpha; // 插值后的绘制 x
-    const float renderY = m_prevY + (m_y - m_prevY) * alpha; // 插值后的绘制 y
-    return SDL_FPoint{ renderX + m_w * 0.5f, renderY + m_h * 0.5f }; // 中心点 = 渲染位置 + 半尺寸
+    // 插值位置 = 上一固定步位置与当前位置按 alpha 线性插值（与基类 render 同式），
+    // 再换算到中心点——武器因此与玩家本体定位于同一个平滑世界点
+    //（后续由 render 统一经相机换算到屏幕）
+    const float renderX = m_prevX + (m_x - m_prevX) * alpha; // 插值后的世界 x
+    const float renderY = m_prevY + (m_y - m_prevY) * alpha; // 插值后的世界 y
+    return SDL_FPoint{ renderX + m_w * 0.5f, renderY + m_h * 0.5f }; // 中心点 = 插值位置 + 半尺寸
 }

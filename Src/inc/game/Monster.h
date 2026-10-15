@@ -3,6 +3,10 @@
 
 #include "engine/Entity.h" // Entity：实体基类（空间/纹理/帧动画公共能力）
 
+// 前置声明：相机（渲染换算）在本类中只以引用出现，
+// 完整定义由 Monster.cpp 的包含获得（减少头依赖）
+class Camera;
+
 // ============================================================
 // Monster：追击玩家的怪物实体（三变体：史莱姆 / 哥布林 / 骷髅）
 // ============================================================
@@ -36,17 +40,22 @@
 //      怪物不持有玩家指针，也不查询全局状态；PlayScene 每个固定步在
 //      update 前调用 setTarget()/setChaseSpeed()，把「本步的追踪目标」
 //      （玩家矩形中心）与「本步速度」注入进来，再调用 update：
-//        - 有目标：沿「怪物中心 -> 目标点」的归一化方向 x 速度移动，
-//          并把左上角 clamp 在视口内（先注入、后更新的顺序让难度曲线
-//          之类的玩法规则完全留在场景层）
+//        - 有目标：沿「怪物中心 -> 目标点」的归一化方向 x 速度移动；
+//          批二坐标化：世界坐标直接积分；墙体碰撞处理（分轴滑动 + 卡住时
+//          轻量侧滑）见后续接入笔——完整绕墙/寻路留批三评估；
 //        - 无目标：仅推进帧动画（防御性分支）
+//      行为本质不变（巡逻/仇恨/栓绳留批三），仅坐标体系升级
 //   4. 战斗反馈（沿用上一版）：受击闪白（约 0.1s，render 叠加加色绘制）
-//      + 击退（沿背离伤害来源的方向瞬移）；死亡转「未激活」（对象池语义：
-//      不再更新/渲染/碰撞，槽位等下一次 spawnEdge 复用）
+//      + 击退（沿背离伤害来源的方向瞬移；批二起为纯位移——落点的世界
+//      可走校验见后续接入笔）；死亡转「未激活」（对象池语义：不再更新/
+//      渲染/碰撞，槽位等下一次 spawnAt 复用）
 //   5. 生成 / 击退 / 回收都是「状态突变类操作」：落点定稿后必须快照
 //      prev=cur，否则渲染插值会从旧位置拉丝到新位置（延续既有纪律）
 //   6. 动画节奏：4 帧循环、每帧 0.2 秒（代码常量），由基类 render 的
 //      「累计时间 / 帧时长」换算，与渲染帧率解耦
+//   7. 出生（批二过渡版）：不再从「窗口边缘」刷新——场景在玩家周围
+//      550~750px 圆环内选「激活区块内且可走」的落点，经 spawnAt 写入
+//      （落点规则属玩法层，场景负责选择；本类只负责可信落点的落位）
 // ============================================================
 
 // 怪物变体枚举：等权随机刷新的取值范围（Count 恒为变体数量，用作随机上界）
@@ -76,7 +85,7 @@ public:
 
     // 按指定变体加载/重载纹理：设置变体类型 -> 释放旧纹理 -> 三级回退加载
     // 该变体的「精灵表 -> 单帧图 -> 程序化纯色」。对象池槽位复用时由
-    // PlayScene 在 spawnEdge 之前调用（换皮）；重复加载同变体也无害
+    // PlayScene 在 spawnAt 之前调用（换皮）；重复加载同变体也无害
     bool loadVariant(SDL_Renderer* renderer, MonsterType type);
 
     // 当前变体类型（日志/查询用）
@@ -110,14 +119,14 @@ public:
     // 负数伤害属于调用方错误：忽略并警告，不改变任何状态
     bool takeDamage(int amount);
 
-    // 生成（边缘刷新）：在窗口四条边的随机一边内侧落位（怪物从屏幕边缘
-    // 走入战场），激活本对象并按变体数值表写入出生生命值。
-    // avoidRect（通常为玩家矩形）近旁会重试避让，避免「贴脸刷新」；
-    // 瞬移类操作：落点定稿后同步插值快照（防拉丝）
-    void spawnEdge(int winW, int winH, const SDL_FRect& avoidRect);
+    // 生成（批二过渡版）：在「调用方选好的可信落点」上激活本对象——
+    // 落点以怪物中心给出（世界坐标），由场景侧按出生规则选择并完成
+    // 「激活区块内 + 可走」校验（落点规则属玩法层，见 PlayScene）。
+    // 出生生命按变体数值表写入；瞬移类操作：落点定稿后同步插值快照（防拉丝）
+    void spawnAt(float centerX, float centerY);
 
     // 回收：从场上移除本怪物（重开清场/未来清屏技使用），槽位可被再次
-    // spawnEdge 复用。清掉追踪目标与闪白状态，避免复用前残留旧数据
+    // spawnAt 复用。清掉追踪目标与闪白状态，避免复用前残留旧数据
     void despawn()
     {
         m_alive = false;     // 未激活：不再更新/渲染/碰撞
@@ -126,25 +135,23 @@ public:
     }
 
     // 被撞开/被击退：沿「(fromX, fromY) -> 怪物中心」的方向（即远离伤害
-    // 来源的方向）瞬移 distance 像素，并 clamp 在视口内。
-    // 距离由调用方给出：接触伤害用较远的弹开（拉开保护距离），
-    // 横扫命中用较短的微击退（保持追击压力、方便连扫补刀）。
+    // 来源的方向）瞬移 distance 像素（批二：世界坐标纯位移；落点的世界
+    // 可走校验见后续接入笔）。距离由调用方给出：接触伤害用较远的弹开
+    // （拉开保护距离），横扫命中用较短的微击退（保持追击压力、方便连扫补刀）。
     // 瞬移类操作：内部同步插值快照（防拉丝）
-    void knockback(float fromX, float fromY, float viewportW, float viewportH, float distance);
+    void knockback(float fromX, float fromY, float distance);
 
-    // 覆写更新：推进帧动画 + 受击闪白计时 + 朝目标点直线追踪。
+    // 覆写更新：推进帧动画 + 受击闪白计时 + 朝目标点追踪（世界坐标直接积分）。
     // 签名与基类保持一致：世界上下文（deltaTime/键盘/视口）打包传入
     void update(const UpdateContext& ctx) override;
 
-    // 覆写渲染：基础绘制之外，受击闪白期间额外叠加一次加色绘制
-    void render(SDL_Renderer* renderer, float alpha) const override;
+    // 覆写渲染：基础绘制（经相机世界->屏幕换算）之外，
+    // 受击闪白期间额外叠加一次加色绘制
+    void render(SDL_Renderer* renderer, float alpha, const Camera& camera) const override;
 
 private:
-    static constexpr float kSize = 48.0f;              // 怪物边长（正方形），也是单帧宽高
-    static constexpr float kMinSpawnDistance = 150.0f; // 出生点距玩家中心的最小距离（像素）
-    static constexpr int kSpawnMaxTries = 20;          // 「距玩家足够远」的最大重试次数
-    static constexpr float kEdgeInset = 4.0f;          // 边缘刷新点从窗口边向内收的像素（完整可见）
-    static constexpr float kHitFlashSeconds = 0.1f;    // 受击闪白时长（秒；代码常量，不进配置）
+    static constexpr float kSize = 48.0f;           // 怪物边长（正方形），也是单帧宽高
+    static constexpr float kHitFlashSeconds = 0.1f; // 受击闪白时长（秒；代码常量，不进配置）
 
     // 「已到达」判定的距离阈值（像素）：小于它就原地不动。
     // 双重作用：避免目标点附近的来回抖动，也排除归一化除以零的退化情形
@@ -154,12 +161,12 @@ private:
 
     MonsterType m_type = MonsterType::Goblin; // 当前变体（默认哥布林；刷新时由场景指定）
 
-    bool m_alive = false;     // 是否在场：spawnEdge 置 true，受击致死/回收置 false
-    int m_hp = 0;             // 当前生命值（spawnEdge 时按变体数值表写入）
+    bool m_alive = false;     // 是否在场：spawnAt 置 true，受击致死/回收置 false
+    int m_hp = 0;             // 当前生命值（spawnAt 时按变体数值表写入）
     float m_flashLeft = 0.0f; // 受击闪白剩余时长（秒；>0 时 render 叠加提亮）
 
     bool m_hasTarget = false;  // 本步是否已注入追踪目标（false 时仅播动画）
-    float m_targetX = 0.0f;    // 目标点 x（屏幕像素，通常为玩家矩形中心）
+    float m_targetX = 0.0f;    // 目标点 x（世界坐标，通常为玩家矩形中心）
     float m_targetY = 0.0f;    // 目标点 y（同上）
     float m_chaseSpeed = 0.0f; // 本步移动速度（像素/秒，由场景注入）
 };

@@ -30,9 +30,10 @@
 //   - 透明度：alpha = 255 x 剩余/总寿命（出生全亮，到点恰好淡尽）。
 // ============================================================
 
-// 前置声明：头文件里 Font 只以引用形式出现，不需要完整定义（减少头依赖）；
-// 完整定义由 FloatingText.cpp 包含 "engine/Font.h" 获得
+// 前置声明：头文件里 Font / Camera 只以引用形式出现，不需要完整定义
+//（减少头依赖）；完整定义由 FloatingText.cpp 包含对应头文件获得
 class Font;
+class Camera;
 
 class FloatingText
 {
@@ -44,8 +45,9 @@ public:
     static constexpr float kRiseDistance = 48.0f;
 
     // 生成（可复用一个实例槽位）：text 为 UTF-8 文案（拷贝保存——「-25」这类
-    // 文案来自栈上缓冲，不能只存指针）；centerX 为文字水平中心；topY 为文字
-    // 顶边出生位置；color 为基础颜色（alpha 分量在渲染时按寿命另行换算）；
+    // 文案来自栈上缓冲，不能只存指针）；centerX / topY 为出生点
+    //（自批二起为「世界坐标」——飘字锚定在世界上，随相机滚动而移动）；
+    // color 为基础颜色（alpha 分量在渲染时按寿命另行换算）；
     // lifeSeconds 小于等于 0 时回退默认值（防御调用方传坏值）
     void spawn(const char* text, float centerX, float topY, SDL_Color color,
                float lifeSeconds = kDefaultLifeSeconds);
@@ -57,14 +59,14 @@ public:
     // 是否已到期（场景据此统一清理）
     bool isExpired() const { return m_lifeLeft <= 0.0f; }
 
-    // 绘制：按寿命进度计算上浮后的位置与 alpha，设置渲染器绘制颜色后
-    // 交给 Font 水平居中绘制。字体未加载时 Font 内部安全跳过（不崩）
-    void render(SDL_Renderer* renderer, const Font& font) const;
+    // 绘制：按寿命进度计算上浮后的位置（世界坐标）与 alpha，经相机换算到
+    // 屏幕后交给 Font 水平居中绘制。字体未加载时 Font 内部安全跳过（不崩）
+    void render(SDL_Renderer* renderer, const Font& font, const Camera& camera) const;
 
 private:
     std::string m_text;              // 文案（UTF-8；spawn 时拷贝保存）
-    float m_centerX = 0.0f;          // 文字水平中心（屏幕像素）
-    float m_topY = 0.0f;             // 出生时文字顶边（屏幕像素）
+    float m_centerX = 0.0f;          // 文字水平中心（世界坐标）
+    float m_topY = 0.0f;             // 出生时文字顶边（世界坐标）
     float m_lifeLeft = 0.0f;         // 剩余寿命（秒；<=0 表示未激活/已到期）
     float m_lifeTotal = kDefaultLifeSeconds; // 本次生成的总寿命（秒）：淡出与上浮的分母
     SDL_Color m_color{ 255, 255, 255, 255 }; // 基础颜色（alpha 在渲染时被替换为寿命换算值）
