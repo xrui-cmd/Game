@@ -210,3 +210,62 @@ set_target_properties(attack_arc_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  世界与相机单元测试（world_test，批二）
+#
+#  被测对象：game/World.h + World.cpp（世界生成 / 格级碰撞 / 激活窗口）
+#  以及引擎的 Camera.h（header-only：坐标换算 / 边界钳制 / 平滑跟随）。
+#
+#  与 config_parse_test / input_test 同模式：编译游戏源码（Src/cpp/game/
+#  World.cpp）并链接 SDL3 与 SDL3_image（World.cpp 的纹理路径引用
+#  IMG_LoadTexture 等符号）。测试只走纯计算路径（生成/查询/滑动），
+#  不创建窗口、不加载素材，任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\world_test.exe
+# ============================================================
+
+add_executable(world_test
+    world_test.cpp
+    ../Src/cpp/game/World.cpp
+)
+
+if (MSVC)
+    target_compile_options(world_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：World.h 位于游戏仓 Src/inc（"game/World.h"）、
+# Camera.h 位于引擎子模块（"engine/Camera.h"）、SDL 头位于 vendor
+target_include_directories(world_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL3_image/include")
+
+# 链接主工程构建出的 SDL3 与 SDL3_image 导入库
+#（World.cpp 引用 SDL_LogInfo 与 IMG_LoadTexture 两组符号）
+target_link_libraries(world_test PRIVATE
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib"
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL3_image/SDL3_image.lib")
+
+# 运行目录放 SDL3.dll 与 SDL3_image.dll（与主工程同一份构建产物）
+add_custom_command(TARGET world_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3.dll"
+    "$<TARGET_FILE_DIR:world_test>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3_image.dll"
+    "$<TARGET_FILE_DIR:world_test>"
+)
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(world_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
