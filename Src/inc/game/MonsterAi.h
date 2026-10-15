@@ -126,6 +126,7 @@ public:
         m_wantPatrolTarget = false;       // 清「索要目标」标记
         m_pauseLeft = 0.0f;               // 无停顿：下一次 update 即可索要目标
         m_patrolElapsed = 0.0f;           // 游荡计时清零
+        m_aggroReentryArmed = false;      // 清「再入仇恨」武装（池复用语义）
         m_hasGoal = false;                // 本步无移动目标（等供水）
         m_goalX = m_nestX;                // 目标点回巢心（防御：无目标时也不误导）
         m_goalY = m_nestY;
@@ -168,10 +169,15 @@ public:
             break;
 
         case MonsterAiState::Return:
-            // 回巢中：玩家再入仇恨 -> 立即 Chase（仇恨优先于到巢）；
+            // 回巢中：玩家「再入仇恨」-> 立即 Chase（仇恨优先于到巢）；
             // 否则到巢 -> Patrol（宿主在此事件上挂钩回巢回血）；
-            // 再否则继续 Return
-            if (distPlayer <= m_config.aggroRadius)
+            // 再否则继续 Return。
+            // 「再入」的严格语义（批三修正）：玩家必须先离开仇恨圈、
+            // 再回来才算「再入」——拉怪瞬间玩家往往仍贴身（从未离开），
+            // 若允许立即重新追击，栓绳与仇恨会每步互相翻转：怪物原地
+            // 抖动、永远回不了巢。故重新追击需 m_aggroReentryArmed
+            //（圈外至少一步后武装，见本函数末尾的武装逻辑）
+            if (distPlayer <= m_config.aggroRadius && m_aggroReentryArmed)
             {
                 next = MonsterAiState::Chase; // 重新仇恨：回巢途中再追
             }
@@ -203,6 +209,19 @@ public:
             m_wantPatrolTarget = false; // 索要标记复位（本步目标算法见下）
             m_pauseLeft = 0.0f;         // 停顿清零
             m_patrolElapsed = 0.0f;     // 追赶计时清零
+            if (next == MonsterAiState::Return)
+            {
+                m_aggroReentryArmed = false; // 新一段回巢：「再入」需重新武装（见上）
+            }
+        }
+
+        // 「再入仇恨」的武装（批三修正，见 Return 分支说明）：处于回巢且
+        // 本步玩家在仇恨圈外时，标记「玩家已离开」——之后玩家再回到
+        // 圈内（<= 半径）才算「再入」，允许重新追击。拉怪瞬间的贴身
+        // （从未离开）不武装，怪物专心回巢，不在两状态间每步翻转
+        if (m_state == MonsterAiState::Return && distPlayer > m_config.aggroRadius)
+        {
+            m_aggroReentryArmed = true; // 圈外一步：武装「再入」判定
         }
 
         // ---- 本步移动目标（由状态决定；hasGoal=false 表示原地）----
@@ -374,6 +393,10 @@ private:
     float m_patrolY = 0.0f;          // 游荡点 y
     float m_patrolElapsed = 0.0f;    // 本游荡点已追赶时长（秒；放弃判据）
     float m_pauseLeft = 0.0f;        // 停顿时长剩余（秒；<=0 表示可索要新目标）
+
+    // 「再入仇恨」武装标记（批三修正）：回巢中玩家离开过仇恨圈才置 true——
+    // 之后玩家再回到圈内才算「再入」、允许重新追击（见 update 的 Return 分支）
+    bool m_aggroReentryArmed = false;
 
     // ---- 本步移动目标 ----
     bool m_hasGoal = false; // 本步是否有目标（false = 原地不动）

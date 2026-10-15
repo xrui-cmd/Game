@@ -371,6 +371,27 @@ int main()
         r = ai.update(300.0f, 0.0f, true, 620.0f, 0.0f, dt);
         expectState("玩家恰好 320px：重新追击", r.state, MonsterAiState::Chase);
         expectTrue("重进仇恨：enteredChase 置位", r.enteredChase);
+
+        // ---- 「再入」语义（批三修正）：拉怪瞬间贴身不算「再入」，不翻转 ----
+        // 铺垫重新进入追击：玩家近身
+        r = ai.update(300.0f, 0.0f, true, 350.0f, 0.0f, dt);
+        expectState("玩家 50px：保持追击", r.state, MonsterAiState::Chase);
+        // 怪物被拉过栓绳线（520 > 500），玩家仍贴身（80px <= 320）：
+        // 触发回巢，但玩家「从未离开」——不武装再入判定
+        r = ai.update(520.0f, 0.0f, true, 600.0f, 0.0f, dt);
+        expectState("贴身拉过栓绳线：回巢", r.state, MonsterAiState::Return);
+        expectTrue("拉怪瞬间：enteredReturn 置位", r.enteredReturn);
+        // 下一步玩家仍贴身（80px）：不能翻转回追击（否则栓绳/仇恨每步互翻）
+        r = ai.update(520.0f, 0.0f, true, 600.0f, 0.0f, dt);
+        expectState("贴身回巢中：不翻转、继续回巢", r.state, MonsterAiState::Return);
+        expectTrue("贴身回巢中：未再进入仇恨", !r.enteredChase);
+        // 玩家离开仇恨圈（+380px > 320）：武装「再入」判定，仍继续回巢
+        r = ai.update(520.0f, 0.0f, true, 900.0f, 0.0f, dt);
+        expectState("玩家离开留出圈外：仍回巢", r.state, MonsterAiState::Return);
+        // 玩家重新回到恰好 320px：此刻「再入」成立 -> 重新追击
+        r = ai.update(520.0f, 0.0f, true, 840.0f, 0.0f, dt);
+        expectState("离开一圈后再入 320px：重新追击", r.state, MonsterAiState::Chase);
+        expectTrue("再入追击：enteredChase 置位", r.enteredChase);
     }
     endCase(5, p0, f0);
 
