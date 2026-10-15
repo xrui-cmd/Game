@@ -159,6 +159,7 @@ void Monster::spawnAt(float centerX, float centerY)
     // 状态绝不带进新怪物
     m_ai.setRandom(&monsterAiRandom, nullptr); // 随机源：SDL 随机流适配
     m_ai.reset(centerX, centerY);              // 巢 = 本落点；状态清回巡逻
+    clearMotionState();                        // 侧滑/卡死检测窗口清零（新怪的干净起点）
 
     // 瞬移类操作的插值收尾（重点）：出生是「瞬间换位」，必须把插值快照
     // 对齐到新落点，否则渲染会从上一位置向新落点拉丝（延续既有纪律）
@@ -189,6 +190,10 @@ void Monster::knockback(float fromX, float fromY, float distance)
         dirX = dx / length; // 单位方向 x：dx 占全长的比例
         dirY = dy / length; // 单位方向 y：dy 占全长的比例
     }
+
+    // 击退是瞬移：位置突变后旧位置的卡死统计/侧滑方向不再有意义——清零。
+    //（清在位移之前：各分支（含世界未注入的防御分支）都已受益）
+    clearMotionState();
 
     // 世界未注入（防御）：退化为无校验位移——直接按全距离瞬移
     if (m_world == nullptr)
@@ -353,10 +358,10 @@ void Monster::update(const UpdateContext& ctx)
     moveWithCollision(stepDX, stepDY, ctx.deltaTime);
 }
 
-// 位移推进（含墙体碰撞 + 撞墙时的轻量侧滑）：三种状态共用的移动出口
-void Monster::moveWithCollision(float stepDX, float stepDY, float /*dt*/)
+// 位移推进（含墙体碰撞 + 卡死检测 + 持久化侧滑）：三种状态共用的移动出口
+void Monster::moveWithCollision(float stepDX, float stepDY, float dt)
 {
-    // 世界未注入（防御分支）：无碰撞直接位移，不做任何阻挡
+    // 世界未注入（防御分支）：无碰撞直接位移，不做任何检测
     if (m_world == nullptr)
     {
         m_x += stepDX; // 直接推进 x
@@ -364,54 +369,195 @@ void Monster::moveWithCollision(float stepDX, float stepDY, float /*dt*/)
         return;        // 本步移动结束
     }
 
-    // ---- 主方向：分轴滑动（与玩家移动共用同一个纯函数，行为一致）----
+    // ---- 持久化侧滑混合（批三）----
+    // 侧滑维持期内：实际尝试方向 = 期望方向 + 垂直方向 x 权重。
+    // 权重随时间从 1 缓慢衰减到下限（「维持一段时间并缓慢衰减」），
+    // 使怪物坚持从同一侧绕墙，而不是每步重新掷骰子（减少凹角滞留）
+    float useDX = stepDX; // 实际尝试的水平位移（默认 = 期望位移）
+    float useDY = stepDY; // 实际尝试的垂直位移
+    if (m_slideSign != 0 && m_slideHoldLeft > 0.0f)
+    {
+        const float weight = slideWeight(); // 本步权重（随维持时间衰减）
+        // 垂直方向 = 期望位移旋转 90° x 侧滑方向符号：
+        // 只旋转不改变长度，把它作为「绕行分量」叠加到期望方向上
+        const float perpX = -stepDY * static_cast<float>(m_slideSign); // 垂直分量 x
+        const float perpY = stepDX * static_cast<float>(m_slideSign);  // 垂直分量 y
+        useDX = stepDX + perpX * weight; // 混合后的水平尝试
+        useDY = stepDY + perpY * weight; // 混合后的垂直尝试
+
+        // 长度夹回：混合后合成向量长于原位移，不夹会「斜走加速」——
+        // 除零防御：原位移恒不为零（调用方已过滤到达/无目标）
+        const float baseLen = std::sqrt(stepDX * stepDX + stepDY * stepDY); // 期望长度
+        const float useLen = std::sqrt(useDX * useDX + useDY * useDY);      // 混合长度
+        if (useLen > 0.0001f)
+        {
+            const float scale = baseLen / useLen; // 夹回比例
+            useDX *= scale; // 水平位移夹回
+            useDY *= scale; // 垂直位移夹回
+        }
+
+        // 维持计时递减；到期清方向（下一次卡死会重新探测选取）
+        m_slideHoldLeft = std::max(m_slideHoldLeft - dt, 0.0f);
+        if (m_slideHoldLeft <= 0.0f)
+        {
+            m_slideSign = 0; // 维持期结束：不再侧滑，回归直线行进
+        }
+    }
+
+    // ---- 主方向分轴滑动（与玩家移动共用同一个纯函数，行为一致）----
     // 一轴被墙挡住、另一轴照走——「贴墙滑行」的手感来源；内部还带子步
     // 拆分防高速穿透
-    const SDL_FPoint moved = m_world->slideMove(m_x, m_y, m_w, m_h, stepDX, stepDY);
+    const SDL_FPoint moved = m_world->slideMove(m_x, m_y, m_w, m_h, useDX, useDY);
     const float movedDX = moved.x - m_x; // 碰撞后的实际水平位移
     const float movedDY = moved.y - m_y; // 碰撞后的实际垂直位移
 
-    // 卡住检测：期望位移² vs 实际位移²（比较用平方，省一次开方）
-    const float expectedSq = stepDX * stepDX + stepDY * stepDY;  // 期望位移平方
+    // 期望/实际位移的平方（比较用平方，省一次开方）
+    const float expectedSq = useDX * useDX + useDY * useDY;      // 期望位移平方
     const float movedSq = movedDX * movedDX + movedDY * movedDY; // 实际位移平方
 
+    // ---- 卡死检测窗口统计（批三）：累计本窗口的期望/实际位移长度 ----
+    m_stuckWindowTime += dt;                        // 窗口计时
+    m_stuckWindowExpected += std::sqrt(expectedSq); // 期望位移累计（像素）
+    m_stuckWindowActual += std::sqrt(movedSq);      // 实际位移累计（像素）
+
+    // ---- 即时探测（单步几乎没动）：正面撞墙的快速响应 ----
     if (expectedSq > 0.0f && movedSq < expectedSq * kStuckMoveRatioSquared)
     {
-        // ---- 轻量侧滑：正面撞墙「几乎没动」时，把期望位移旋转 90 度
-        //（先右后左）再试——能滑就沿墙爬行、两侧皆堵就原地 ----
-        const SDL_FPoint slideRight = m_world->slideMove(m_x, m_y, m_w, m_h, -stepDY, stepDX); // 右侧滑（顺时针 90°）
-        const SDL_FPoint slideLeft = m_world->slideMove(m_x, m_y, m_w, m_h, stepDY, -stepDX);  // 左侧滑（逆时针 90°）
-
-        // 两候选侧滑的实际位移平方：评判「哪一侧更能动」
-        const float rightMovedSq = (slideRight.x - m_x) * (slideRight.x - m_x) +
-                                   (slideRight.y - m_y) * (slideRight.y - m_y); // 右滑位移²
-        const float leftMovedSq = (slideLeft.x - m_x) * (slideLeft.x - m_x) +
-                                  (slideLeft.y - m_y) * (slideLeft.y - m_y);    // 左滑位移²
-
-        // 选择规则：在「比主方向结果更能动」的候选中取更优者；
-        // 两侧都不如主方向（凹角死角）则落回主方向结果（基本原地）
-        if (rightMovedSq > movedSq && rightMovedSq >= leftMovedSq)
-        {
-            m_x = slideRight.x; // 采用右侧滑结果 x
-            m_y = slideRight.y; // 采用右侧滑结果 y
-        }
-        else if (leftMovedSq > movedSq)
-        {
-            m_x = slideLeft.x; // 采用左侧滑结果 x
-            m_y = slideLeft.y; // 采用左侧滑结果 y
-        }
-        else
-        {
-            m_x = moved.x; // 两侧皆堵：落回主方向结果（截停后的位置）
-            m_y = moved.y;
-        }
+        // 本步被挡得很死：立即尝试左右侧滑并择优采用（含持久方向设置）
+        applyImmediateSideSlide(useDX, useDY, moved, movedSq);
     }
     else
     {
-        // 正常推进（含单轴贴墙滑动的常见情形）
+        // 正常推进（含单轴贴墙滑动的常见情形与侧滑混合路径）
         m_x = moved.x; // 采用主方向滑动结果 x
         m_y = moved.y; // 采用主方向滑动结果 y
     }
+
+    // ---- 窗口级评估（每 kStuckWindowSeconds 一次）----
+    if (m_stuckWindowTime >= kStuckWindowSeconds)
+    {
+        // 窗口位移比 = 实际累计 / 期望累计（期望为 0 不会进入本函数，
+        // 仍做防御：无期望按「自由」处理，避免除零）
+        const float ratio = (m_stuckWindowExpected > 0.0f)
+            ? (m_stuckWindowActual / m_stuckWindowExpected)
+            : 1.0f;
+
+        if (ratio < kStuckWindowRatio)
+        {
+            // 持续性卡死（凹角滞留）：重探左右两侧并刷新持久化侧滑方向——
+            // 上一段维持期选的方向走不动时，这里有机会换边
+            refreshSlideSide(stepDX, stepDY);
+        }
+        else if (ratio >= kFreeWindowRatio)
+        {
+            // 移动自由：提前结束侧滑（不需要帮忙绕墙，回归直线追击）
+            m_slideSign = 0;        // 清方向
+            m_slideHoldLeft = 0.0f; // 清维持计时
+        }
+        // 中间地带（0.3 ~ 0.9）：维持既有侧滑状态不动——贴墙爬行中，
+        // 侧滑仍在帮忙；让维持计时自然衰减
+
+        // 窗口清零：下一段重新统计
+        m_stuckWindowTime = 0.0f;     // 计时归零
+        m_stuckWindowExpected = 0.0f; // 期望累计归零
+        m_stuckWindowActual = 0.0f;   // 实际累计归零
+    }
+}
+
+// 侧滑权重：维持期内从 1 缓慢衰减到 kSlideWeightFloor（随时间线性）
+float Monster::slideWeight() const
+{
+    // 归一化剩余维持时间 [0,1]（0 = 恰好到期；越接近 1 说明刚触发）
+    const float t = std::clamp(m_slideHoldLeft / kSlideHoldSeconds, 0.0f, 1.0f);
+    // 权重 = 下限 + (1 - 下限) x t：t=1 时为 1（全力侧滑），
+    // t=0 时为 0.35（仅保留部分绕行倾向），全线线性衰减
+    return kSlideWeightFloor + (1.0f - kSlideWeightFloor) * t;
+}
+
+// 计算左右侧滑的候选结果（从当前位置、以期望位移旋转 ±90° 试走）
+void Monster::sideSlideCandidates(float stepDX, float stepDY,
+                                  SDL_FPoint& rightPoint, float& rightMovedSq,
+                                  SDL_FPoint& leftPoint, float& leftMovedSq) const
+{
+    // 右侧滑（顺时针 90°）：(dx, dy) -> (-dy, dx)
+    rightPoint = m_world->slideMove(m_x, m_y, m_w, m_h, -stepDY, stepDX);
+    // 左侧滑（逆时针 90°）：(dx, dy) -> (dy, -dx)
+    leftPoint = m_world->slideMove(m_x, m_y, m_w, m_h, stepDY, -stepDX);
+
+    // 各自的实际位移平方：评判「哪一侧更能动」的度量
+    const float rightDX = rightPoint.x - m_x; // 右滑实际水平位移
+    const float rightDY = rightPoint.y - m_y; // 右滑实际垂直位移
+    rightMovedSq = rightDX * rightDX + rightDY * rightDY; // 右滑位移平方
+    const float leftDX = leftPoint.x - m_x;   // 左滑实际水平位移
+    const float leftDY = leftPoint.y - m_y;   // 左滑实际垂直位移
+    leftMovedSq = leftDX * leftDX + leftDY * leftDY;      // 左滑位移平方
+}
+
+// 立即应用较优侧滑（单步几乎没动时的即时探测）
+void Monster::applyImmediateSideSlide(float stepDX, float stepDY,
+                                      const SDL_FPoint& mainPoint, float mainMovedSq)
+{
+    // 两侧候选（从当前位置试走，纯查询）
+    SDL_FPoint rightPoint{};   // 右侧滑候选落点
+    float rightMovedSq = 0.0f; // 右侧滑位移平方
+    SDL_FPoint leftPoint{};    // 左侧滑候选落点
+    float leftMovedSq = 0.0f;  // 左侧滑位移平方
+    sideSlideCandidates(stepDX, stepDY, rightPoint, rightMovedSq, leftPoint, leftMovedSq);
+
+    // 选择规则（沿用批二口径）：在「比主方向结果更能动」的候选中取更优者
+    if (rightMovedSq > mainMovedSq && rightMovedSq >= leftMovedSq)
+    {
+        m_x = rightPoint.x; // 采用右侧滑结果 x
+        m_y = rightPoint.y; // 采用右侧滑结果 y
+        m_slideSign = 1;    // 记录持久化侧滑方向：右侧（顺时针）
+        m_slideHoldLeft = kSlideHoldSeconds; // 刷新维持窗口（后续步继续绕）
+        return; // 本步处理完毕
+    }
+    if (leftMovedSq > mainMovedSq)
+    {
+        m_x = leftPoint.x; // 采用左侧滑结果 x
+        m_y = leftPoint.y; // 采用左侧滑结果 y
+        m_slideSign = -1;  // 记录持久化侧滑方向：左侧（逆时针）
+        m_slideHoldLeft = kSlideHoldSeconds; // 刷新维持窗口
+        return; // 本步处理完毕
+    }
+
+    // 两侧都不如主方向结果（深凹角死角）：落回主方向结果（基本原地），
+    // 但把侧滑方向设为「默认/既有」并刷新维持期——维持期内混合垂直
+    // 分量持续尝试，等缺口出现时立即滑出（凹角滞留的软化）
+    m_x = mainPoint.x; // 落回主结果 x（截停后的位置）
+    m_y = mainPoint.y; // 落回主结果 y
+    if (m_slideSign == 0)
+    {
+        m_slideSign = 1; // 无既有方向：默认取右侧（确定性，便于观察与复现）
+    }
+    m_slideHoldLeft = kSlideHoldSeconds; // 刷新维持窗口
+}
+
+// 窗口级重探（持续性卡死时调用）：重新选定持久化侧滑方向并刷新维持窗口
+void Monster::refreshSlideSide(float stepDX, float stepDY)
+{
+    // 两侧候选（纯查询；本步位置已由主流程落定，这里只更新方向）
+    SDL_FPoint rightPoint{};   // 右侧滑候选落点
+    float rightMovedSq = 0.0f; // 右侧滑位移平方
+    SDL_FPoint leftPoint{};    // 左侧滑候选落点
+    float leftMovedSq = 0.0f;  // 左侧滑位移平方
+    sideSlideCandidates(stepDX, stepDY, rightPoint, rightMovedSq, leftPoint, leftMovedSq);
+
+    // 侧滑可忽略判据（像素²）：两侧位移都小于它 = 全堵死（凹角底部）
+    constexpr float kNegligibleSq = 0.25f; // (0.5px)²——半个像素内视为没动
+
+    if (rightMovedSq <= kNegligibleSq && leftMovedSq <= kNegligibleSq)
+    {
+        // 全堵死：翻转既有方向再试一段（换边探索）；无方向时取右侧
+        m_slideSign = (m_slideSign == 0) ? 1 : -m_slideSign;
+    }
+    else
+    {
+        // 有一侧能走：取更能动的一侧（重新判定，可能与上一段不同）
+        m_slideSign = (rightMovedSq >= leftMovedSq) ? 1 : -1;
+    }
+    m_slideHoldLeft = kSlideHoldSeconds; // 刷新维持窗口（新方向又维持一段）
 }
 
 // 覆写渲染：常规帧 + 受击闪白帧 + 头顶血条（均经相机世界->屏幕换算）

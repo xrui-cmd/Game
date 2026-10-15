@@ -159,14 +159,15 @@ public:
     void spawnAt(float centerX, float centerY);
 
     // 回收：从场上移除本怪物（重开清场/未来清屏技使用），槽位可被再次
-    // spawnAt 复用。清掉追踪目标、闪白状态与 AI 运行时——
-    // 复用前的残留数据（追踪目标/状态机）全部归零
+    // spawnAt 复用。清掉追踪目标、闪白状态与 AI/侧滑运行时——
+    // 复用前的残留数据（追踪目标/状态机/卡死检测窗口）全部归零
     void despawn()
     {
         m_alive = false;     // 未激活：不再更新/渲染/碰撞
         m_hasTarget = false; // 清追踪目标：下次激活等场景重新注入
         m_flashLeft = 0.0f;  // 清闪白：新生成的怪物不带受击光效
         m_ai.clear();        // AI 状态回巡逻（巢保留——下次 spawnAt 会重写）
+        clearMotionState();  // 清持久化侧滑与卡死检测窗口
     }
 
     // 被撞开/被击退：沿「(fromX, fromY) -> 怪物中心」的方向（即远离伤害
@@ -205,11 +206,26 @@ private:
     // 上限内找不到就退化为「回巢心」（巢必可走——出生校验保证），不死循环
     static constexpr int kPatrolTargetAttempts = 8;
 
-    // 卡住检测阈值（实际位移² / 期望位移² 的比值）：低于它视为「几乎没动」
-    //（正面撞墙时两轴都被挡 ≈ 0；斜向贴墙有一轴在滑动 ≈ 0.5，不算卡住），
-    // 触发一次轻量侧滑尝试（见 moveWithCollision）——密度取 0.25 让两类
-    // 情形的判别留有充分余量
+    // ---- 绕墙轻量改进（批三）：卡死检测与持久化侧滑 ----
+
+    // 卡死检测阈值（单步，实际位移² / 期望位移² 的比值）：低于它视为
+    // 「几乎没动」（正面撞墙时两轴都被挡 ≈ 0；斜向贴墙有一轴在滑动
+    // ≈ 0.5，不算卡住），触发一次即时侧滑探测（见 moveWithCollision）
     static constexpr float kStuckMoveRatioSquared = 0.25f;
+
+    // 卡死检测窗口（秒）与窗口判据（实际/期望 位移比）：
+    // 窗口内比值低于 kStuckWindowRatio = 持续性卡死（凹角滞留），
+    // 重新探测并刷新侧滑方向；不低于 kFreeWindowRatio = 移动自由，
+    // 提前结束侧滑（不需要帮忙绕墙）
+    static constexpr float kStuckWindowSeconds = 0.5f; // 检测窗口时长（秒）
+    static constexpr float kStuckWindowRatio = 0.3f;   // 持续性卡死判据
+    static constexpr float kFreeWindowRatio = 0.9f;    // 移动自由判据
+
+    // 持久化侧滑：选定侧滑方向后维持的时长（秒）与权重衰减下限——
+    // 维持期内主方向与垂直方向按权重混合（权重从 1 缓慢衰减到下限），
+    // 「一段时间内坚持从同一侧绕」比每步独立掷骰子更容易走出凹角
+    static constexpr float kSlideHoldSeconds = 1.2f;  // 侧滑方向维持时长（秒）
+    static constexpr float kSlideWeightFloor = 0.35f; // 衰减下限（维持期末尾）
 
     // ---- 头顶血条（批三）：受伤后显示 ----
     static constexpr float kHpBarWidth = 40.0f;  // 血条宽（像素；约 40 与规格一致）
@@ -233,12 +249,50 @@ private:
     // AI 状态机（决策核心；参数/巢/回血百分比都封装在内部，见 MonsterAi）
     MonsterAi m_ai;
 
+    // ---- 持久化侧滑运行时（卡死检测窗口 + 选定方向）----
+    int m_slideSign = 0;          // 侧滑方向：+1 右侧（顺时针）、-1 左侧、0 无
+    float m_slideHoldLeft = 0.0f; // 侧滑维持剩余时长（秒；<=0 表示未激活）
+    float m_stuckWindowTime = 0.0f;     // 卡死检测窗口已累计时长（秒）
+    float m_stuckWindowExpected = 0.0f; // 窗口内期望位移累计（像素）
+    float m_stuckWindowActual = 0.0f;   // 窗口内实际位移累计（像素）
+
     // 世界指针（碰撞查询；monster 不持有所有权）。nullptr = 无墙世界（防御）
     const World* m_world = nullptr;
 
-    // 位移推进（含墙体碰撞 + 撞墙时的轻量侧滑）：本类移动的唯一出口，
-    // 三种状态（巡逻/追击/回巢）共用。行为说明见实现（Monster.cpp）
+    // 清侧滑/卡死检测运行时（despawn 与 spawnAt 复用；落点/状态突变后
+    // 旧窗口数据不再有意义——清零避免把旧怪的卡死统计带进新怪）
+    void clearMotionState()
+    {
+        m_slideSign = 0;          // 无侧滑方向
+        m_slideHoldLeft = 0.0f;   // 无维持计时
+        m_stuckWindowTime = 0.0f;     // 窗口清零
+        m_stuckWindowExpected = 0.0f; // 期望累计清零
+        m_stuckWindowActual = 0.0f;   // 实际累计清零
+    }
+
+    // 位移推进（含墙体碰撞 + 卡死检测 + 持久化侧滑）：本类移动的唯一出口，
+    // 三种状态（巡逻/追击/回巢）共用。行为与参数说明见实现（Monster.cpp）
     void moveWithCollision(float stepDX, float stepDY, float dt);
+
+    // 侧滑权重：维持期内从 1 缓慢衰减到 kSlideWeightFloor（随时间线性）
+    float slideWeight() const;
+
+    // 计算左右侧滑的候选结果（从当前位置、以期望位移旋转 ±90° 试走）：
+    // 输出候选落点与各自的实际位移量平方。纯查询——不改状态；
+    // 即时探测与窗口重探共用（世界未注入时不调用）
+    void sideSlideCandidates(float stepDX, float stepDY,
+                             SDL_FPoint& rightPoint, float& rightMovedSq,
+                             SDL_FPoint& leftPoint, float& leftMovedSq) const;
+
+    // 立即应用较优侧滑（单步几乎没动时的即时探测）：更优侧存在的场合
+    // 直接采用其位置并在其方位上开启/刷新持久化侧滑；两侧都不如主结果
+    //（深凹角）时保留主结果并把方向设为「默认/既有」的一次尝试
+    void applyImmediateSideSlide(float stepDX, float stepDY,
+                                 const SDL_FPoint& mainPoint, float mainMovedSq);
+
+    // 窗口级重探（持续性卡死时调用）：根据左右候选重新选定持久化侧滑
+    // 方向并刷新维持窗口（不移动位置——本步位置已由主流程落定）
+    void refreshSlideSide(float stepDX, float stepDY);
 };
 
 #endif // !__MONSTER_H__
