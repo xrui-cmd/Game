@@ -4,8 +4,8 @@
 #include "engine/Scene.h"       // Scene：场景基类
 #include "engine/AudioSystem.h" // AudioSystem：音效系统（拾取/受击/结束/暂停触发播放）
 #include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字，支持中文）
-#include "game/Player.h"        // Player：玩家实体（移动 + 挥击 + 生命）
-#include "game/Monster.h"       // Monster：追击怪物（对象池）
+#include "game/Player.h"        // Player：玩家实体（移动 + 自动攻击 + 武器挥击表现）
+#include "game/Monster.h"       // Monster：追击怪物（三变体、对象池）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
 #include <list>                 // std::list：经验宝石集合（节点式容器，元素地址稳定）
 #include <vector>               // std::vector：怪物对象池
@@ -15,23 +15,31 @@
 // ============================================================
 //
 // 职责：
-//   1. 资源：onEnter 加载背景图、挥击弧光、玩家/怪物纹理与字体
-//      （背景与弧光可选，失败兜底；实体纹理各自析构兜底）；
-//      析构时释放场景自持的背景与弧光纹理
-//   2. 玩法（本批由 COIN RUSH 重构为战斗骨架）：
-//      - WASD 移动、J 挥击（面朝方向近战：冷却 0.4s、伤害 25、约 64x56 判定）；
-//      - 怪物从窗口四边内侧持续刷新并随时间增强（数量上限初始 4、每 20s +2、
-//        封顶 12；刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s），
-//        追踪玩家、接触伤害 10；
-//      - 怪物 30 点生命：受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
+//   1. 资源：onEnter 加载背景图、玩家/怪物纹理与字体（背景可选，失败兜底；
+//      实体纹理各自析构兜底，玩家的武器素材由 Player 自持）；析构时释放
+//      场景自持的背景纹理
+//   2. 玩法（本批：素材换血 + 自动战斗改版——自动攻击·生存流）：
+//      - WASD 移动（左右移动时水平翻转朝向，静止保持上次朝向）；
+//      - 自动攻击（无需按键）：每个固定步结算一次索敌——对攻击范围
+//        （attack_range，默认 96px，玩家中心与怪物中心的距离）内
+//        「最近的怪物」出手；冷却 attack_cooldown（默认 0.4s）门控，
+//        伤害 attack_damage（默认 25）；本批单目标（多目标扩展留后续）；
+//        无目标不发招（索敌为空则整个结算流程直接结束）；
+//        出手时玩家朝目标方向播放武器挥击表现（0.12s 前探+收回）；
+//      - 怪物三变体等权随机刷新（史莱姆 20/90、哥布林 30/110、骷髅 18/140
+//        ——生命/基础速度，数值常量见 Monster.cpp 变体表），从窗口四边内侧
+//        持续刷新并随时间增强（数量上限初始 4、每 20s +2、封顶 12；
+//        刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s）；
+//        共同追踪玩家、接触伤害 10；
+//      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
 //      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开；拾取宝石累积经验
 //        （升级系统留待下一批）；生命归零 -> GameOver；
 //      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键）。
 //   3. 音效：拾取播 coin、被撞播 hit、生命归零播 gameover、
 //      ESC 暂停/恢复播 pause（经 onEnter 注入的 AudioSystem；降级环境安全空操作）
-//   4. 配置：onEnter 时读取玩家速度/生命/攻击参数与怪物速度曲线/刷新参数/
-//      生命/伤害；缺键/坏值自动回退内置默认值
-//   5. 渲染：背景 -> 玩家 -> 怪物 -> 挥击弧光 -> 经验宝石 -> 生存 HUD
+//   4. 配置：onEnter 时读取玩家速度/生命/自动攻击参数与怪物速度成长/刷新参数/
+//      接触伤害；缺键/坏值自动回退内置默认值
+//   5. 渲染：背景 -> 玩家（含挥剑表现）-> 怪物 -> 经验宝石 -> 生存 HUD
 //      （左上：HP 血条+文字；其下：击杀/存活/经验；左下角 FPS/帧时间，
 //      F3 切换显隐——调试开关维持事件式）
 //
@@ -73,7 +81,8 @@ public:
     // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移
     void update(const UpdateContext& ctx) override;
 
-    // 每帧渲染：清屏、背景、实体、挥击弧光、HUD。alpha 是插值系数，原样转发给实体
+    // 每帧渲染：清屏、背景、玩家（含挥剑表现）、怪物、宝石、HUD。
+    // alpha 是插值系数，原样转发给实体
     void render(float alpha) override;
 
 private:
@@ -87,9 +96,10 @@ private:
     // 保证每次按下恰好触发一次（行为与事件式完全一致）
     void handleInputEdges(const UpdateContext& ctx);
 
-    // 结算一次挥击：对判定矩形内的每只存活怪物逐只结算（扣血/死亡/掉宝）。
-    // 挥击是「单次判定」而非持续伤害——每只怪物每次挥击至多结算一次
-    void resolveAttack(const SDL_FRect& playerRect);
+    // 自动攻击结算（每个固定步调用一次）：索敌 -> 出手 -> 单体命中结算。
+    // 「场景选目标、玩家管出手」：本函数找出攻击范围内最近的怪物后调用
+    // Player::tryAutoAttack；出手成功才扣血/击退/掉宝（每次出手单体命中）
+    void resolveAutoAttack(const SDL_FRect& playerRect);
 
     // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位
     void dropGemAt(float x, float y);
@@ -114,12 +124,11 @@ private:
 private:
     // ---- 配置项缺省值（与 config/game.ini 对应键一致；缺键/坏值回退）----
     static constexpr int kDefaultPlayerHp = 100;                // 玩家生命上限
-    static constexpr int kDefaultAttackDamage = 25;             // 玩家挥击伤害
-    static constexpr float kDefaultMonsterSpeed = 110.0f;       // 怪物基础移动速度（像素/秒）
+    static constexpr int kDefaultAttackDamage = 25;             // 自动攻击伤害（attack_damage，点）
+    static constexpr float kDefaultAttackRange = 96.0f;         // 自动攻击范围（attack_range，像素）
     static constexpr float kDefaultMonsterSpeedGrowth = 2.5f;   // 怪物速度成长（像素/秒²，按局内秒数叠加）
     static constexpr float kDefaultMonsterSpawnInterval = 2.5f; // 刷新间隔初始值（秒）
     static constexpr int kDefaultMonsterMaxCount = 4;           // 数量上限初始值（只）
-    static constexpr int kDefaultMonsterHp = 30;                // 怪物生命值
     static constexpr int kDefaultMonsterDamage = 10;            // 怪物接触伤害
 
     // ---- 玩法常量（代码固定，不进配置；改动须连同注释一起审视）----
@@ -133,7 +142,9 @@ private:
 
     // 怪物速度上限（像素/秒）：不超过玩家默认速度 300，保证玩家永远可以甩开
     // 追兵（「可逃」是难度曲线的设计红线——速度成长不能把玩家逼进死局）。
-    // 默认参数下约 60 秒到达上限，此后维持 260 不再增长
+    // 三变体共用同一条成长曲线：基础速度（史莱姆 90 / 哥布林 110 / 骷髅 140）
+    // 之上每秒 +kDefaultMonsterSpeedGrowth，到达 260 后不再增长
+    // （哥布林默认参数下约 60 秒到顶；骷髅更早、史莱姆稍晚）
     static constexpr float kMonsterMaxSpeed = 260.0f;
 
     // 玩家被撞中后的无敌时长（秒）：期间跳过怪物碰撞检测、渲染每 0.1 秒闪烁。
@@ -147,16 +158,12 @@ private:
     // 配合 0.8s 无敌构成「受击保护窗口」
     static constexpr float kContactKnockbackDistance = 150.0f;
 
-    // 挥击命中的怪物击退距离（像素）：比接触弹开短——保持追击压力，
-    // 让玩家能跟上补刀（击杀需要两次命中）
+    // 自动攻击命中的怪物击退距离（像素）：比接触弹开短——保持追击压力，
+    // 让玩家在冷却窗口内仍有下一击的牵制（多数变体两击内可杀）
     static constexpr float kAttackKnockbackDistance = 60.0f;
 
     // 每颗经验宝石的经验值（代码常量）：升级系统下一批落地，本批只累计与显示
     static constexpr int kGemXpValue = 10;
-
-    // 挥击弧光素材的显示尺寸（像素）：与 scripts/generate_assets 生成的
-    // slash.png 边长一致（96x96），以玩家中心为圆心旋转绘制
-    static constexpr float kSlashSize = 96.0f;
 
     static constexpr float kHudPtSize = 32.0f; // HUD/提示文字字号（像素高，小数需求清晰）
     static constexpr float kBigPtSize = 64.0f; // 暂停/结束标题字号（大号观感）
@@ -180,10 +187,6 @@ private:
     // 露出清屏深蓝色兜底（背景不是游戏必需品，加载失败不阻塞启动）
     SDL_Texture* m_background = nullptr;
 
-    // 挥击弧光纹理（assets/slash.png）：加载失败时为 nullptr，挥击特效跳过，
-    // 命中判定与玩法完全不受影响
-    SDL_Texture* m_slashTexture = nullptr;
-
     // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
     Font m_hudFont; // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
     Font m_bigFont; // 大号标题（暂停 / 游戏结束）
@@ -194,12 +197,11 @@ private:
 
     // ---- 战斗配置（onEnter 读取；R 重开不重读，整局沿用同一套调参）----
     int m_playerMaxHp = kDefaultPlayerHp;                 // 玩家生命上限（player_hp）
-    int m_attackDamage = kDefaultAttackDamage;            // 挥击伤害（player_attack_damage）
-    float m_monsterSpeed = kDefaultMonsterSpeed;          // 怪物基础速度（monster_speed）
+    int m_attackDamage = kDefaultAttackDamage;            // 自动攻击伤害（attack_damage）
+    float m_attackRange = kDefaultAttackRange;            // 自动攻击范围（attack_range，像素）
     float m_monsterSpeedGrowth = kDefaultMonsterSpeedGrowth; // 速度成长（monster_speed_growth）
     float m_monsterSpawnInterval = kDefaultMonsterSpawnInterval; // 刷新间隔初始值（monster_spawn_interval）
     int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）
-    int m_monsterHp = kDefaultMonsterHp;                  // 怪物生命值（monster_hp）
     int m_monsterDamage = kDefaultMonsterDamage;          // 接触伤害（monster_damage）
 
     // ---- 战斗运行时状态（restart 复位）----

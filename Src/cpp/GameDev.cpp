@@ -143,8 +143,8 @@ void GameDev::bindInputActions()
     bindAction("move_left", "bind_move_left", "A", SDL_SCANCODE_A);
     bindAction("move_right", "bind_move_right", "D", SDL_SCANCODE_D);
 
-    // 战斗动作（pressed 边缘：按一次触发一次）
-    bindAction("attack", "bind_attack", "J", SDL_SCANCODE_J);
+    // 说明：攻击动作（bind_attack）已随「自动战斗改版」移除——战斗改为
+    // 自动索敌出手，不再需要玩家按攻击键，绑定表随之瘦身
 
     // 对局控制（pressed 边缘：暂停/重开/回菜单）
     bindAction("pause", "bind_pause", "ESC", SDL_SCANCODE_ESCAPE);
@@ -155,7 +155,7 @@ void GameDev::bindInputActions()
     bindAction("confirm", "bind_confirm", "ENTER", SDL_SCANCODE_RETURN);
 
     // 小键盘回车：确认动作的内置别名（历史行为两个 Enter 都接受；
-    // 它不占配置键位——九个 bind_* 配置保持最小集合，菜单查询时一并检查）
+    // 它不占配置键位——八个 bind_* 配置保持最小集合，菜单查询时一并检查）
     m_input.bind("confirm_kp", SDL_SCANCODE_KP_ENTER);
 }
 

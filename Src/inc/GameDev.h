@@ -88,7 +88,7 @@ private:
 
     Config m_config; // 配置数据：initialize() 加载后只读；生命周期覆盖整个应用
 
-    // 输入系统：语义动作（move_up/attack/pause 等）到物理按键的映射表 + 边沿状态。
+    // 输入系统：语义动作（move_up/pause 等）到物理按键的映射表 + 边沿状态。
     // initialize() 依据 config 的 bind_* 键完成绑定（见 bindInputActions）；
     // run() 每个渲染帧在事件处理之后调用 m_input.update() 采样一次键盘；
     // 上下文装配时以指针注入（UpdateContext::input），场景与实体经动作名

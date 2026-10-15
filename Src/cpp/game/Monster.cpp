@@ -2,19 +2,85 @@
 #include <algorithm> // std::clamp / std::max：移动边界、出生范围与闪白计时的上下界
 #include <cmath>     // std::sqrt：归一化方向与距离计算
 
-// 加载怪物纹理：三级回退流程由基类统一实现，这里只提供本实体的参数
-bool Monster::load(SDL_Renderer* renderer)
+// 本编译单元私有的变体数值表与工具（不对外暴露）
+namespace
 {
-    // loadTextureWithFallback 依次尝试：
-    //   1. assets/enemy_sheet.png 逼近精灵表（2 帧，持续播动画）
-    //   2. assets/enemy.png 单帧精灵（动画退化为静止）
-    //   3. 程序化 32x32 红紫色方块（素材缺失时兜底）
+
+// 变体规格：外观纹理 + 战斗数值。三变体共用同一套追击 AI，
+// 差异只体现在这张表里（换平衡先改这里）
+struct VariantSpec
+{
+    const char* name;       // 变体名（日志展示用）
+    const char* sheetPath;  // 精灵表相对路径（4 帧横向排列，每帧 48x48）
+    const char* singlePath; // 单帧回退相对路径（精灵表缺失时的降级素材）
+    int hp;                 // 出生生命值（点）
+    float baseSpeed;        // 基础追击速度（像素/秒）：难度成长在此之上叠加
+    SDL_Color fallback;     // 程序化回退颜色（两种素材都缺失时的兜底方块色）
+};
+
+// 变体数值表（下标 = MonsterType 枚举值，顺序必须与枚举一致）。
+// 数值为「代码常量、硬编码并注释」——本批定案不走配置文件：
+//   - 史莱姆：慢而脆（生命 20 / 速度 90）
+//   - 哥布林：基准线（生命 30 / 速度 110，与旧单怪时代数值一致）
+//   - 骷髅  ：快而脆（生命 18 / 速度 140，追逐压力来源）
+// 颜色取自各素材的主色系（回退方块与变体观感相近，一眼能认出是哪只）
+constexpr VariantSpec kVariants[] = {
+    // 史莱姆（swampy）：绿色软泥怪，慢吞吞的低压目标
+    { "史莱姆", "assets/monster_slime_sheet.png", "assets/monster_slime.png",
+      20, 90.0f, SDL_Color{124, 200, 74, 255} },
+    // 哥布林（goblin）：基准变体，数值与旧单怪时代一致
+    { "哥布林", "assets/monster_goblin_sheet.png", "assets/monster_goblin.png",
+      30, 110.0f, SDL_Color{74, 142, 64, 255} },
+    // 骷髅（skelet）：白骨骷髅，快而脆
+    { "骷髅", "assets/monster_skelet_sheet.png", "assets/monster_skelet.png",
+      18, 140.0f, SDL_Color{230, 228, 210, 255} },
+};
+
+// 变体枚举 -> 数值表下标（Count 哨兵值不在表内，做一个防御性夹取）
+int variantIndex(MonsterType type)
+{
+    // 枚举值直接作为下标使用；越界（未来加枚举忘加表项）夹到最后一项，
+    // 宁可外观/数值不符也绝不越界读表
+    return std::clamp(static_cast<int>(type), 0, static_cast<int>(MonsterType::Count) - 1);
+}
+
+} // 匿名命名空间结束
+
+// 变体名查询：日志展示用（「怪物出现（第 1 只，骷髅）」这类文案）
+const char* monsterTypeName(MonsterType type)
+{
+    // 查表返回变体名；越界情形由 variantIndex 夹取保护（见上）
+    return kVariants[variantIndex(type)].name;
+}
+
+// 按指定变体加载/重载纹理
+bool Monster::loadVariant(SDL_Renderer* renderer, MonsterType type)
+{
+    // 记录变体类型：baseSpeed()/spawnEdge 的出生生命都从它查表
+    m_type = type;
+
+    // 取出本变体的规格（路径、帧参数外的数值、回退色）
+    const VariantSpec& spec = kVariants[variantIndex(type)];
+
+    // 换皮前先释放旧纹理（重点）：loadTextureWithFallback 每次都会新建纹理
+    // 并覆写 m_texture——不先释放的话，对象池槽位反复换变体时旧纹理的显存
+    // 会持续泄漏。release 幂等，首次加载（m_texture 为空）调用也无害
+    release();
+
+    // 三级回退加载本变体素材：精灵表（4 帧）-> 单帧图 -> 程序化纯色
     return loadTextureWithFallback(renderer,
-                                   "assets/enemy_sheet.png",      // 首选：逼近精灵表相对路径
-                                   "assets/enemy.png",            // 次选：单帧精灵相对路径
-                                   kFrameCount,                   // 精灵表帧数：2 帧
-                                   kDefaultFrameTime,             // 每帧时长：默认 0.2 秒
-                                   SDL_Color{186, 64, 148, 255}); // 回退颜色：不透明红紫色（与素材同色系）
+                                   spec.sheetPath,     // 首选：本变体精灵表相对路径
+                                   spec.singlePath,    // 次选：本变体单帧精灵相对路径
+                                   kFrameCount,        // 精灵表帧数：4 帧
+                                   kDefaultFrameTime,  // 每帧时长：默认 0.2 秒
+                                   spec.fallback);     // 回退颜色：变体主色系方块
+}
+
+// 本变体的基础追击速度（像素/秒）：难度成长在其上叠加（由场景完成）
+float Monster::baseSpeed() const
+{
+    // 查表返回基础速度；越界情形由 variantIndex 夹取保护
+    return kVariants[variantIndex(m_type)].baseSpeed;
 }
 
 // 设置追踪目标：只存目标矩形的中心点——追踪是「朝点直线行进」，
@@ -54,8 +120,8 @@ bool Monster::takeDamage(int amount)
     return false; // 仍有生命：调用方通常接着施加击退
 }
 
-// 生成（边缘刷新）：窗口四边随机一边的内侧落位，激活并写入生命值
-void Monster::spawnEdge(int winW, int winH, const SDL_FRect& avoidRect, int hp)
+// 生成（边缘刷新）：窗口四边随机一边的内侧落位，激活并按变体写入生命值
+void Monster::spawnEdge(int winW, int winH, const SDL_FRect& avoidRect)
 {
     // 玩家矩形中心：出生避让的参照点（与 setTarget 同一取中心算法）
     const float avoidCenterX = avoidRect.x + avoidRect.w * 0.5f;
@@ -115,11 +181,12 @@ void Monster::spawnEdge(int winW, int winH, const SDL_FRect& avoidRect, int hp)
     m_x = std::clamp(m_x, 0.0f, maxX);
     m_y = std::clamp(m_y, 0.0f, maxY);
 
-    // 激活 + 写入战斗数值：生命值由场景按配置注入（monster_hp）
-    m_alive = true;             // 本对象进入战场：更新/渲染/碰撞自此生效
-    m_hp = std::max(hp, 1);     // 至少 1 点：0 血出生会在首帧判定为已死，属配置错误兜底
-    m_flashLeft = 0.0f;         // 新生怪物不带受击光效
-    m_hasTarget = false;        // 追踪目标等场景下个固定步注入
+    // 激活 + 按变体数值表写入战斗数值：出生生命取自当前变体
+    //（stale 防护：至少 1 点——表内数值恒为正，这里的 max 是防未来改表的兜底）
+    m_alive = true;                                            // 本对象进入战场：更新/渲染/碰撞自此生效
+    m_hp = std::max(kVariants[variantIndex(m_type)].hp, 1);    // 出生生命（变体表；0 血出生会在首帧判定为已死）
+    m_flashLeft = 0.0f;                                        // 新生怪物不带受击光效
+    m_hasTarget = false;                                       // 追踪目标等场景下个固定步注入
 
     // 瞬移类操作的插值收尾（重点）：出生是「瞬间换位」，必须把插值快照
     // 对齐到新落点，否则渲染会从上一位置向新落点拉丝（延续既有纪律）
@@ -173,7 +240,7 @@ void Monster::update(const UpdateContext& ctx)
     snapshotPreviousPosition();
 
     // 帧动画无条件推进（基类默认实现的同款语句）：移动与否不影响动画节奏，
-    // 蠕动动画在追踪全程持续播放
+    // 跑动/蠕动动画在追踪全程持续播放
     m_animTime += ctx.deltaTime;
 
     // 受击闪白计时递减并夹到 0：与固定步长同源，暂停时随 update 门控冻结
@@ -204,7 +271,7 @@ void Monster::update(const UpdateContext& ctx)
 
     // 沿归一化方向 x 速度移动（固定步长积分）。与玩家「逐轴独立」不同：
     // 怪物是直线追击，归一化保证任意方向合速度恒等于注入的速度值。
-    // 速度由 PlayScene 按难度曲线注入（基础速度 + 成长 x 局内秒数）
+    // 速度由 PlayScene 按「变体基础速度 + 难度成长」注入
     m_x += (dx / distance) * m_chaseSpeed * ctx.deltaTime; // 水平分量：单位方向 x 速度 x 步长
     m_y += (dy / distance) * m_chaseSpeed * ctx.deltaTime; // 垂直分量：同上（y 轴向下为正）
 
@@ -226,7 +293,8 @@ void Monster::render(SDL_Renderer* renderer, float alpha) const
     }
 
     // 受击闪白 = 用加色混合（ADD）把同一帧再画一遍：像素颜色与自身相加后
-    // 整体提亮，红紫本体被推亮成偏白的高光。
+    // 整体提亮，各变体本体色被推亮成偏白的高光（史莱姆的绿、骷髅的白骨
+    // 都会明显「发光」一下）。
     // 为什么不用颜色调制（SDL_SetTextureColorMod）：乘法调制只能压暗，
     // 无法把本体「提亮成白光」；叠加混合才能做出闪光效果
     SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);

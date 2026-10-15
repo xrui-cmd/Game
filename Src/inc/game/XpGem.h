@@ -19,13 +19,14 @@
 //   - update()：基类默认实现「无条件推进帧动画」恰是宝石需要的持续旋转
 //   - render()：按当前帧从精灵表裁帧绘制（本类无需覆写）
 //
-// 本类自己的规则：
+// 本类自己的规则（本批：素材换血——0x72 金币动画）：
 //   1. 纹理来源（三级回退，逐级降级的细节见基类）：
-//      首选 assets/gem_sheet.png 旋转精灵表（6 帧横向排列），持续播动画；
+//      首选 assets/gem_sheet.png 旋转精灵表（coin_anim 4 帧，每帧 18x21）；
 //      次选 assets/gem.png 单帧静态精灵（动画退化为静止）；
-//      回退为程序化 24x24 青绿色方块（素材缺失时兜底，保证游戏可运行）
-//   2. 动画节奏：6 帧循环、默认每帧 0.12 秒（代码常量沿用旧金币动画节奏，
-//      本批不进配置文件），与渲染帧率解耦
+//      回退为程序化 18x21 金黄色方块（素材缺失时兜底，保证游戏可运行）
+//   2. 动画节奏：4 帧循环、默认每帧 0.18 秒（代码常量，不进配置文件）——
+//      原 6 帧 x 0.12 秒一个整转约 0.72 秒，4 帧时代取 0.18 秒保持
+//      同一整转观感（0.18 x 4 = 0.72 秒）
 //   3. 生命周期：怪物死亡时场景创建并 load -> update 播动画 -> 玩家触碰后
 //      markPicked -> 场景统一清理（cleanup 时析构并释放纹理）
 // ============================================================
@@ -33,14 +34,14 @@
 class XpGem : public Entity
 {
 public:
-    // 默认帧时长：旋转动画每帧 0.12 秒（代码常量，不进配置文件）
-    static constexpr float kDefaultFrameTime = 0.12f; // 默认每帧显示时长（秒）
+    // 默认帧时长：旋转动画每帧 0.18 秒（代码常量；4 帧整转约 0.72 秒）
+    static constexpr float kDefaultFrameTime = 0.18f; // 默认每帧显示时长（秒）
 
-    // 构造：固定宝石尺寸为 24x24（正方形，也是精灵表的单帧尺寸）
+    // 构造：固定宝石尺寸为 18x21（与精灵表的单帧尺寸一致）
     XpGem()
     {
-        m_w = kSize; // 宽 = 单帧宽
-        m_h = kSize; // 高 = 单帧高（正方形宝石）
+        m_w = kWidth;  // 宽 18 像素：金币帧宽 6px x 3 倍放大（见 tools/compose_sprites.ps1）
+        m_h = kHeight; // 高 21 像素：金币帧高 7px x 3 倍放大
     }
 
     // 加载宝石纹理：只声明素材路径、帧参数与回退颜色，
@@ -56,8 +57,9 @@ public:
     bool isPicked() const { return m_picked; }
 
 private:
-    static constexpr float kSize = 24.0f; // 宝石边长（正方形），也是单帧宽高
-    static constexpr int kFrameCount = 6; // 旋转精灵表总帧数（6 帧 x 24px = 144px 宽）
+    static constexpr float kWidth = 18.0f;  // 宝石宽（像素）＝单帧宽
+    static constexpr float kHeight = 21.0f; // 宝石高（像素）＝单帧高
+    static constexpr int kFrameCount = 4;   // 旋转精灵表总帧数（4 帧 x 18px = 72px 宽）
 
     bool m_picked = false; // 是否已被玩家拾取（拾取后等待场景清理）
 };

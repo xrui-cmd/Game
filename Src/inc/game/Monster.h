@@ -4,13 +4,12 @@
 #include "engine/Entity.h" // Entity：实体基类（空间/纹理/帧动画公共能力）
 
 // ============================================================
-// Monster：追击玩家的怪物实体（追踪移动 + 帧动画 + 战斗数值）
+// Monster：追击玩家的怪物实体（三变体：史莱姆 / 哥布林 / 骷髅）
 // ============================================================
 //
-// 名称说明：本类由既有 Enemy 演进更名而来（文件/类同步改名）——「怪物」
-// 比「敌人」更贴近 Roguelike「打怪升级」的语义；职责在原有「追踪移动」
-// 之上扩展为完整战斗实体（生命值/受击/死亡）。纹理素材沿用 enemy_* 名
-// （素材改名留待资源管理器批次，避免本批牵动素材管线）。
+// 本批改造（素材换血 + 自动战斗）：单一「敌人」拆为三种外观+数值变体，
+// 共用同一套追击 AI——变体只影响「外观纹理」与「生命值/基础速度」两组
+// 数值，行为逻辑完全一致。PlayScene 刷新时等权随机选择变体。
 //
 // 继承自 Entity 获得的能力（与 Player/XpGem 共用，不再各自复制）：
 //   - 位置/尺寸数据与 rect()、setPosition()、width()/height() 查询
@@ -18,11 +17,22 @@
 //   - 三级回退纹理加载：精灵表 -> 单帧图 -> 程序化纯色（loadTextureWithFallback）
 //
 // 本类自己的规则：
-//   1. 纹理来源（三级回退，逐级降级的细节见基类）：
-//      首选 assets/enemy_sheet.png 2 帧逼近精灵表（32x32，持续播动画）；
-//      次选 assets/enemy.png 单帧静态精灵（动画退化为静止）；
-//      回退为程序化 32x32 红紫色方块（素材缺失时兜底，保证游戏可运行）
-//   2. 行为（AI 驱动方式——「场景注入、实体执行」）：
+//   1. 变体数值表（本批定案：常量写死并注释，不走配置文件）：
+//        - 史莱姆：生命 20 / 速度 90  —— 慢吞吞的软柿子（最慢，血量居中）
+//        - 哥布林：生命 30 / 速度 110 —— 基准线（与旧单怪时代的数值一致）
+//        - 骷髅  ：生命 18 / 速度 140 —— 快而脆的压力型目标
+//      速度的实际值 = 变体基础速度 + 难度成长 x 局内秒数，封顶 260
+//      （成长与封顶都由 PlayScene 注入，本类只提供 baseSpeed()）
+//   2. 纹理：每个变体一套「精灵表 + 单帧回退」，4 帧 / 每帧 48x48
+//      （16x16 像素 x 3 倍放大）：
+//        monster_slime_sheet.png   史莱姆（原始帧：swampy 软泥怪动画）
+//        monster_goblin_sheet.png  哥布林（原始帧：goblin run）
+//        monster_skelet_sheet.png  骷髅（原始帧：skelet run）
+//      loadVariant() 按需切换变体纹理：对象池槽位复用时先换皮再生成。
+//      换变体前必须先释放旧纹理（本类在加载前调用 release()）——
+//      loadTextureWithFallback 每次都会新建纹理并覆写指针，不先释放
+//      会把旧纹理的显存泄漏掉
+//   3. 行为（AI 驱动方式——「场景注入、实体执行」）：
 //      怪物不持有玩家指针，也不查询全局状态；PlayScene 每个固定步在
 //      update 前调用 setTarget()/setChaseSpeed()，把「本步的追踪目标」
 //      （玩家矩形中心）与「本步速度」注入进来，再调用 update：
@@ -30,34 +40,51 @@
 //          并把左上角 clamp 在视口内（先注入、后更新的顺序让难度曲线
 //          之类的玩法规则完全留在场景层）
 //        - 无目标：仅推进帧动画（防御性分支）
-//   3. 战斗数值（本批新增）：
-//      - 生命值 m_hp：spawnEdge 时由场景注入（monster_hp 配置），受击扣减；
-//      - 受击反馈：闪白 m_flashLeft（约 0.1s，render 叠加一次加色绘制实现）
-//        与击退（knockback，沿背离伤害来源的方向瞬移）；
-//      - 死亡：takeDamage 返回 true 并把对象标记为「未激活」——不再更新/
-//        渲染/参与碰撞，槽位等下一次 spawnEdge 复用（对象池语义）
-//   4. 生成 / 击退 / 回收都是「状态突变类操作」：落点定稿后必须快照
+//   4. 战斗反馈（沿用上一版）：受击闪白（约 0.1s，render 叠加加色绘制）
+//      + 击退（沿背离伤害来源的方向瞬移）；死亡转「未激活」（对象池语义：
+//      不再更新/渲染/碰撞，槽位等下一次 spawnEdge 复用）
+//   5. 生成 / 击退 / 回收都是「状态突变类操作」：落点定稿后必须快照
 //      prev=cur，否则渲染插值会从旧位置拉丝到新位置（延续既有纪律）
-//   5. 动画节奏：2 帧循环、默认每帧 0.2 秒（缓慢蠕动感），由基类
-//      render 的「累计时间 / 帧时长」换算，与渲染帧率解耦
+//   6. 动画节奏：4 帧循环、每帧 0.2 秒（代码常量），由基类 render 的
+//      「累计时间 / 帧时长」换算，与渲染帧率解耦
 // ============================================================
+
+// 怪物变体枚举：等权随机刷新的取值范围（Count 恒为变体数量，用作随机上界）
+enum class MonsterType
+{
+    Slime,  // 史莱姆：生命 20 / 速度 90（慢而拖延）
+    Goblin, // 哥布林：生命 30 / 速度 110（基准线）
+    Skelet, // 骷髅：生命 18 / 速度 140（快而脆）
+    Count   // 变体总数（哨兵值）：SDL_rand(Count) 实现等权随机时的上界
+};
+
+// 变体名（日志展示用，如「怪物出现（第 1 只，骷髅）」）
+const char* monsterTypeName(MonsterType type);
 
 class Monster : public Entity
 {
 public:
-    // 默认帧时长：本阶段怪物动画节奏固定 0.2 秒/帧（代码常量，不进配置文件）
+    // 默认帧时长：怪物动画节奏固定 0.2 秒/帧（代码常量，不进配置文件）
     static constexpr float kDefaultFrameTime = 0.2f; // 默认每帧显示时长（秒）
 
-    // 构造：固定怪物尺寸为 32x32（与精灵表的单帧尺寸一致）
+    // 构造：固定怪物尺寸为 48x48（与精灵表的单帧尺寸一致）
     Monster()
     {
-        m_w = kSize; // 宽 32 像素：逼近精灵表每帧宽 32px
-        m_h = kSize; // 高 32 像素：逼近精灵表每帧高 32px
+        m_w = kSize; // 宽 48 像素：变体帧宽 16px x 3 倍放大（见 tools/compose_sprites.ps1）
+        m_h = kSize; // 高 48 像素：变体帧高 16px x 3 倍放大
     }
 
-    // 加载怪物纹理：只声明素材路径、帧参数与回退颜色，
-    // 三级回退（精灵表 -> 单帧图 -> 程序化纯色）流程全部收敛在基类
-    bool load(SDL_Renderer* renderer);
+    // 按指定变体加载/重载纹理：设置变体类型 -> 释放旧纹理 -> 三级回退加载
+    // 该变体的「精灵表 -> 单帧图 -> 程序化纯色」。对象池槽位复用时由
+    // PlayScene 在 spawnEdge 之前调用（换皮）；重复加载同变体也无害
+    bool loadVariant(SDL_Renderer* renderer, MonsterType type);
+
+    // 当前变体类型（日志/查询用）
+    MonsterType type() const { return m_type; }
+
+    // 本变体的基础追击速度（像素/秒）：PlayScene 在它之上叠加难度成长
+    // （monster_speed_growth x 局内秒数）并封顶，再经 setChaseSpeed 注入
+    float baseSpeed() const;
 
     // 设置本步的追踪目标点（传目标矩形，内部取中心存储）。
     // PlayScene 每个固定步在 update 前调用——「场景注入、实体执行」的分工：
@@ -84,10 +111,10 @@ public:
     bool takeDamage(int amount);
 
     // 生成（边缘刷新）：在窗口四条边的随机一边内侧落位（怪物从屏幕边缘
-    // 走入战场），激活本对象并写入出生生命值 hp。
+    // 走入战场），激活本对象并按变体数值表写入出生生命值。
     // avoidRect（通常为玩家矩形）近旁会重试避让，避免「贴脸刷新」；
     // 瞬移类操作：落点定稿后同步插值快照（防拉丝）
-    void spawnEdge(int winW, int winH, const SDL_FRect& avoidRect, int hp);
+    void spawnEdge(int winW, int winH, const SDL_FRect& avoidRect);
 
     // 回收：从场上移除本怪物（重开清场/未来清屏技使用），槽位可被再次
     // spawnEdge 复用。清掉追踪目标与闪白状态，避免复用前残留旧数据
@@ -113,7 +140,7 @@ public:
     void render(SDL_Renderer* renderer, float alpha) const override;
 
 private:
-    static constexpr float kSize = 32.0f;              // 怪物边长（正方形），也是单帧宽高
+    static constexpr float kSize = 48.0f;              // 怪物边长（正方形），也是单帧宽高
     static constexpr float kMinSpawnDistance = 150.0f; // 出生点距玩家中心的最小距离（像素）
     static constexpr int kSpawnMaxTries = 20;          // 「距玩家足够远」的最大重试次数
     static constexpr float kEdgeInset = 4.0f;          // 边缘刷新点从窗口边向内收的像素（完整可见）
@@ -123,10 +150,12 @@ private:
     // 双重作用：避免目标点附近的来回抖动，也排除归一化除以零的退化情形
     static constexpr float kArriveEpsilon = 1.0f;
 
-    static constexpr int kFrameCount = 2; // 逼近精灵表总帧数（2 帧 x 32px = 64px 宽）
+    static constexpr int kFrameCount = 4; // 每个变体精灵表的总帧数（4 帧 x 48px = 192px 宽）
+
+    MonsterType m_type = MonsterType::Goblin; // 当前变体（默认哥布林；刷新时由场景指定）
 
     bool m_alive = false;     // 是否在场：spawnEdge 置 true，受击致死/回收置 false
-    int m_hp = 0;             // 当前生命值（spawnEdge 时由场景按配置注入）
+    int m_hp = 0;             // 当前生命值（spawnEdge 时按变体数值表写入）
     float m_flashLeft = 0.0f; // 受击闪白剩余时长（秒；>0 时 render 叠加提亮）
 
     bool m_hasTarget = false;  // 本步是否已注入追踪目标（false 时仅播动画）

@@ -4,13 +4,13 @@
 bool XpGem::load(SDL_Renderer* renderer)
 {
     // loadTextureWithFallback 依次尝试：
-    //   1. assets/gem_sheet.png 旋转精灵表（6 帧，持续播动画）
+    //   1. assets/gem_sheet.png 旋转精灵表（4 帧，持续播动画）
     //   2. assets/gem.png 单帧精灵（动画退化为静止）
-    //   3. 程序化 24x24 青绿色方块（素材缺失时兜底）
+    //   3. 程序化 18x21 金黄色方块（素材缺失时兜底）
     return loadTextureWithFallback(renderer,
                                    "assets/gem_sheet.png",        // 首选：旋转精灵表相对路径
                                    "assets/gem.png",              // 次选：单帧精灵相对路径
-                                   kFrameCount,                   // 精灵表帧数：6 帧
-                                   kDefaultFrameTime,             // 每帧时长：默认 0.12 秒
-                                   SDL_Color{64, 224, 208, 255}); // 回退颜色：不透明青绿色（绿松石色系）
+                                   kFrameCount,                   // 精灵表帧数：4 帧
+                                   kDefaultFrameTime,             // 每帧时长：默认 0.18 秒
+                                   SDL_Color{255, 200, 60, 255}); // 回退颜色：不透明金黄色（与金币素材同色系）
 }

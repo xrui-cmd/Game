@@ -138,6 +138,7 @@ void MenuScene::render(float /*alpha*/)
     SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
     m_hintFont.drawCentered(m_renderer, "按 Enter 开始", screenW / 2.0f, screenH * 0.55f);
 
-    // 第三行：操作说明（白色，与上一行同字号）——本批起攻击键 J 正式登场
-    m_hintFont.drawCentered(m_renderer, "WASD 移动 / J 攻击 / ESC 暂停", screenW / 2.0f, screenH * 0.68f);
+    // 第三行：操作说明（白色，与上一行同字号）——本批起战斗为自动攻击：
+    // 无需攻击键，靠近怪物即自动出手（冷却门控见 PlayScene/Player）
+    m_hintFont.drawCentered(m_renderer, "WASD 移动 / 自动攻击 / ESC 暂停", screenW / 2.0f, screenH * 0.68f);
 }

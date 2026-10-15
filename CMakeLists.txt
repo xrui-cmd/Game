@@ -152,7 +152,8 @@ add_custom_command(TARGET GameDev POST_BUILD
 )
 
 # 运行时把 assets/ 素材目录整体复制到 GameDev.exe 所在目录（与上面的 DLL 拷贝并列）。
-# 这样 exe 以 SDL_GetBasePath() 为基准就能就近找到 assets/player.png、assets/coin.png
+# 这样 exe 以 SDL_GetBasePath() 为基准就能就近找到 assets/player_sheet.png、
+# assets/monster_*_sheet.png 等素材（素材由 tools/compose_sprites.ps1 从原始帧组装）
 add_custom_command(TARGET GameDev POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_CURRENT_SOURCE_DIR}/assets"
