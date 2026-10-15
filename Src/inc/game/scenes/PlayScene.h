@@ -12,6 +12,7 @@
 #include "game/FloatingText.h"  // FloatingText：漂浮文字（伤害飘字与升级飘字共用）
 #include "game/LevelupSfx.h"    // LevelupSfx：升级音效（游戏层直读；引擎加 SoundId::LevelUp 前的过渡）
 #include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
+#include <array>                // std::array：本扫程命中记录（按怪物池槽位的定长布尔表）
 #include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
 #include <vector>               // std::vector：怪物对象池
 
@@ -29,11 +30,16 @@
 //        （attack_cooldown，默认 0.4s）连续横扫；单击挥一次；挥空也出招
 //        （播放挥砍表现、不索敌、也不做命中结算）；
 //      - 瞄准：攻击方向 = 玩家中心 -> 鼠标（零向量时回退到玩家面向）；
-//      - 横扫（本批核心）：扇形判定——以瞄准方向为中轴、总张角
-//        attack_arc（默认 120 度）、半径 attack_range（默认 96px），
-//        命中弧内「所有」怪物，各自结算伤害 attack_damage（默认 25，
-//        随升级成长）、闪白、飘字与击退 attack_knockback（默认 30px）；
-//        判定走 AttackArc 纯函数（单测覆盖边界）；
+//      - 横扫（本批核心·刀锋同步命中）：扇形判定——以瞄准方向为中轴、
+//        总张角 attack_arc（默认 120 度）、半径 attack_range（默认 96px）；
+//        伤害不再出手瞬发全弧，而是随刀锋扫过逐帧结算：扫程
+//        attack_swing_time 秒（默认 0.10）内，每个固定步取「上一步刀锋角
+//        -> 本步刀锋角」的角区间，对扇形内、本扫程未命中、且角度落在
+//        区间内的怪物此刻结算伤害 attack_damage（默认 25，随升级成长）、
+//        闪白、飘字与击退 attack_knockback（默认 30px）；多目标按刀锋
+//        先后自然错开（不再同一瞬全结算），怪物移动中进入弧内会被扫到、
+//        已命中不重复。判定与渲染共用 AttackArc.h 的缓出曲线纯函数
+//        （bladeAngleAt / isAngleInSweep 等，单测覆盖边界）；
 //      - 怪物三变体等权随机刷新（史莱姆 20/90、哥布林 30/110、骷髅 18/140
 //        ——生命/基础速度，数值常量见 Monster.cpp 变体表），从窗口四边内侧
 //        持续刷新并随时间增强（数量上限初始 4、每 20s +2、封顶 12；
@@ -54,8 +60,8 @@
 //      降级环境安全空操作）、升级播 levelup（LevelupSfx 游戏层直读，
 //      见该类头文件说明——引擎 SoundId 扩展前的过渡实现）
 //   4. 配置：onEnter 时读取玩家速度/生命/攻击参数（冷却/伤害/半径/张角/
-//      击退）、怪物速度成长/刷新参数/接触伤害、升级曲线
-//      （xp_level_base/xp_level_growth）与每级强化
+//      击退/扫程时长 attack_swing_time）、怪物速度成长/刷新参数/接触伤害、
+//      升级曲线（xp_level_base/xp_level_growth）与每级强化
 //      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
 //      缺键/坏值自动回退内置默认值
 //   5. 渲染：背景 -> 玩家（含横扫表现）-> 怪物 -> 经验宝石 -> 漂浮文字
@@ -115,14 +121,24 @@ private:
     // 保证每次按下恰好触发一次（行为与事件式完全一致）
     void handleInputEdges(const UpdateContext& ctx);
 
-    // 主动攻击结算（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扇形命中」。
+    // 主动攻击入口（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扫程推进」。
     // 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
-    //   1. 左键没按住：本步不结算（主动攻击——不按不挥）；
+    //   1. 左键没按住：本步不尝试出手（主动攻击——不按不挥）；
     //   2. 瞄准方向 = 玩家中心 -> 鼠标（零向量时回退到玩家面向，见实现）；
     //   3. 调 Player::tryAttack 出手（冷却门控在玩家侧；挥空也出招）；
-    //   4. 出手成功才做扇形结算：对每只存活怪物跑 AttackArc 判定，命中者
-    //      各自扣血/飘字/掉落或击退（多目标）
+    //      出手成功：开启新扫程（清命中记录、对齐刀锋起点角）并记出手日志；
+    //   4. 无论本步是否出手，都调用 advanceSwingSweep 推进已开启的扫程
+    //      （出了手的刀必须扫完——表现与判定同生命周期）
     void resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& playerRect);
+
+    // 扫程推进（每个固定步调用）：刀锋同步命中的核心。
+    // 扫程活跃期间，取「上一步刀锋角 -> 本步刀锋角」的扫过区间，对每只
+    // 存活且本扫程未命中的怪物：中心在扇形内（距离/中轴夹角）且角度落在
+    // 本步扫过区间内 -> 此刻结算（伤害/飘字/闪白/击退/死亡掉落）；收尾步
+    // 补扫到终点角并清理命中记录（「挥空」日志也在此刻给出）。
+    // 刀锋角与进度来自 Player 的同一缓存与 AttackArc.h 共享纯函数——
+    // 「画到哪、打到哪」由结构性共享保证
+    void advanceSwingSweep(const SDL_FRect& playerRect);
 
     // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位
     void dropGemAt(float x, float y);
@@ -318,6 +334,12 @@ private:
     float m_monsterElapsed = 0.0f;       // 局内已过秒数（仅 Playing 递增；难度计时基准）
     float m_monsterNextSpawnTime = 0.0f; // 下一只怪物的刷新时刻（局内秒）
     int m_monsterSpawnedTotal = 0;       // 本局累计生成数（日志「第 N 只」/冒烟断言用）
+
+    // ---- 刀锋同步命中运行时（本批新增；restart 复位）----
+    bool m_sweepRunning = false;       // 扫程推进是否进行中（出手置 true、收尾置 false——收尾补段的判据）
+    float m_sweepPrevAngleRad = 0.0f;  // 上一步的刀锋角（弧度）：本步扫过区间的起点；出手时对齐到起点角
+    int m_sweepHitCount = 0;           // 本次扫程累计命中数（收尾判「这一刀是否命中过」——挥空日志依据）
+    std::array<bool, kMonsterPoolSize> m_sweepHit{}; // 本扫程已命中记录（按怪物池槽位；新扫程开始/收尾均清零）
 
     PlayState m_state = PlayState::Playing; // 当前对局状态
 

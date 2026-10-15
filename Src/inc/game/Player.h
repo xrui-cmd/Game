@@ -37,10 +37,14 @@
 //      判定走 AttackArc 纯函数）；冷却时长来自配置 attack_cooldown
 //      （setAttackCooldown 注入）
 //   5. 武器表现（assets/weapon.png 骑士剑，可选增强）：
-//      出手后 kSwingSeconds 秒内，剑以玩家中心为轴心、沿瞄准方向从
-//      −kSweepSpanDegrees/2 扫到 +kSweepSpanDegrees/2（120° 横扫轨迹）；
-//      渲染在 render 覆写内完成。武器素材加载失败只警告：攻击结算照常，
-//      只是没有横扫画面
+//      出手后 attack_swing_time 秒内（默认 0.10），剑以「玩家中心下移
+//      kOrbitPivotOffsetY 像素」为旋转锚点、沿瞄准方向从 −半张角扫到
+//      +半张角（扫角 = 攻击弧 attack_arc）；扫程位置走缓出曲线
+//      （easeOutSwingProgress：快起慢收），与场景的逐帧命中判定共用
+//      AttackArc.h 的纯函数（画到哪、打到哪）。主体剑之后拖 3 道
+//      渐隐残影（角度落后 8°/16°/24°，alpha 0.55/0.30/0.15）。
+//      渲染在 render 覆写内完成。武器素材加载失败只警告：攻击结算
+//      照常，只是没有横扫画面
 // ============================================================
 
 class Player : public Entity
@@ -52,6 +56,7 @@ public:
     static constexpr float kDefaultAccel = 1800.0f;    // 默认加速度（像素/秒²）：0->300 用时约 0.17 秒
     static constexpr float kDefaultFriction = 2400.0f; // 默认摩擦减速度（像素/秒²）：300->0 用时约 0.13 秒
     static constexpr float kDefaultAttackCooldown = 0.4f; // 默认攻击冷却（秒）：两次出手的最小间隔
+    static constexpr float kDefaultSwingTime = 0.10f;     // 默认扫程时长（秒）：刀锋从 −半张角 扫到 +半张角 的总时间
 
     // 构造：固定玩家尺寸为 48x84（与精灵表单帧尺寸一致：16x28 像素 x 3 倍放大）
     Player()
@@ -82,6 +87,20 @@ public:
     // （attack_cooldown，默认 0.4 秒）。负数属于配置错误：忽略并警告，
     // 保留原冷却；0 允许（每个固定步都出手的「无冷却」玩法）
     void setAttackCooldown(float seconds);
+
+    // 设置扫程时长（秒）：PlayScene 在 onEnter 时用配置值注入
+    // （attack_swing_time，默认 0.10 秒）——出手后刀锋扫完全程的总时间，
+    // 也是扫程进度归一化的分母（判定与渲染共用）。非正值属于配置错误：
+    // 忽略并警告（0 时长会让进度归一化失去分母；与冷却的 0「无冷却」
+    // 语义不同——扫程 0 时长没有可表达的表现）
+    void setSwingTime(float seconds);
+
+    // 设置扫角（度）：PlayScene 在 onEnter 时用配置值注入（attack_arc，
+    // 默认 120 度）——刀锋从「瞄准角 − 半张角」扫到「瞄准角 + 半张角」
+    // 的跨度，与场景扇形判定的张角是同一个值（画到哪、打到哪的结构性
+    // 保证）。负值属于配置错误：忽略并警告；0 允许（刀锋原地不扫，
+    // 判定退化为中轴线上的点）
+    void setAttackArc(float degrees);
 
     // 覆写更新：动作查询驱动的渐近加减速移动 + 朝向跟随鼠标 +
     // 攻击计时 + 「移动播跑动帧、静止定格站立帧」的动画切换。
@@ -115,6 +134,16 @@ public:
     // 「判定中轴」与「画面中轴」严格同一。从未出手过时为初始朝向（向右）
     Vec2 swingDirection() const { return Vec2{ m_swingDirX, m_swingDirY }; }
 
+    // 扫程是否进行中：render 画剑/残影、PlayScene 逐帧判定都以它为准
+    // （出手后 m_swingLeft 从满值递减到 0 的整个窗口）
+    bool swingActive() const { return m_swingLeft > 0.0f; }
+
+    // 本次扫程的归一化进度 [0,1]：0 = 刚出手，1 = 扫程结束。
+    // 判定（PlayScene 求相邻两步扫过的角区间）与渲染（画剑朝向）共用
+    // 它换算刀锋角（bladeAngleAt）——两侧因此严格同一条曲线、同一相位；
+    // 不在扫程中时按「已完成」返回 1
+    float swingProgress01() const;
+
 private:
     // 释放武器纹理并置空（析构兜底；幂等）
     void releaseWeapon();
@@ -135,16 +164,25 @@ private:
     // ---- 主动攻击状态（本批改版）----
 
     // 横扫表现的几何常量（与 weapon.png 的尺寸/观感对应；改动需同步观感验收）
-    static constexpr float kSwingSeconds = 0.15f;      // 横扫表现时长（秒）：从 −60° 扫到 +60° 的总时间
-    static constexpr float kSweepSpanDegrees = 120.0f; // 横扫总扫角（度）：相对瞄准方向 −60° -> +60°
-    static constexpr float kWeaponOrbit = 40.0f;       // 武器中心绕玩家中心的旋转半径（像素）
+    static constexpr float kDefaultSweepArcDegrees = 120.0f; // 默认扫角（度）：config attack_arc 的缺省值（与场景扇形张角同值）
+    static constexpr float kWeaponOrbit = 32.0f;       // 武器中心绕旋转锚点的轨道半径（像素）：本批 40 -> 32（支点修正）
+    static constexpr float kOrbitPivotOffsetY = 8.0f;  // 旋转锚点相对玩家中心的垂直偏移（像素，向下为正）：本批新增（支点修正）
     static constexpr float kWeaponWidth = 30.0f;       // 武器绘制宽（像素）：与 weapon.png 尺寸一致
     static constexpr float kWeaponHeight = 87.0f;      // 武器绘制高（像素）：与 weapon.png 尺寸一致
     static constexpr float kDirectionEpsilon = 0.001f; // 方向归一化的退化阈值（长度小于它保留旧方向）
     static constexpr float kFlipDeadZone = 4.0f;       // 朝向跟随鼠标的死区（像素）：横向差小于它时保持朝向
 
+    // 残影轨迹参数（本批新增）：主体剑之后拖 3 道渐隐剑影，角度依次
+    // 落后于当前刀锋——读作「刚才扫过的几个位置」；绘制在主体剑之下、
+    // alpha 从近到远递减。索引 0 对应最靠近主体的一道
+    static constexpr int kTrailCount = 3;                                 // 残影数量（道）
+    static constexpr float kTrailLagDegrees[3] = { 8.0f, 16.0f, 24.0f };  // 各道残影相对当前刀锋的角度落后量（度）
+    static constexpr float kTrailAlphas[3] = { 0.55f, 0.30f, 0.15f };     // 各道残影的透明度（近 -> 远，越远越淡）
+
     float m_attackCooldown = kDefaultAttackCooldown; // 攻击冷却总时长（秒）：onEnter 时由配置覆盖
     float m_attackCooldownLeft = 0.0f; // 冷却剩余（秒）：>0 时 tryAttack 返回 false
+    float m_swingSeconds = kDefaultSwingTime;   // 扫程总时长（秒）：onEnter 时由配置覆盖（attack_swing_time）
+    float m_sweepArcDegrees = kDefaultSweepArcDegrees; // 扫角（度）：onEnter 时由配置覆盖（attack_arc）
     float m_swingLeft = 0.0f;          // 横扫表现剩余时长（秒）：>0 时 render 绘制挥砍画面
     float m_swingDirX = 1.0f;          // 本次挥砍朝向 x 分量（单位向量，朝鼠标；初始向右）
     float m_swingDirY = 0.0f;          // 本次挥砍朝向 y 分量（同上）

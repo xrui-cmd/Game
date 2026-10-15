@@ -1,4 +1,5 @@
 #include "game/Player.h"
+#include "game/AttackArc.h" // bladeAngleAt：刀锋角共享曲线（判定与渲染同款）；缓出注释见该文件
 #include "engine/Input.h" // Input：经 ctx.input 查询移动动作的接口定义
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载武器素材（可选增强）
 #include <algorithm>      // std::min / std::max / std::clamp：速度逼近与边界
@@ -136,6 +137,36 @@ void Player::setAttackCooldown(float seconds)
     m_attackCooldown = seconds; // 覆盖冷却总时长：其后的出手（tryAttack）使用新值
 }
 
+// 设置扫程时长：配置驱动入口（对应 attack_swing_time）
+void Player::setSwingTime(float seconds)
+{
+    // 非正时长（含 0）属于配置错误：0 会让扫程进度归一化（swingProgress01）
+    // 失去分母、负数则让表现窗口永不成立。忽略并警告，保留原时长继续游戏
+    if (!(seconds > 0.0f))
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "玩家扫程时长必须为正数（收到 %f），忽略该配置", seconds);
+        return;
+    }
+
+    m_swingSeconds = seconds; // 覆盖扫程总时长：其后的出手与进度换算使用新值
+}
+
+// 设置扫角：配置驱动入口（对应 attack_arc，与场景扇形判定的张角同值）
+void Player::setAttackArc(float degrees)
+{
+    // 负扫角会让刀锋反向扫（起点在终点之后），没有玩法语义：忽略并警告；
+    // 0 允许（刀锋不扫，判定退化为中轴线上的点——显式配置的语义）
+    if (degrees < 0.0f)
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "玩家扫角不能为负数（收到 %f），忽略该配置", degrees);
+        return;
+    }
+
+    m_sweepArcDegrees = degrees; // 覆盖扫角：其后的渲染与刀锋角计算使用新值
+}
+
 // 覆写更新：渐近加减速移动 + 朝向跟随鼠标 + 攻击计时与横扫表现推进 + 动画切换。
 // 速度模型：目标速度 = 输入方向 x m_speed；当前速度以 accel（有输入）/
 // friction（无输入）逐轴逼近；位移 = 速度 x 固定步长（与帧率解耦）
@@ -258,51 +289,83 @@ void Player::update(const UpdateContext& ctx)
 }
 
 // 覆写渲染：本体（含翻转/插值/帧区间）之后叠加横扫表现
+//（主体剑 + 3 道渐隐残影；扫程位置走共享缓出曲线，与判定同一相位）
 void Player::render(SDL_Renderer* renderer, float alpha) const
 {
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
     Entity::render(renderer, alpha);
 
     // 只有「横扫表现期内」且武器纹理已加载时才画剑；其余时刻直接结束
+    //（早退不触碰纹理 alpha 状态——上一帧的绘制末尾已恢复 255）
     if (m_swingLeft <= 0.0f || m_weaponTexture == nullptr)
     {
         return;
     }
 
-    // 横扫进度 t：0（出手瞬间）-> 1（表现结束）
-    const float t = 1.0f - m_swingLeft / kSwingSeconds; // 归一化进度 [0,1]
+    // 横扫进度 [0,1]：0（出手瞬间）-> 1（表现结束）。判定侧（PlayScene）
+    // 每个固定步查询同一个值——两侧由此共用这一条缓出曲线
+    const float progress = swingProgress01();
 
     // 本次挥砍的瞄准角（弧度）：由挥砍方向单位向量换算（atan2 在
     // 屏幕坐标系下顺时针为正，与扫角的方向一致）
     constexpr float kRadiansToDegrees = 57.29577951308232f; // 弧度 -> 度（180/π 数值）
     const float aimAngleRad = std::atan2(m_swingDirY, m_swingDirX);
 
-    // 本帧扫到角 = 瞄准角 + (t - 0.5) x 总扫角：t=0 时瞄准角 −60°、
-    // t=0.5 时恰好压在中轴、t=1 时瞄准角 +60°——一条线性曲线表达
-    // 「约 0.15 秒扫过 120°」的横扫轨迹
-    const float halfSpanRad = kSweepSpanDegrees * 0.5f / kRadiansToDegrees; // 半扫角（弧度）
-    const float sweepAngleRad = aimAngleRad + (t - 0.5f) * (2.0f * halfSpanRad); // 本帧扫到角
+    // 本帧刀锋角与扫程起点角：共享曲线（AttackArc.h 的 bladeAngleAt）——
+    // 判定侧用同一函数取相邻两步的角求「本步扫过区间」，画到哪、打到哪
+    const float bladeAngleRad = bladeAngleAt(aimAngleRad, progress, m_sweepArcDegrees);
+    const float startAngleRad = bladeAngleAt(aimAngleRad, 0.0f, m_sweepArcDegrees);
 
-    // 挂点：玩家插值中心（与本体同一平滑位置，快速移动时武器不脱节）
-    const SDL_FPoint center = interpolatedCenter(alpha);
+    // 旋转锚点：玩家插值中心下移 kOrbitPivotOffsetY（支点修正）——
+    // 剑绕「略低于身体中心」的点扫过，观感上更接近手持剑的挥动支点；
+    // 插值中心与本体共用同一条平滑公式，快速移动时武器不脱节
+    SDL_FPoint pivot = interpolatedCenter(alpha); // 玩家插值中心（本体的绘制锚点）
+    pivot.y += kOrbitPivotOffsetY;                // 下移到旋转锚点
 
-    // 武器中心 = 玩家中心 + 扫角方向 x 旋转半径（剑身绕身体扫过）
-    const float weaponX = center.x + std::cos(sweepAngleRad) * kWeaponOrbit; // 武器中心 x
-    const float weaponY = center.y + std::sin(sweepAngleRad) * kWeaponOrbit; // 武器中心 y
+    // 单道剑的绘制（主体与残影共用）：给定刀锋角与透明度，把武器中心
+    // 摆在「锚点 + 刀锋方向 x 轨道半径」处、绕矩形自身中心旋转绘制
+    const auto drawBlade = [&](float angleRad, int alphaByte)
+    {
+        // 武器中心 = 旋转锚点 + 刀锋方向 x 轨道半径（剑身绕锚点扫过）
+        const float weaponX = pivot.x + std::cos(angleRad) * kWeaponOrbit; // 武器中心 x
+        const float weaponY = pivot.y + std::sin(angleRad) * kWeaponOrbit; // 武器中心 y
 
-    // 目标矩形：把武器中心作为矩形中心摆放（宽高 = 素材绘制尺寸常量）
-    const SDL_FRect dst{ weaponX - kWeaponWidth * 0.5f,  // 左上角 x = 中心 - 半宽
-                         weaponY - kWeaponHeight * 0.5f, // 左上角 y = 中心 - 半高
-                         kWeaponWidth,                    // 绘制宽（像素）
-                         kWeaponHeight };                 // 绘制高（像素）
+        // 目标矩形：把武器中心作为矩形中心摆放（宽高 = 素材绘制尺寸常量）
+        const SDL_FRect dst{ weaponX - kWeaponWidth * 0.5f,  // 左上角 x = 中心 - 半宽
+                             weaponY - kWeaponHeight * 0.5f, // 左上角 y = 中心 - 半高
+                             kWeaponWidth,                    // 绘制宽（像素）
+                             kWeaponHeight };                 // 绘制高（像素）
 
-    // 旋转角度 = 本帧扫到角 + 90 度：素材剑尖朝上（基准姿态），旋转
-    // 90 度后剑尖指向扫角方向（屏幕坐标系、顺时针为正）
-    const double angle = sweepAngleRad * kRadiansToDegrees + 90.0;
+        // 旋转角度 = 刀锋角 + 90 度：素材剑尖朝上（基准姿态），旋转
+        // 90 度后剑尖指向刀锋方向（屏幕坐标系、顺时针为正）
+        const double angle = angleRad * kRadiansToDegrees + 90.0;
 
-    // 旋转绘制：center 传 nullptr = 绕目标矩形自身中心旋转（武器中心即挂点）
-    SDL_RenderTextureRotated(renderer, m_weaponTexture, nullptr, &dst,
-                             angle, nullptr, SDL_FLIP_NONE);
+        // 透明度调制：残影半透明、主体 255 全不透明（纹理级状态，
+        // 每道绘制前显式设置——不同剑道之间互不串扰）
+        SDL_SetTextureAlphaMod(m_weaponTexture, static_cast<Uint8>(alphaByte));
+
+        // 旋转绘制：center 传 nullptr = 绕目标矩形自身中心旋转（武器中心即挂点）
+        SDL_RenderTextureRotated(renderer, m_weaponTexture, nullptr, &dst,
+                                 angle, nullptr, SDL_FLIP_NONE);
+    };
+
+    // 残影轨迹：从最旧（落后 24°）到最近（落后 8°）逐道绘制在主体之下。
+    // 残影角 = 当前刀锋角 − 落后量，并夹在「扫程起点 -> 当前刀锋」区间内：
+    // 扫程刚开始时刀锋尚未扫过 24°，残影不会出现在未扫过的区域上；
+    // 每道的透明度由常量表给出（越远越淡），形成渐隐拖尾
+    for (int i = kTrailCount - 1; i >= 0; --i)
+    {
+        // 本道残影的落后量（度 -> 弧度）
+        const float lagRad = kTrailLagDegrees[i] * kAttackArcDegreesToRadians;
+        // 残影角：不早于起点、不晚于当前刀锋（clamp 保证只画已扫过区间）
+        const float trailAngleRad = std::max(bladeAngleRad - lagRad, startAngleRad);
+        // 绘制本道残影：透明度查表（0.55/0.30/0.15 换算成 0~255 字节）
+        drawBlade(trailAngleRad, static_cast<int>(kTrailAlphas[i] * 255.0f + 0.5f));
+    }
+
+    // 主体剑最后绘制（压在所有残影之上）：alpha 恢复 255 全不透明，
+    // 纹理级状态回到中性——下一帧无论画不画剑都不受影响
+    drawBlade(bladeAngleRad, 255);
 }
 
 // 重开归位：委托基类的 setPosition 瞬间覆盖坐标（不经过速度/时间累积），
@@ -352,9 +415,24 @@ bool Player::tryAttack(float aimDirX, float aimDirY)
     // 出手：重置冷却门 + 启动横扫表现计时（render 据此绘制挥砍画面）。
     // 不索敌：出手与场上有没有怪物无关——挥空也出招、也消耗冷却
     m_attackCooldownLeft = m_attackCooldown; // 冷却开始走：届时的后续出手被它门控
-    m_swingLeft = kSwingSeconds;             // 横扫表现从满时长开始（−60° -> +60°）
+    m_swingLeft = m_swingSeconds;            // 横扫表现从满时长开始（−半张角 -> +半张角）
 
-    return true; // 通知场景：本次出手成功，可做扇形命中结算（可命中 0 只）
+    return true; // 通知场景：本次出手成功（其逐帧扫程判定以 swingActive 为准）
+}
+
+// 本次扫程的归一化进度 [0,1]（判定与渲染共用的相位；见头文件契约）
+float Player::swingProgress01() const
+{
+    // 不在扫程中（含剩余归零的收尾步）：按「已完成」返回 1
+    if (!(m_swingLeft > 0.0f))
+    {
+        return 1.0f;
+    }
+
+    // 进度 = 1 - 剩余/总时长。setSwingTime 保证总时长为正；
+    // 逐帧递减的浮点误差用 clamp 收进 [0,1]，保证是合法进度
+    const float progress = 1.0f - m_swingLeft / m_swingSeconds; // 未夹取的原始进度
+    return std::clamp(progress, 0.0f, 1.0f); // 夹取：0=刚出手、1=扫程结束
 }
 
 // 插值后的玩家中心点（渲染坐标）：横扫表现挂点

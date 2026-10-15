@@ -64,6 +64,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      player_anim_interval    玩家行走动画每帧时长（秒）
     //      player_hp               玩家生命上限
     //      attack_cooldown         攻击冷却（秒）——左键按住时的横扫节奏
+    //      attack_swing_time       横扫表现时长（秒）——刀锋扫完全程的总时间
     //      attack_damage           横扫伤害（点，弧内每只各扣）
     //      attack_range            横扫半径（像素）
     //      attack_arc              横扫总张角（度）
@@ -84,6 +85,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         config.getFloat("player_anim_interval", Player::kDefaultFrameTime);
     const float attackCooldown =
         config.getFloat("attack_cooldown", Player::kDefaultAttackCooldown);
+    const float attackSwingTime =
+        config.getFloat("attack_swing_time", Player::kDefaultSwingTime);
     m_attackRange = config.getFloat("attack_range", kDefaultAttackRange);
     // 张角与击退距离做下限夹取（负张角/负距离没有玩法语义，同 levelup_* 的
     // 防御写法）；张角上界交由 AttackArc 归一化（超整圆按整圆处理）
@@ -166,14 +169,18 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
-    // 8) 注入玩家配置：速度、加减速、行走动画节奏与攻击冷却。
+    // 8) 注入玩家配置：速度、加减速、行走动画节奏与攻击冷却/扫程。
     //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
     //    配置值晚一步落定才能覆盖它（各 set 对非法值会忽略并警告）。
-    //    速度注入的是「当前值」字段（= 基准起步；升级成长改的也是它）
+    //    速度注入的是「当前值」字段（= 基准起步；升级成长改的也是它）。
+    //    扫角注入的是 attack_arc——与扇形判定张角同值，判定与渲染因此
+    //    同一条刀锋曲线（画到哪、打到哪）
     m_player.setSpeed(m_playerSpeed);
     m_player.setMotion(playerAccel, playerFriction);
     m_player.setFrameTime(playerAnimInterval);
     m_player.setAttackCooldown(attackCooldown);
+    m_player.setSwingTime(attackSwingTime);
+    m_player.setAttackArc(m_attackArc);
 
     // 9) 查询窗口实际尺寸并缓存：刷新出生和后续边界计算都基于它
     SDL_GetWindowSize(m_window, &m_width, &m_height);
@@ -490,105 +497,163 @@ void PlayScene::update(const UpdateContext& ctx)
     }
 }
 
-// 主动攻击结算（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扇形命中」。
-// 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
-//   1. 左键没按住：本步不结算（主动攻击——不按不挥）；
-//   2. 瞄准方向 = 玩家中心 -> 鼠标；零向量（鼠标压在玩家中心）时回退到
-//      玩家当前面向（左/右），保证方向可预期、不出 NaN；
-//   3. Player::tryAttack 出手（冷却门控在玩家侧；挥空也出招）；
-//   4. 出手成功才做扇形结算：对每只存活怪物跑 AttackArc 判定，命中者
-//      各自扣血/飘字/掉落或微击退（本批核心的「横扫多目标」）
+// 主动攻击入口（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扫程推进」。
+// 分工：本函数只处理「要不要出手、朝哪出手」；命中结算在 advanceSwingSweep
+//（刀锋逐帧扫过判定）。注意：未出手时也要调用 advanceSwingSweep——已出的
+// 刀必须扫完（表现与判定同生命周期，松开左键也不例外）
 void PlayScene::resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& playerRect)
 {
-    // 无输入系统（旧调用方）：既没有鼠标位置也没有攻击动作，本步不结算
+    // 无输入系统（旧调用方）：既没有鼠标位置也没有攻击动作，本步不处理
     if (ctx.input == nullptr)
     {
         return;
     }
 
-    // 主动攻击门控：左键没按住就不出手——「不按不挥」是本批与自动攻击的
-    // 根本区别。held 同时覆盖「单击挥一次」（按住的那一个固定步）与
-    // 「按住连扫」（节奏由 Player 的冷却门控制）
-    if (!ctx.input->held("attack"))
+    // 主动攻击门控：左键没按住就不尝试出手——「不按不挥」是本批与自动
+    // 攻击的根本区别。held 同时覆盖「单击挥一次」（按住的那一个固定步）
+    // 与「按住连扫」（节奏由 Player 的冷却门控制）
+    if (ctx.input->held("attack"))
     {
-        return;
-    }
+        // 玩家中心：瞄准向量的起点（扇形判定的圆心在扫程推进内按步取）
+        const float centerX = playerRect.x + playerRect.w * 0.5f; // 中心 x
+        const float centerY = playerRect.y + playerRect.h * 0.5f; // 中心 y
 
-    // 玩家中心：瞄准向量的起点，也是扇形判定的圆心
-    const float centerX = playerRect.x + playerRect.w * 0.5f; // 中心 x = 左上角 + 半宽
-    const float centerY = playerRect.y + playerRect.h * 0.5f; // 中心 y = 左上角 + 半高
+        // 瞄准向量 = 玩家中心 -> 鼠标位置（鼠标为窗口客户区坐标，与游戏
+        // 世界同一坐标系；ctx.input 的位置是「本渲染帧的采样快照」）
+        const Vec2 mouse = ctx.input->mousePosition();
+        float aimX = mouse.x - centerX; // 水平分量（正右负左）
+        float aimY = mouse.y - centerY; // 垂直分量（正下负上）
 
-    // 瞄准向量 = 玩家中心 -> 鼠标位置（鼠标为窗口客户区坐标，与游戏世界
-    // 同一坐标系；ctx.input 的位置是「本渲染帧的采样快照」，整帧共享）
-    const Vec2 mouse = ctx.input->mousePosition();
-    float aimX = mouse.x - centerX; // 水平分量（正右负左）
-    float aimY = mouse.y - centerY; // 垂直分量（正下负上）
-
-    // 零向量防御（鼠标恰好压在玩家中心）：没有方向可言，回退到玩家当前
-    // 面向（右为 +1、左为 -1），保证横扫方向可预期且不产生 NaN
-    if (aimX * aimX + aimY * aimY < kAimEpsilonSquared)
-    {
-        aimX = m_player.flipped() ? -1.0f : 1.0f; // 面向左侧/右侧
-        aimY = 0.0f;                              // 水平方向
-    }
-
-    // 出手尝试：冷却未到返回 false（不结算）；「按住 + 冷却就绪」才走到
-    // 下面的扇形结算——有没有怪物不在这次判断里（挥空也出招）
-    if (!m_player.tryAttack(aimX, aimY))
-    {
-        return;
-    }
-
-    // 判定中轴取「表现所用的同一方向」（归一化单位向量）：tryAttack 内已
-    // 归一化并保存，判定与画面因此严格同轴，不会因两次计算产生偏差
-    const Vec2 swingDir = m_player.swingDirection();
-
-    // 弧内判定参数：圆心 = 玩家中心；半径 = attack_range、总张角 =
-    // attack_arc（纯函数见 game/AttackArc.h，边界行为有单测覆盖）
-    const Vec2 attackOrigin{ centerX, centerY };
-
-    // 命中统计：全弧扫完统一报告（挥空也记日志——「挥空也出招」的证据点）
-    int hitCount = 0;
-
-    // 逐只扫描存活怪物：命中弧内「所有」目标（本批多目标语义——不再是
-    // 旧版的最近单体；每只独立结算，互不影响）
-    for (Monster& monster : m_monsters)
-    {
-        if (!monster.isAlive())
+        // 零向量防御（鼠标恰好压在玩家中心）：没有方向可言，回退到玩家
+        // 当前面向（右为 +1、左为 -1），保证横扫方向可预期且不产生 NaN
+        if (aimX * aimX + aimY * aimY < kAimEpsilonSquared)
         {
-            continue; // 空槽位跳过
+            aimX = m_player.flipped() ? -1.0f : 1.0f; // 面向左侧/右侧
+            aimY = 0.0f;                              // 水平方向
         }
 
-        // 怪物矩形只取一次：本只的中心点与后续掉落位置共用同一份快照
+        // 出手尝试：冷却未到返回 false（本步不出手；上一刀的扫程推进
+        // 照常在下半段处理——它有自己的生命周期）
+        if (m_player.tryAttack(aimX, aimY))
+        {
+            // ---- 新扫程开始：场景侧状态全部对齐到「刀锋起点」----
+            m_sweepRunning = true;  // 收尾补段与清理的判据：扫程从现在开始
+            m_sweepHitCount = 0;    // 本次扫程命中计数清零
+            m_sweepHit.fill(false); // 本扫程命中记录清零（按怪物池槽位）
+
+            // 刀锋起点角 = 缓出曲线在 progress=0 处的角（aim − 半张角）。
+            // 方向取「出手后的挥砍方向」——Player 内刚归一化并保存，
+            // 判定/渲染同一数据源（两次计算不会产生偏差）
+            const Vec2 dir = m_player.swingDirection();         // 判定中轴（单位向量）
+            const float aimRad = std::atan2(dir.y, dir.x);      // 瞄准角（弧度）
+            m_sweepPrevAngleRad = bladeAngleAt(aimRad, 0.0f, m_attackArc); // 起点角
+
+            // 冒烟观测点：出手日志（与命中日志配对做时序断言——命中 t
+            // 必须晚于出手 t，证明伤害随刀锋到达而非出手瞬发）。
+            // t 取三位小数：1/120 秒的固定步差异在日志上可分辨
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "横扫出手（t=%.3f）", m_survivalSeconds);
+        }
+    }
+
+    // 扫程推进（与本次是否出手、左键是否仍按住无关）：出了手的刀必须
+    // 扫完——每个固定步把「上一步刀锋角 -> 本步刀锋角」之间扫过的怪物结算
+    advanceSwingSweep(playerRect);
+}
+
+// 扫程推进（每个固定步调用）：刀锋同步命中的核心。
+// 扫程活跃期间，取「上一步刀锋角 -> 本步刀锋角」的扫过区间，对每只
+// 存活且本扫程未命中的怪物：中心在扇形内（距离/中轴夹角）且角度落在
+// 本步扫过区间内 -> 此刻结算（伤害/飘字/闪白/击退/死亡掉落）。
+// 收尾步（剩余归零后的第一次推进）把最后一段补扫到终点角、清理命中
+// 记录并给出「挥空」观测点。多目标命中按刀锋先后自然错开若干固定步
+void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
+{
+    // 快照本步的扫程活跃状态：后面的收尾判断用它（不能用推进后的状态
+    // 反推——那是「下一步」的视角）
+    const bool active = m_player.swingActive(); // 本步扫程是否活跃
+
+    // 既不在扫程中、也没有待收尾的扫程：本步无事（最常见路径，直接返回）
+    if (!active && !m_sweepRunning)
+    {
+        return;
+    }
+
+    // 玩家中心：本步的判定圆心（与扇形判定的圆心同源——玩家中心）
+    const float centerX = playerRect.x + playerRect.w * 0.5f; // 中心 x
+    const float centerY = playerRect.y + playerRect.h * 0.5f; // 中心 y
+
+    // 本步刀锋角：活跃中取当前进度；收尾步（剩余已归零）补扫到终点角
+    //（progress=1）——刀锋绝不「差最后一段没扫完」。与渲染共用
+    // bladeAngleAt / swingProgress01——画到哪、打到哪就是这条数据链
+    const Vec2 dir = m_player.swingDirection();    // 判定中轴（单位向量）
+    const float aimRad = std::atan2(dir.y, dir.x); // 瞄准角（弧度）
+    const float bladeNow = bladeAngleAt(aimRad,
+                                        active ? m_player.swingProgress01() : 1.0f,
+                                        m_attackArc); // 本步刀锋角（收尾补到终点）
+
+    // 本步扫过区间 = [上一步角, 本步角]。浮点抖动守卫：progress 单调，
+    // bladeNow 理论上不小于上一步，但舍入可能造成微回退——取两者较大，
+    // 把区间钳成零宽；否则 isAngleInSweep 的正向增量语义会把一个
+    // 微小的负增量读成「几乎整圈扫过」，导致全场误命中
+    const float bladeFrom = m_sweepPrevAngleRad;      // 区间起点（上一步刀锋角）
+    const float bladeTo = std::max(bladeNow, bladeFrom); // 区间终点（抖动守卫）
+
+    // 逐只扫描：存活 + 本扫程未命中 + 扇形内 + 角度在本步扫过区间内。
+    // 带下标循环：命中记录与怪物池槽位一一对应
+    for (size_t i = 0; i < m_monsters.size(); ++i)
+    {
+        // 槽位引用：命中记录、结算、击退都作用在同一只怪上
+        Monster& monster = m_monsters[i];
+
+        // 空槽位或本扫程已命中：跳过（一次刀锋对同一只怪至多结算一次）
+        if (!monster.isAlive() || m_sweepHit[i])
+        {
+            continue;
+        }
+
+        // 怪物矩形只取一次：中心点与后续掉落位置共用同一份快照
         const SDL_FRect monsterRect = monster.rect();
         const float monsterCenterX = monsterRect.x + monsterRect.w * 0.5f; // 中心 x
         const float monsterCenterY = monsterRect.y + monsterRect.h * 0.5f; // 中心 y
 
-        // 弧内判定：距离 ≤ 半径 且 与中轴夹角 ≤ 半张角（含边界；零向量
-        // 防御等边界行为都在纯函数内，见 AttackArc.h）
-        if (!isPointInAttackArc(attackOrigin, swingDir,
+        // 条件一：中心在扇形内（距离 ≤ attack_range 且与中轴夹角 ≤ 半张角；
+        // 纯函数边界行为有单测覆盖，见 AttackArc.h）
+        if (!isPointInAttackArc(Vec2{ centerX, centerY }, dir,
                                 Vec2{ monsterCenterX, monsterCenterY },
                                 m_attackRange, m_attackArc))
         {
-            continue; // 弧外：本只不结算，继续检查下一只
+            continue; // 弧外：本步不结算（刀锋扫到时还会再看——怪会移动）
         }
 
-        ++hitCount; // 命中一只（同一只怪在一次出手里至多命中一次）
+        // 条件二：怪物角度落在本步扫过的角区间内（刀锋此刻正好扫到它）。
+        // 条件一已经保证「最终扫得到」，本条件决定「是不是这一步」
+        const float monsterAngleRad = std::atan2(monsterCenterY - centerY,
+                                                 monsterCenterX - centerX); // 怪物方位角
+        if (!isAngleInSweep(monsterAngleRad, bladeFrom, bladeTo))
+        {
+            continue; // 刀锋本步还没扫到（或已扫过）：留给后续步骤
+        }
+
+        // ---- 此刻命中的完整结算（与「出手瞬发结算」同一套反馈）----
+        m_sweepHit[i] = true; // 标记：本扫程不再重复命中该槽位
+        ++m_sweepHitCount;    // 本次扫程命中计数 +1（收尾判挥空用）
 
         // 1) 扣血（闪白在 takeDamage 内自动触发；返回是否致死）
         const bool died = monster.takeDamage(m_attackDamage);
 
         // 2) 伤害飘字：在怪物位置弹出「-当前伤害值」（上浮+淡出）。
-        //    多目标同帧命中时逐只各弹一条——同帧多飘字正是横扫的观感
+        //    多目标按刀锋先后逐条弹出——命中时刻错开，飘字也自然错开
         char damageText[32]; // 容纳 "-" + 最长伤害数字，绰绰有余
         SDL_snprintf(damageText, sizeof(damageText), "-%d", m_attackDamage);
         spawnFloatingText(damageText, monsterCenterX, monsterCenterY - 20.0f,
                           SDL_Color{ 255, 255, 255, 255 }); // 白色：与金色升级飘字区分
 
-        // 冒烟观测点：横扫命中日志（含剩余生命与局内时间——自动化测试据
-        // 它断言多目标命中与连扫节奏；t 为局内秒数，同一次出手共享同一 t）
+        // 冒烟观测点：横扫命中日志（含剩余生命与局内时间——自动化测试
+        // 据它断言「命中晚于出手」「多目标错开」；t 取三位小数以分辨
+        // 1/120 秒固定步的时间差）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "横扫命中（剩余生命 %d，t=%.2f）", monster.hp(), m_survivalSeconds);
+                    "横扫命中（剩余生命 %d，t=%.3f）", monster.hp(), m_survivalSeconds);
 
         if (died)
         {
@@ -610,12 +675,26 @@ void PlayScene::resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& p
         }
     }
 
-    // 挥空也出招的日志证据：本次出手成功但一只也没命中怪（此时也不索敌、
-    // 不做任何命中结算——挥砍表现已在 Player 内照常播放）
-    if (hitCount == 0)
+    // 区间推进：本步终点成为下一步区间的起点（刀锋只前进、不回头）
+    m_sweepPrevAngleRad = bladeTo;
+
+    // 扫程收尾：本步剩余归零后的第一次推进——上面的补段已完成最后
+    // 一段区间，现在清理状态并给出「挥空」观测点
+    if (!active && m_sweepRunning)
     {
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                    "横扫挥空（未命中任何怪物，t=%.2f）", m_survivalSeconds);
+        m_sweepRunning = false; // 场景侧标记归还：下次出手重新开启
+
+        // 整刀一只也没碰到：挥空日志（「挥空也出招」的证据点——出手仍
+        // 消耗冷却、播放完整表现；冷却/表现由 Player 负责，与本清理无关）
+        if (m_sweepHitCount == 0)
+        {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "横扫挥空（未命中任何怪物，t=%.3f）", m_survivalSeconds);
+        }
+
+        // 命中记录清零：为下一扫程腾出全新状态（也避免残留旧标记）
+        m_sweepHit.fill(false); // 全槽位清空（与出手时的清零成对出现）
+        m_sweepHitCount = 0;    // 命中计数清零
     }
 }
 
@@ -834,6 +913,14 @@ void PlayScene::restart()
 
     // 场上经验宝石清空（析构各自释放纹理；renderer 尚在，安全）
     m_gems.clear();
+
+    // 刀锋扫程状态清零：上一局未扫完的刀锋（含命中记录）不带进新一局——
+    // Player::reset 已清零表现计时（swingActive 随之为 false），这里把
+    // 场景侧推进标记与命中记录一并复位
+    m_sweepRunning = false;     // 扫程推进标记归还（新一局首刀重新开启）
+    m_sweepHitCount = 0;        // 本扫程命中计数清零
+    m_sweepHit.fill(false);     // 命中记录清空（全槽位）
+    m_sweepPrevAngleRad = 0.0f; // 区间起点角复位（新一局首刀出手时重新对齐）
 
     // 场上漂浮文字清空：上一局未播完的伤害/升级飘字不跨局残留
     m_floatingTexts.clear();
