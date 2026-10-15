@@ -143,3 +143,35 @@ set_target_properties(input_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  XP 升级曲线单元测试（xp_test）
+#
+#  与前三者的差异：被测对象是 game 层的纯逻辑头文件
+#  （Src/inc/game/LevelCurve.h），不依赖 SDL3、无 .cpp、无链接——
+#  因此本目标只需头文件搜索路径，任何环境下都可确定性构建运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\xp_test.exe
+# ============================================================
+
+add_executable(xp_test xp_test.cpp)
+
+if (MSVC)
+    target_compile_options(xp_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：LevelCurve.h 位于游戏仓 Src/inc（按 "game/LevelCurve.h" 引用）
+target_include_directories(xp_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(xp_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
