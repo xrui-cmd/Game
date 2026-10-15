@@ -61,6 +61,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      monster_spawn_interval  刷新间隔初始值（秒，随局内时间收紧）
     //      monster_max_count       数量上限初始值（只，随局内时间 +2）
     //      monster_damage          怪物接触伤害
+    //      monster_patrol_radius   巡逻半径（像素；绕巢游荡范围）
+    //      monster_aggro_radius    仇恨半径（像素；玩家进入即追击）
+    //      monster_leash_radius    栓绳半径（像素；离巢超过即回巢）
+    //      monster_return_heal_percent 回巢回血百分比（0=关闭；预留键）
     //      xp_level_base           升级曲线基数（第 1 级升第 2 级的需求）
     //      xp_level_growth         升级曲线倍率（需求逐级倍率）
     //      levelup_max_hp_bonus    每级生命上限强化（并即时回血等值）
@@ -87,6 +91,16 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_monsterSpawnInterval =
         config.getFloat("monster_spawn_interval", kDefaultMonsterSpawnInterval);
     m_monsterDamage = config.getInt("monster_damage", kDefaultMonsterDamage);
+
+    // 批三新增：怪物生态参数（AI 决策半径 + 回巢回血预留键）。
+    // 半径做下界夹取（负半径没有玩法语义——宁可按 0 处理，也不让
+    // 负值进 AI 的时间/距离计算）；回血百分比同样夹到 0 起
+    //（0 = 关闭；负数等价关闭，显式夹取让注入值可控）
+    m_monsterPatrolRadius = std::max(0.0f, config.getFloat("monster_patrol_radius", kDefaultMonsterPatrolRadius));
+    m_monsterAggroRadius = std::max(0.0f, config.getFloat("monster_aggro_radius", kDefaultMonsterAggroRadius));
+    m_monsterLeashRadius = std::max(0.0f, config.getFloat("monster_leash_radius", kDefaultMonsterLeashRadius));
+    m_monsterReturnHealPercent =
+        std::max(0.0f, config.getFloat("monster_return_heal_percent", kDefaultMonsterReturnHealPercent));
 
     // 批二新增：世界与相机配置。
     // 世界尺寸做下界钳制（至少 1x1 区块——World::generate 内还有一道同样的
@@ -212,11 +226,18 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //     （单帧 PNG 解码开销很小）；未激活的槽位不更新、不渲染、不参与碰撞
     m_monsters.resize(static_cast<size_t>(kMonsterPoolSize));
 
-    // 池内槽位统一注入世界指针（碰撞滑动与击退落点校验用）；
-    // 进程内改造完成前的防御语义：未注入 = 无墙世界（不会卡死实体）
+    // 池内槽位统一注入世界指针（碰撞滑动与击退落点校验用）与批三 AI 参数：
+    // 决策半径来自 config（上面刚读），停顿/判据等细节用 MonsterAi 的
+    // 代码常量默认值（不进配置文件——「半径可调、手感固定」的本批取舍）
+    MonsterAi::Config aiConfig; // AI 决策参数（半径类填配置值）
+    aiConfig.patrolRadius = m_monsterPatrolRadius; // 巡逻半径（monster_patrol_radius）
+    aiConfig.aggroRadius = m_monsterAggroRadius;   // 仇恨半径（monster_aggro_radius）
+    aiConfig.leashRadius = m_monsterLeashRadius;   // 栓绳半径（monster_leash_radius）
     for (Monster& monster : m_monsters)
     {
-        monster.setWorld(&m_world);
+        monster.setWorld(&m_world);                          // 世界（碰撞）注入
+        monster.setAiConfig(aiConfig);                       // AI 决策参数注入
+        monster.setReturnHealPercent(m_monsterReturnHealPercent); // 回巢回血（0=关闭）
     }
 
     // 13) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
@@ -395,7 +416,7 @@ void PlayScene::update(const UpdateContext& ctx)
     // 方向取鼠标瞄准（不索敌、挥空也出招），命中由扇形判定逐只结算
     resolvePlayerAttack(ctx, playerRect);
 
-    // 怪物刷新（批二过渡版：玩家周围圆环内持续刷新 + 随时间增强）：
+    // 怪物刷新（批三正式版：激活区块内随机 walkable 点持续刷新 + 随时间增强）：
     // 局内秒数累计 + 到点生成。存活计时与怪物难度计时共用同一时间基准
     // （固定步长，暂停时冻结）
     m_survivalSeconds += ctx.deltaTime; // 存活时间正计时（HUD/结算展示）
@@ -926,27 +947,29 @@ float PlayScene::currentSpawnInterval() const
                     kSpawnIntervalFloor);
 }
 
-// 为指定空槽位寻找落点并生成怪物（批二过渡版出生规则，契约见头文件）
+// 为指定空槽位寻找落点并生成怪物（批三正式版出生规则，契约见头文件）
 bool PlayScene::spawnMonsterAtSlot(Monster& monster)
 {
-    // 玩家中心：出生环的圆心（每步重取——玩家在移动，环随人走）
+    // 玩家中心：出生距离校验的圆心（每步重取——玩家在移动，距离随人走）
     const SDL_FRect playerRect = m_player.rect();                   // 玩家矩形快照
     const float playerCenterX = playerRect.x + playerRect.w * 0.5f; // 玩家中心 x（世界坐标）
-    const float playerCenterY = playerRect.y + playerRect.h * 0.5f; // 玩家中心 y（世界坐标）
+    const float playerCenterY = playerRect.y + playerRect.h * 0.5f; // 玩家中心 y
+
+    // 采样区域 = 激活区块窗口（批三正式版：怪物在激活区块内随机点出生）。
+    // 窗口已由 World 回钳在世界内；「区块索引 -> 像素」换算用区块边长
+    const float areaMinX = static_cast<float>(m_world.activeMinChunkX()) * World::kChunkPixels; // 区域左边界
+    const float areaMinY = static_cast<float>(m_world.activeMinChunkY()) * World::kChunkPixels; // 区域上边界
+    const float areaMaxX = static_cast<float>(m_world.activeMaxChunkX() + 1) * World::kChunkPixels; // 区域右边界（含末区块）
+    const float areaMaxY = static_cast<float>(m_world.activeMaxChunkY() + 1) * World::kChunkPixels; // 区域下边界
 
     for (int attempt = 0; attempt < kMonsterSpawnAttempts; ++attempt)
     {
-        // 极坐标取点：随机方位角 + 随机半径（圆环 [内径, 外径) 内一点）。
-        // 圆环上点的分布密度略偏向内圈（无心处理均匀性——过渡版只需
-        // 「玩家附近但不在脸上」的观感；批三接巡逻/巢穴体系时重做）
-        const float angle = SDL_randf() * 6.283185307179586f; // 随机方位角（弧度，[0, 2π)）
-        const float radius = kMonsterSpawnRadiusMin +
-            SDL_randf() * (kMonsterSpawnRadiusMax - kMonsterSpawnRadiusMin); // 随机半径
-        const float spawnCenterX = playerCenterX + std::cos(angle) * radius; // 候选中心 x
-        const float spawnCenterY = playerCenterY + std::sin(angle) * radius; // 候选中心 y
+        // 窗口矩形内均匀取点（x/y 各自独立均匀——矩形上面积均匀）
+        const float spawnCenterX = areaMinX + SDL_randf() * (areaMaxX - areaMinX); // 候选中心 x
+        const float spawnCenterY = areaMinY + SDL_randf() * (areaMaxY - areaMinY); // 候选中心 y
 
-        // 条件一：离玩家中心 >= kMonsterSpawnMinPlayerDistance（内径 550 已
-        // 保证，这里是显式冗余——将来调内径时这条底线不被无声破坏）
+        // 条件一：离玩家中心 >= kMonsterSpawnMinPlayerDistance（防贴脸刷新；
+        // 平方比较省一次开方）
         const float dx = spawnCenterX - playerCenterX; // 与玩家的水平差
         const float dy = spawnCenterY - playerCenterY; // 与玩家的垂直差
         if (dx * dx + dy * dy <
@@ -955,14 +978,9 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
             continue; // 离玩家太近：换一个候选
         }
 
-        // 条件二：处于激活区块内（非激活区不生怪——出生即冻结没有意义）
-        if (!m_world.isPointInActiveChunks(spawnCenterX, spawnCenterY))
-        {
-            continue; // 激活窗口外：换一个候选
-        }
-
-        // 条件三：怪物矩形可走（候选矩形 = 怪物尺寸 AABB；世界边界墙与
-        // 内部墙簇均会在查询中被挡下——不会把怪生进墙里）
+        // 条件二：怪物矩形可走（候选矩形 = 怪物尺寸 AABB；世界边界墙与
+        // 内部墙簇均会在查询中被挡下——不会把怪生进墙里）。
+        // 说明：采样区域 = 激活窗口，故候选点必在激活区块内（无需另查）
         const SDL_FRect monsterRect{ spawnCenterX - monster.width() * 0.5f,  // 候选左上角 x
                                      spawnCenterY - monster.height() * 0.5f, // 候选左上角 y
                                      monster.width(),                        // 宽（48）
@@ -972,16 +990,18 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
             continue; // 落点是墙：换一个候选
         }
 
-        // 三轮校验全过：等权随机变体 -> 槽位换皮 -> 落位生成
+        // 两个校验全过：等权随机变体 -> 槽位换皮 -> 落位生成。
+        // 落点同时登记为「巢」（spawnAt 内部写入 AI）——出生点即巢，
+        // 怪物自此绕它巡逻、以它为栓绳圆心
         const auto variant = static_cast<MonsterType>(
             SDL_rand(static_cast<int>(MonsterType::Count))); // 等权三变体（各 1/3）
         monster.loadVariant(m_renderer, variant);            // 复用槽位换皮（先释放旧纹理）
-        monster.spawnAt(spawnCenterX, spawnCenterY);         // 落位（内部写生命并快照防拉丝）
+        monster.spawnAt(spawnCenterX, spawnCenterY);         // 落位（写生命+巢，快照防拉丝）
         return true; // 生成成功：调用方接着写日志/累计
     }
 
-    // 重试耗尽（玩家贴墙死角等极端情形）：本步不生成。刷新时刻表已在
-    // 调用方推进——下一次刷新时刻自然再试，不会死循环也不阻塞其余逻辑
+    // 重试耗尽（少见：窗口内可走区域被墙占满等极端情形）：本步不生成。
+    // 刷新时刻表已在调用方推进——下一次刷新时刻自然再试，不会死循环
     return false;
 }
 

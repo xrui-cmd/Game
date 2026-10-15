@@ -1,14 +1,22 @@
 #include "game/Monster.h"
-#include "game/World.h"    // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
-#include "engine/Camera.h" // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
-#include <algorithm> // std::clamp / std::max：闪白计时与战斗数值的上下界
-#include <cmath>     // std::sqrt：归一化方向与距离计算
+#include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
+#include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
+#include <algorithm> // std::clamp / std::max：闪白计时、滑移权重与战斗数值的上下界
+#include <cmath>     // std::sqrt：归一化方向、距离与侧滑权重的计算
 
 // 本编译单元私有的变体数值表与工具（不对外暴露）
 namespace
 {
 
-// 变体规格：外观纹理 + 战斗数值。三变体共用同一套追击 AI，
+// AI 随机源适配（批三）：MonsterAi 只认 [0,1) 的函数指针接口（纯逻辑
+// 不依赖 SDL），这里把 SDL_randf 包一层交给它——游戏内随机、单测内可注入
+// 固定序列，随机源的可控性由此而来
+float monsterAiRandom(void* /*context*/)
+{
+    return SDL_randf(); // 复用 SDL 全局随机（与刷新/出生取点同一随机流）
+}
+
+// 变体规格：外观纹理 + 战斗数值 + 击杀掉落。三变体共用同一套 AI，
 // 差异只体现在这张表里（换平衡先改这里）
 struct VariantSpec
 {
@@ -17,25 +25,26 @@ struct VariantSpec
     const char* singlePath; // 单帧回退相对路径（精灵表缺失时的降级素材）
     int hp;                 // 出生生命值（点）
     float baseSpeed;        // 基础追击速度（像素/秒）：难度成长在此之上叠加
+    int coinDrop;           // 击杀掉落金币数（枚）——局内货币的经济常量
     SDL_Color fallback;     // 程序化回退颜色（两种素材都缺失时的兜底方块色）
 };
 
 // 变体数值表（下标 = MonsterType 枚举值，顺序必须与枚举一致）。
 // 数值为「代码常量、硬编码并注释」——本批定案不走配置文件：
-//   - 史莱姆：慢而脆（生命 20 / 速度 90）
-//   - 哥布林：基准线（生命 30 / 速度 110，与旧单怪时代数值一致）
-//   - 骷髅  ：快而脆（生命 18 / 速度 140，追逐压力来源）
+//   - 史莱姆：慢而脆（生命 20 / 速度 90 / 掉落金币 1）
+//   - 哥布林：基准线（生命 30 / 速度 110 / 掉落金币 2，与旧单怪时代数值一致）
+//   - 骷髅  ：快而脆（生命 18 / 速度 140 / 掉落金币 1，追逐压力来源）
 // 颜色取自各素材的主色系（回退方块与变体观感相近，一眼能认出是哪只）
 constexpr VariantSpec kVariants[] = {
-    // 史莱姆（swampy）：绿色软泥怪，慢吞吞的低压目标
+    // 史莱姆（swampy）：绿色软泥怪，慢吞吞的低压目标（赏金 1 枚）
     { "史莱姆", "assets/monster_slime_sheet.png", "assets/monster_slime.png",
-      20, 90.0f, SDL_Color{124, 200, 74, 255} },
-    // 哥布林（goblin）：基准变体，数值与旧单怪时代一致
+      20, 90.0f, 1, SDL_Color{124, 200, 74, 255} },
+    // 哥布林（goblin）：基准变体，数值与旧单怪时代一致（赏金 2 枚——最「值钱」）
     { "哥布林", "assets/monster_goblin_sheet.png", "assets/monster_goblin.png",
-      30, 110.0f, SDL_Color{74, 142, 64, 255} },
-    // 骷髅（skelet）：白骨骷髅，快而脆
+      30, 110.0f, 2, SDL_Color{74, 142, 64, 255} },
+    // 骷髅（skelet）：白骨骷髅，快而脆（赏金 1 枚）
     { "骷髅", "assets/monster_skelet_sheet.png", "assets/monster_skelet.png",
-      18, 140.0f, SDL_Color{230, 228, 210, 255} },
+      18, 140.0f, 1, SDL_Color{230, 228, 210, 255} },
 };
 
 // 变体枚举 -> 数值表下标（Count 哨兵值不在表内，做一个防御性夹取）
@@ -85,13 +94,19 @@ float Monster::baseSpeed() const
     return kVariants[variantIndex(m_type)].baseSpeed;
 }
 
-// 设置追踪目标：只存目标矩形的中心点——追踪是「朝点直线行进」，
-// 不需要每步保存整块矩形（本步速度另有 setChaseSpeed 注入）
+// 本变体的击杀金币掉落数（枚）：场景在击杀结算时读取（史莱姆 1 / 哥布林 2 / 骷髅 1）
+int Monster::coinDrop() const
+{
+    // 查表返回掉落数；越界情形由 variantIndex 夹取保护
+    return kVariants[variantIndex(m_type)].coinDrop;
+}
+
+// 设置追踪目标：只存目标矩形的中心点——AI 的仇恨判定与追迹都以此为玩家位置
 void Monster::setTarget(const SDL_FRect& targetRect)
 {
     m_targetX = targetRect.x + targetRect.w * 0.5f; // 目标中心 x：矩形左上角 + 半宽
     m_targetY = targetRect.y + targetRect.h * 0.5f; // 目标中心 y：矩形左上角 + 半高
-    m_hasTarget = true;                             // 标记本步有目标：update 将执行追踪
+    m_hasTarget = true;                             // 标记玩家可见：AI 开始做仇恨判定
 }
 
 // 受击：扣血 + 闪白；返回是否死亡（生命归零）
@@ -105,7 +120,7 @@ bool Monster::takeDamage(int amount)
         return false; // 未死亡（也没有扣血）
     }
 
-    // 扣血并把生命夹到 0：日志/HUD 永远看不到负数生命
+    // 扣血并把生命夹到 0：日志/血条永远看不到负数生命
     m_hp = std::max(m_hp - amount, 0);
 
     // 闪白计时重置为满值：连续受击时白光从本次受击重新起算（视觉连续）
@@ -122,7 +137,7 @@ bool Monster::takeDamage(int amount)
     return false; // 仍有生命：调用方通常接着施加击退
 }
 
-// 生成（批二过渡版）：在调用方选好的可信落点上激活本对象
+// 生成（批三正式版）：在调用方选好的可信落点上激活本对象
 void Monster::spawnAt(float centerX, float centerY)
 {
     // 落点换算：入参是「怪物中心」的世界坐标，转成左上角存内部
@@ -130,16 +145,24 @@ void Monster::spawnAt(float centerX, float centerY)
     m_x = centerX - m_w * 0.5f; // 左上角 x = 中心 - 半宽
     m_y = centerY - m_h * 0.5f; // 左上角 y = 中心 - 半高
 
-    // 激活 + 按变体数值表写入战斗数值：出生生命取自当前变体
+    // 激活 + 按变体数值表写入战斗数值：出生生命/上限都取自当前变体
     //（stale 防护：至少 1 点——表内数值恒为正，这里的 max 是防未来改表的兜底）
-    m_alive = true;                                         // 本对象进入战场：更新/渲染/碰撞自此生效
-    m_hp = std::max(kVariants[variantIndex(m_type)].hp, 1); // 出生生命（变体表；0 血出生会在首帧判定为已死）
-    m_flashLeft = 0.0f;                                     // 新生怪物不带受击光效
-    m_hasTarget = false;                                    // 追踪目标等场景下个固定步注入
+    const VariantSpec& spec = kVariants[variantIndex(m_type)]; // 本变体规格
+    m_alive = true;                     // 本对象进入战场：更新/渲染/碰撞自此生效
+    m_maxHp = std::max(spec.hp, 1);     // 生命上限（血条比例与回血夹取都读它）
+    m_hp = m_maxHp;                     // 出生满血（0 血出生会在首帧判定为已死）
+    m_flashLeft = 0.0f;                 // 新生怪物不带受击光效
+    m_hasTarget = false;                // 玩家目标等场景下个固定步注入
+
+    // AI 复位（批三）：随机源就位 -> 巢 = 出生点（出生点即巢）-> 状态全量
+    // 复位（巡逻、无游荡点、无停顿）——池槽位复用时旧怪物的仇恨/回巢
+    // 状态绝不带进新怪物
+    m_ai.setRandom(&monsterAiRandom, nullptr); // 随机源：SDL 随机流适配
+    m_ai.reset(centerX, centerY);              // 巢 = 本落点；状态清回巡逻
 
     // 瞬移类操作的插值收尾（重点）：出生是「瞬间换位」，必须把插值快照
     // 对齐到新落点，否则渲染会从上一位置向新落点拉丝（延续既有纪律）
-    //（落点的「激活区块内 + 可走」校验由调用方完成——见 PlayScene）
+    //（落点的「激活区块内 + 可走 + 离玩家 >= 500px」校验由调用方完成）
     snapshotPreviousPosition();
 }
 
@@ -176,9 +199,9 @@ void Monster::knockback(float fromX, float fromY, float distance)
         return;
     }
 
-    // 落点校验（本批新增）：从全距离开始，被墙挡则按 1/2、1/4 逐级缩短重试。
-    // 「贴墙可接受」的口径下不允许落点推进墙内——否则怪物会卡在墙里
-    // 两轴都出不来（而贴墙边站位是允许的：矩形与墙格相交才被拒）
+    // 落点校验（批二落地、批三沿用）：从全距离开始，被墙挡则按 1/2、1/4
+    // 逐级缩短重试。「贴墙可接受」的口径下不允许落点推进墙内——否则怪物
+    // 会卡在墙里两轴都出不来（而贴墙边站位是允许的：矩形与墙格相交才被拒）
     for (float factor = 1.0f; factor >= 0.25f; factor *= 0.5f)
     {
         // 候选落点（左上角坐标）：中心 + 方向 x 距离 x 比例 - 半尺寸
@@ -201,7 +224,9 @@ void Monster::knockback(float fromX, float fromY, float distance)
     // 比「卡进墙里出不来」好；位置未变，插值区间保持原样（无需快照）
 }
 
-// 覆写更新：帧动画 + 受击闪白计时 + 朝目标点的直线追踪
+// 覆写更新：AI 状态决策 + 帧动画 + 闪白计时 + 朝目标点移动（移动经世界碰撞）。
+// 分工：AI（MonsterAi）只做状态/目标决策；本函数把决策执行成位移，
+// 并在状态切换/到巢事件上打日志、结回血——「场景注入、实体执行」的延续
 void Monster::update(const UpdateContext& ctx)
 {
     // 第一行固定动作：快照「本步开始前的位置」作为渲染插值起点。
@@ -209,7 +234,7 @@ void Monster::update(const UpdateContext& ctx)
     snapshotPreviousPosition();
 
     // 帧动画无条件推进（基类默认实现的同款语句）：移动与否不影响动画节奏，
-    // 跑动/蠕动动画在追踪全程持续播放
+    // 跑动/蠕动动画在巡逻/追击全程持续播放
     m_animTime += ctx.deltaTime;
 
     // 受击闪白计时递减并夹到 0：与固定步长同源，暂停时随 update 门控冻结
@@ -218,18 +243,93 @@ void Monster::update(const UpdateContext& ctx)
         m_flashLeft = std::max(m_flashLeft - ctx.deltaTime, 0.0f);
     }
 
-    // 无目标：仅播动画（防御性分支——PlayScene 在 Playing 状态每步都会注入目标）
-    if (!m_hasTarget)
+    // 怪物中心（世界坐标）：AI 判定的自身位置基准
+    const float centerX = m_x + m_w * 0.5f; // 中心 x
+    const float centerY = m_y + m_h * 0.5f; // 中心 y
+
+    // ---- AI 状态决策（纯逻辑）：巡逻/仇恨/栓绳回巢/到巢 ----
+    // 玩家位置 = 场景每步注入的追踪目标（m_hasTarget=false 时 AI 视为
+    // 玩家不可见——不仇恨；防御路径，正常流程每步都会注入）
+    const MonsterAi::StepResult ai = m_ai.update(centerX, centerY,
+                                                 m_hasTarget, m_targetX, m_targetY,
+                                                 ctx.deltaTime);
+
+    // ---- 状态事件日志（批三冒烟断言点，含变体名）----
+    if (ai.enteredChase)
+    {
+        // 冒烟观测点：进入仇恨（自动化测试据此断言「靠近才追」）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入仇恨（%s）", monsterTypeName(m_type));
+    }
+    if (ai.enteredReturn)
+    {
+        // 冒烟观测点：触发栓绳回巢（自动化测试据此断言「拉怪过线即返」）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "触发栓绳回巢（%s）", monsterTypeName(m_type));
+    }
+    if (ai.returnedHome)
+    {
+        // 到巢事件（冒烟观测点）：先按注入的百分比结算回血（0=关闭），
+        // 再打「回到巢穴」日志；真回血了补一条「回巢回血」明细日志
+        const int hpBefore = m_hp; // 回血前生命（对比日志用）
+        m_hp = MonsterAi::healedHpAfterReturn(m_hp, m_maxHp, m_ai.returnHealPercent());
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "回到巢穴（%s）", monsterTypeName(m_type));
+        if (m_hp > hpBefore)
+        {
+            // 冒烟观测点：回血明细（monster_return_heal_percent>0 时的验证点）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "回巢回血（%s：%d -> %d / %d）",
+                        monsterTypeName(m_type), hpBefore, m_hp, m_maxHp);
+        }
+    }
+
+    // ---- 巡逻点供水（宿主职责）：AI 索要游荡点时，在世界内挑一个
+    //「怪物矩形可走」的随机点写回（AI 不知道墙的存在）----
+    if (m_ai.wantsPatrolTarget())
+    {
+        const float nestX = m_ai.nestX(); // 巢心 x：取点圆心
+        const float nestY = m_ai.nestY(); // 巢心 y
+        const float patrolRadius = m_ai.patrolRadius(); // 巡逻半径（配置注入）
+        bool supplied = false; // 是否成功挑到有效游荡点
+
+        for (int attempt = 0; attempt < kPatrolTargetAttempts; ++attempt)
+        {
+            // 圆内均匀取点：方位角均匀 + 半径取平方根（面积均匀分布——
+            // 直接线性取半径会让点集中在圆心附近）
+            const float angle = SDL_randf() * 6.283185307179586f; // 随机方位角（弧度）
+            const float radius = std::sqrt(SDL_randf()) * patrolRadius; // 均匀半径
+            const float targetX = nestX + std::cos(angle) * radius; // 候选点 x
+            const float targetY = nestY + std::sin(angle) * radius; // 候选点 y
+
+            // 候选点可走校验：怪物矩形（48x48）在候选点必须无墙。
+            // 无世界（防御路径）直接接受——没有墙的概念就没有校验
+            const SDL_FRect candidate{ targetX - m_w * 0.5f, // 候选矩形左上角 x
+                                       targetY - m_h * 0.5f, // 左上角 y
+                                       m_w, m_h };           // 怪物尺寸
+            if (m_world == nullptr || m_world->isRectWalkable(candidate))
+            {
+                m_ai.setPatrolTarget(targetX, targetY); // 供水：开始朝它游荡
+                supplied = true;                        // 标记成功
+                break;                                  // 结束重试
+            }
+        }
+
+        if (!supplied)
+        {
+            // 重试耗尽（屋子角落贴满墙等极端情形）：退化为「回巢心」——
+            // 巢必可走（出生落点校验保证），不会死循环也不会卡进墙
+            m_ai.setPatrolTarget(nestX, nestY);
+        }
+    }
+
+    // 无移动目标（巡逻停顿/等供水）：原地只播动画（防御性分支）
+    if (!m_ai.hasGoal())
     {
         return;
     }
 
-    // 从怪物中心指向目标的向量：追踪以「中心 -> 中心」的连线为准
-    const float centerX = m_x + m_w * 0.5f;
-    const float centerY = m_y + m_h * 0.5f;
-    const float dx = m_targetX - centerX;
-    const float dy = m_targetY - centerY;
-    const float distance = std::sqrt(dx * dx + dy * dy);
+    // 从怪物中心指向目标点（AI 决策的目标：游荡点/玩家/巢心）的向量
+    const float dx = m_ai.goalX() - centerX; // 目标向量 x
+    const float dy = m_ai.goalY() - centerY; // 目标向量 y
+    const float distance = std::sqrt(dx * dx + dy * dy); // 到目标距离
 
     // 已到达目标附近：原地不动。阈值判定避免目标点附近的来回抖动，
     // 也排除距离为 0 时归一化「除以零」的退化情形
@@ -238,12 +338,24 @@ void Monster::update(const UpdateContext& ctx)
         return;
     }
 
-    // 沿归一化方向 x 速度的「期望位移」（固定步长积分）。与玩家「逐轴独立」
-    // 不同：怪物是直线追击，归一化保证任意方向合速度恒等于注入的速度值。
-    // 速度由 PlayScene 按「变体基础速度 + 难度成长」注入
-    const float stepDX = (dx / distance) * m_chaseSpeed * ctx.deltaTime; // 期望水平位移
-    const float stepDY = (dy / distance) * m_chaseSpeed * ctx.deltaTime; // 期望垂直位移
+    // 本步速度：巡逻用「变体基础速度 x 0.5」（不随难度成长——闲逛节奏
+    // 与追兵压迫感解耦）；追击/回巢用场景注入的难度速度
+    const float speed = (m_ai.state() == MonsterAiState::Patrol)
+        ? baseSpeed() * kPatrolSpeedFactor // 巡逻速度（慢半拍，肉眼可辨状态）
+        : m_chaseSpeed;                    // 追击/回巢速度（难度曲线注入）
 
+    // 沿归一化方向 x 速度的「期望位移」（固定步长积分）。归一化保证
+    // 任意方向合速度恒等于本轮速度值
+    const float stepDX = (dx / distance) * speed * ctx.deltaTime; // 期望水平位移
+    const float stepDY = (dy / distance) * speed * ctx.deltaTime; // 期望垂直位移
+
+    // 位移统一出口：世界碰撞（分轴滑动 + 子步防穿透）+ 卡死检测 + 持久化侧滑
+    moveWithCollision(stepDX, stepDY, ctx.deltaTime);
+}
+
+// 位移推进（含墙体碰撞 + 撞墙时的轻量侧滑）：三种状态共用的移动出口
+void Monster::moveWithCollision(float stepDX, float stepDY, float /*dt*/)
+{
     // 世界未注入（防御分支）：无碰撞直接位移，不做任何阻挡
     if (m_world == nullptr)
     {
@@ -252,9 +364,9 @@ void Monster::update(const UpdateContext& ctx)
         return;        // 本步移动结束
     }
 
-    // ---- 主方向：分轴滑动（本批新增）----
+    // ---- 主方向：分轴滑动（与玩家移动共用同一个纯函数，行为一致）----
     // 一轴被墙挡住、另一轴照走——「贴墙滑行」的手感来源；内部还带子步
-    // 拆分防高速穿透（与玩家移动共用同一个纯函数，行为一致）
+    // 拆分防高速穿透
     const SDL_FPoint moved = m_world->slideMove(m_x, m_y, m_w, m_h, stepDX, stepDY);
     const float movedDX = moved.x - m_x; // 碰撞后的实际水平位移
     const float movedDY = moved.y - m_y; // 碰撞后的实际垂直位移
@@ -265,9 +377,8 @@ void Monster::update(const UpdateContext& ctx)
 
     if (expectedSq > 0.0f && movedSq < expectedSq * kStuckMoveRatioSquared)
     {
-        // ---- 轻量侧滑（本批过渡版）：正面撞墙「几乎没动」时，把期望位移
-        // 旋转 90 度（先右后左）再试——每步独立决策、无状态记忆：能滑就
-        // 沿墙爬行、两侧皆堵就原地。完整绕墙/寻路留批三评估 ----
+        // ---- 轻量侧滑：正面撞墙「几乎没动」时，把期望位移旋转 90 度
+        //（先右后左）再试——能滑就沿墙爬行、两侧皆堵就原地 ----
         const SDL_FPoint slideRight = m_world->slideMove(m_x, m_y, m_w, m_h, -stepDY, stepDX); // 右侧滑（顺时针 90°）
         const SDL_FPoint slideLeft = m_world->slideMove(m_x, m_y, m_w, m_h, stepDY, -stepDX);  // 左侧滑（逆时针 90°）
 

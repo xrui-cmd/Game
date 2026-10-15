@@ -32,8 +32,8 @@
 //        生成（坐标哈希 + 种子；seed=0 时每局随机）；世界边界一圈墙 +
 //        每区块随机墙簇（区块交界与出生保护区保证可通行）；
 //      - 玩家移动为「分轴位移 + 撞墙滑动」（World::slideMove，取代旧版
-//        窗口 clamp）；怪物同样碰撞滑动 + 卡住时轻量侧滑（本质行为不变，
-//        完整绕墙/寻路留批三）；
+//        窗口 clamp）；怪物同样碰撞滑动 + 卡住时轻量侧滑（批三延续，
+//        持久化侧滑改进见对应提交）；
 //      - 相机每固定步 follow 玩家中心（指数平滑 camera_smooth_time）、
 //        进局/重开 snapTo；暂停/结束冻结（相机不更新）；鼠标瞄准经
 //        screenToWorld 换算后计算方向（零向量回退保留）；
@@ -57,12 +57,16 @@
 //        已命中不重复。判定与渲染共用 AttackArc.h 的缓出曲线纯函数
 //        （bladeAngleAt / isAngleInSweep 等，单测覆盖边界）；
 //      - 怪物三变体等权随机刷新（史莱姆 20/90、哥布林 30/110、骷髅 18/140
-//        ——生命/基础速度，数值常量见 Monster.cpp 变体表）；批二过渡版
-//        出生规则：由「窗口边缘」改为「玩家周围 550~750px 圆环内、激活
-//        区块内、可走、且离玩家 >=500px」随机（批三大改前保持可玩）；
+//        ——生命/基础速度，数值常量见 Monster.cpp 变体表）；批三正式版
+//        出生规则：在「相机激活区块窗口内」随机 walkable 位置生成、
+//        离玩家 >= 500px；出生点即「巢」——怪物绕巢巡逻（monster_patrol
+//        _radius）、玩家进入仇恨半径（monster_aggro_radius）才追击、
+//        离巢超过栓绳半径（monster_leash_radius）回巢（AI 状态机见
+//        MonsterAi.h，实体执行见 Monster；回巢回血 monster_return_heal
+//        _percent 为预留键、默认关闭）；
 //        刷新节奏与难度曲线沿用（数量上限初始 4、每 20s +2、封顶 12；
 //        刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s）；
-//        共同追踪玩家、接触伤害 10；
+//        接触伤害 10；
 //      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石；
 //      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开（150px）；
 //      - 成长闭环：拾取宝石 +10 经验 -> 按 LevelCurve 曲线循环结算
@@ -79,6 +83,8 @@
 //      见该类头文件说明——引擎 SoundId 扩展前的过渡实现）
 //   5. 配置：onEnter 时读取玩家速度/生命/攻击参数（冷却/伤害/半径/张角/
 //      击退/扫程时长 attack_swing_time）、怪物速度成长/刷新参数/接触伤害、
+//      怪物生态（monster_patrol_radius 巡逻/monster_aggro_radius 仇恨/
+//      monster_leash_radius 栓绳/回巢回血 monster_return_heal_percent）、
 //      世界（world_chunks_x/y、world_seed）与相机（camera_smooth_time）、
 //      升级曲线（xp_level_base/xp_level_growth）与每级强化
 //      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
@@ -193,14 +199,14 @@ private:
     // 下限 1s
     float currentSpawnInterval() const;
 
-    // 为指定空槽位寻找落点并生成怪物（批二过渡版出生规则）：
-    // 变体等权随机；落点在「玩家中心周围 kMonsterSpawnRadiusMin ~
-    // kMonsterSpawnRadiusMax 圆环内」，需同时满足：
-    //   1. 处于当前激活区块内（非激活区不生怪）；
+    // 为指定空槽位寻找落点并生成怪物（批三正式版出生规则）：
+    // 变体等权随机；落点在「相机激活区块窗口」内均匀随机，需同时满足：
+    //   1. 处于当前激活区块窗口内（采样区域即窗口——非激活区不生怪）；
     //   2. 怪物矩形可走（walkable——不生进墙里）；
     //   3. 离玩家中心 >= kMonsterSpawnMinPlayerDistance（防贴脸刷新）。
-    // 落点重试上限内找不到（极少：玩家贴墙死角等）返回 false，本步不生；
-    // 成功则 loadVariant（换皮）-> spawnAt（落位）并返回 true
+    // 落点重试上限内找不到（极少：窗口内可走区域被占满等）返回 false，
+    // 本步不生；成功则 loadVariant（换皮）-> spawnAt（落位、出生点即巢）
+    // 并返回 true
     bool spawnMonsterAtSlot(Monster& monster);
 
     // 绘制 HUD 文字/条（生存 HUD：HP 条、等级+经验条、击杀/存活；
@@ -222,6 +228,10 @@ private:
     static constexpr float kDefaultMonsterSpawnInterval = 2.5f; // 刷新间隔初始值（秒）
     static constexpr int kDefaultMonsterMaxCount = 4;           // 数量上限初始值（只）
     static constexpr int kDefaultMonsterDamage = 10;            // 怪物接触伤害
+    static constexpr float kDefaultMonsterPatrolRadius = 96.0f; // 巡逻半径缺省（monster_patrol_radius，像素）
+    static constexpr float kDefaultMonsterAggroRadius = 320.0f; // 仇恨半径缺省（monster_aggro_radius，像素）
+    static constexpr float kDefaultMonsterLeashRadius = 500.0f; // 栓绳半径缺省（monster_leash_radius，像素）
+    static constexpr float kDefaultMonsterReturnHealPercent = 0.0f; // 回巢回血缺省（monster_return_heal_percent，0=关闭）
     static constexpr int kDefaultXpLevelBase = 30;              // 升级曲线基数（xp_level_base）
     static constexpr float kDefaultXpLevelGrowth = 1.35f;       // 升级曲线倍率（xp_level_growth）
     static constexpr int kDefaultLevelupHpBonus = 10;           // 每级生命上限强化（levelup_max_hp_bonus）
@@ -257,18 +267,16 @@ private:
     // 配合 0.8s 无敌构成「受击保护窗口」
     static constexpr float kContactKnockbackDistance = 150.0f;
 
-    // ---- 怪物出生（批二过渡版：玩家周围圆环内刷新；批三大改前保持可玩）----
-    // 出生环的半径范围（像素）：内径 550 在视口半对角（约 734）以内——
-    // 一部分出生在屏幕内可见、一部分从屏外走入；外径 750 < 区块边长 768，
-    // 从「相机所在区块 ±1」的激活区内一定能取到（无需再扩窗口）
-    static constexpr float kMonsterSpawnRadiusMin = 550.0f; // 出生环内径（像素）
-    static constexpr float kMonsterSpawnRadiusMax = 750.0f; // 出生环外径（像素）
+    // ---- 怪物出生（批三正式版：激活区块内随机 walkable 点；出生点即巢）----
+    // 采样区域 = 相机激活区块窗口（最多 3x3 区块；玩家所在区块 ±1），
+    // 在窗口矩形内均匀随机取点——「世界里的怪从世界里冒出来」，
+    // 而不是围着玩家画环形。窗口已由 World 回钳在世界内，取点不会出界
 
-    // 与玩家的最小中心距离（像素）：规格冗余保险——内径 550 已保证
-    //（保留显式校验：将来调整内径时这条底线不被无声破坏）
+    // 与玩家的最小中心距离（像素）：规格硬要求——出生点不可近于 500px，
+    // 防止「贴脸刷新」（玩家没有反应时间）；重试上限内取不到就本步不生
     static constexpr float kMonsterSpawnMinPlayerDistance = 500.0f;
 
-    // 找落点的重试上限（次）：随机撞墙/撞非激活区的放弃阈值——
+    // 找落点的重试上限（次）：随机撞墙/撞近距离的放弃阈值——
     // 上限内找不到就本步不生（下一刷新时刻再试），不会死循环
     static constexpr int kMonsterSpawnAttempts = 30;
 
@@ -359,6 +367,13 @@ private:
     float m_monsterSpawnInterval = kDefaultMonsterSpawnInterval; // 刷新间隔初始值（monster_spawn_interval）
     int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）
     int m_monsterDamage = kDefaultMonsterDamage;          // 接触伤害（monster_damage）
+
+    // 怪物生态参数（批三；AI 状态机的决策半径与回血——onEnter 读取后
+    // 注入每个怪物槽位的 MonsterAi；整局沿用，R 重开不重读）
+    float m_monsterPatrolRadius = kDefaultMonsterPatrolRadius; // 巡逻半径（monster_patrol_radius，像素）
+    float m_monsterAggroRadius = kDefaultMonsterAggroRadius;   // 仇恨半径（monster_aggro_radius，像素）
+    float m_monsterLeashRadius = kDefaultMonsterLeashRadius;   // 栓绳半径（monster_leash_radius，像素）
+    float m_monsterReturnHealPercent = kDefaultMonsterReturnHealPercent; // 回巢回血百分比（0=关闭，预留键）
 
     // 相机平滑时间常数（秒；camera_smooth_time，默认 0.12）：
     // 越大越「拖」、越小越「贴」——onEnter 读取后整局沿用（restart 不重读）
