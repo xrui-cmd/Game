@@ -175,3 +175,38 @@ set_target_properties(xp_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  横扫弧形判定单元测试（attack_arc_test）
+#
+#  与 xp_test 同模式：被测对象是 game 层的纯逻辑头文件
+#  （Src/inc/game/AttackArc.h），只用引擎 math 层的 Vec2 与标准库，
+#  不依赖 SDL3、无 .cpp、无链接。include 需要两个目录：
+#    - Src/inc               （"game/AttackArc.h"）
+#    - libs/GameEngine/include（"engine/math/Vec2.h"）
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\attack_arc_test.exe
+# ============================================================
+
+add_executable(attack_arc_test attack_arc_test.cpp)
+
+if (MSVC)
+    target_compile_options(attack_arc_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：AttackArc.h 位于游戏仓 Src/inc，Vec2.h 位于引擎子模块
+target_include_directories(attack_arc_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(attack_arc_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
