@@ -116,8 +116,9 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      monster_return_heal_percent 回巢回血百分比（0=关闭；预留键）
     //      xp_level_base           升级曲线基数（第 1 级升第 2 级的需求）
     //      xp_level_growth         升级曲线倍率（需求逐级倍率）
-    //（M2 起升级成长由三选一卡牌提供——卡池/数值为代码常量，见
-    //  game/UpgradeCard.h 的卡表；旧 levelup_* 自动强化键已退役删除）
+    //（M2 起升级成长由三选一提供；批五B 起选项为法术——法术表/数值与
+    //  商店价格均为代码常量，见 game/Spell.h / UpgradeCard.h / Shop.h；
+    //  旧 levelup_* 自动强化键已退役删除）
     //      world_chunks_x/y        世界区块数（横向/纵向；世界 = 区块 x 768px）
     //      world_seed              世界种子（0 = 每局随机；非 0 = 固定可复现）
     //      camera_smooth_time      相机平滑时间常数（秒）
@@ -402,10 +403,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //     流程照常（降级细节见 LevelupSfx.h 的契约）
     m_levelupSfx.load();
 
-    // 15) 播种三选一升级卡的随机源（M2）：在 [1, INT32_MAX] 取随机种子——
-    //     与 world_seed=0「每局随机」同款口径（每局卡序不同；种子采用
-    //     非 0 值，0 会被 CardSeedRandom::seed 置换为固定常量）。
-    //     R 重开不重新播种：层数清零后卡池全开，后续抽卡沿用同一序列
+    // 15) 播种三选一抽取的随机源（M2；批五B 起服务法术抽取）：在
+    //     [1, INT32_MAX] 取随机种子——与 world_seed=0「每局随机」同款
+    //     口径（每局法术序不同；种子采用非 0 值，0 会被 CardSeedRandom::seed
+    //     置换为固定常量）。R 重开不重新播种：层数清零后法术池全开，
+    //     后续抽取沿用同一序列
     m_cardRng.seed(static_cast<std::uint32_t>(SDL_rand(0x7FFFFFFF)) + 1u);
 }
 
@@ -524,49 +526,51 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
     m_menuHandled = menuPressed; // 记录采样：上升沿去重
 }
 
-// 打开（或再弹）升级三选一面板（M2）：抽一组卡 -> 有卡进入 LevelUp 展示；
-// 池空（防御路径：卡池含两张无限卡、正常局永不空）时逐笔消费欠账并记录
-// 跳过，欠账清完后回到 Playing——「无卡可选」绝不把流程卡死。
+// 打开（或再弹）升级三选一面板（M2；批五B：抽取对象改为法术池）：
+// 抽一组法术 -> 有选项进入 LevelUp 展示；池空（六法术全部 5 层满——
+// 理论晚局可达）时逐笔消费欠账并记录跳过，欠账清完后回到 Playing——
+//「无选项可选」绝不把流程卡死。
 // 调用时机：升级（grantXp 记完欠账）与选择后仍有欠账时
-void PlayScene::openCardPanel()
+void PlayScene::openSpellPanel()
 {
     // 防误触基线置位（批五A）：面板打开后的第一个固定步将采样「左键是否
     // 按着」（见 handleCardChoice 第 0 步）——连升连选换组时同样重置，
     // 与键盘「同一次按住不会连选下一组」的去重语义对齐
     m_cardPanelFresh = true;
 
-    // 欠账 > 0 才需要面板；循环处理「抽到卡」与「池空跳过」两种结果。
-    // 正常流程第一轮就抽到卡返回；池空的循环只是防御兜底（不会死循环：
-    // 每轮要么抽到卡返回、要么消费一笔欠账直到清零）
+    // 欠账 > 0 才需要面板；循环处理「抽到法术」与「池空跳过」两种结果。
+    // 正常流程第一轮就抽到法术返回；池空的循环只是防御兜底（不会死循环：
+    // 每轮要么抽到法术返回、要么消费一笔欠账直到清零）
     while (m_choiceQueue.pending() > 0)
     {
-        // 抽取一组：三张不重复、排除已满层、池不足按实际（纯逻辑，见 UpgradeCard.h）
-        m_offeredCards = drawUpgradeCards(m_cardLevels, &CardSeedRandom::nextFrom, &m_cardRng);
+        // 抽取一组：三张不重复、排除已满层、池不足按实际（纯逻辑，见 Spell.h）
+        m_offeredSpells = drawSpellChoices(m_spellLevels, &CardSeedRandom::nextFrom, &m_cardRng);
 
-        // 抽到至少一张：进入 LevelUp 状态（世界从下一固定步起冻结）并打日志
-        if (m_offeredCards.count > 0)
+        // 抽到至少一系：进入 LevelUp 状态（世界从下一固定步起冻结）并打日志
+        if (m_offeredSpells.count > 0)
         {
             m_state = PlayState::LevelUp; // 切换状态：update 的冻结分支接管
 
-            // 冒烟观测点：面板日志（含实际张数与卡名——「连升连选」断言点：
+            // 冒烟观测点：面板日志（含实际张数与法术名——「连升连选」断言点：
             // 连续两组面板会连续出现两条本日志）
             std::string panelText = "升级选择面板（"; // 拼接「（A / B / C）」样式
-            for (int i = 0; i < m_offeredCards.count; ++i) // 逐张追加卡名
+            for (int i = 0; i < m_offeredSpells.count; ++i) // 逐张追加法术名
             {
                 if (i > 0) // 非首张：先加分隔符
                 {
-                    panelText += " / "; // 卡名分隔符
+                    panelText += " / "; // 法术名分隔符
                 }
-                panelText += cardDef(m_offeredCards.cards[i]).name; // 追加本张卡名
+                panelText += spellDef(m_offeredSpells.spells[i]).name; // 追加本系法术名
             }
             panelText += "）"; // 收尾括号
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "%s", panelText.c_str()); // 面板日志
             return; // 面板就位：本次打开结束
         }
 
-        // 池空（防御路径）：本笔欠账没有卡可选——消费并记录，继续尝试下一笔
-        m_choiceQueue.consume(); // 消费一笔欠账（无卡可选的欠账直接作废）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择跳过（卡池已满）"); // 观测点
+        // 池空（六法术全部 5 层满）：本笔欠账没有法术可选——消费并记录，
+        // 继续尝试下一笔
+        m_choiceQueue.consume(); // 消费一笔欠账（无选项的欠账直接作废）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择跳过（法术全部满层）"); // 观测点
     }
 
     // 欠账全部清空（全部因池空跳过）：确保回到 Playing 并记录恢复
@@ -574,14 +578,15 @@ void PlayScene::openCardPanel()
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择完毕，恢复对局"); // 观测点
 }
 
-// 升级选择输入处理（LevelUp 状态每固定步调用，M2；批五A：鼠标点击）。
-// 完整契约（两路并存/防误触/悬停刷新）见头文件声明处
+// 升级选择输入处理（LevelUp 状态每固定步调用，M2；批五A：鼠标点击；
+// 批五B：选择对象为法术）。完整契约（两路并存/防误触/悬停刷新）见头
+// 文件声明处
 void PlayScene::handleCardChoice(const UpdateContext& ctx)
 {
     // ---- 0) 防误触基线（批五A）：面板打开后的第一个固定步采样 ----
     // 规格：点击以「按下边缘」为准；若面板弹出时玩家已按着左键（战斗中
     // 连扫的持续按住），须松开后新的一次点击才生效。「打开时是否按着」
-    // 在面板弹出后的第一个固定步读取——openCardPanel 无输入上下文，
+    // 在面板弹出后的第一个固定步读取——openSpellPanel 无输入上下文，
     // 此处即最早可读的稳定状态（两者相隔恰好 1 个固定步，语义等价）
     if (m_cardPanelFresh)
     {
@@ -597,7 +602,7 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
         int outH = 0; // 渲染输出高（同上）
         SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
         const Vec2 mouse = ctx.input->mousePosition(); // 鼠标屏幕坐标（窗口客户区快照）
-        m_hoverCard = cardPanelHitTest(mouse.x, mouse.y, m_offeredCards.count,
+        m_hoverCard = cardPanelHitTest(mouse.x, mouse.y, m_offeredSpells.count,
                                        static_cast<float>(outW), static_cast<float>(outH));
     }
     else
@@ -650,7 +655,7 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
         int outH = 0; // 渲染输出高
         SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
         const Vec2 mouse = ctx.input->mousePosition(); // 鼠标屏幕坐标快照
-        const int hit = cardPanelHitTest(mouse.x, mouse.y, m_offeredCards.count,
+        const int hit = cardPanelHitTest(mouse.x, mouse.y, m_offeredSpells.count,
                                          static_cast<float>(outW), static_cast<float>(outH));
         if (hit >= 0)
         {
@@ -668,49 +673,36 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
 
     // 无有效选择（没按 / 按的是空位——不足三张时按 3 等 / 点击在卡外）：
     // 面板继续等待
-    if (chosen < 0 || chosen >= m_offeredCards.count)
+    if (chosen < 0 || chosen >= m_offeredSpells.count)
     {
         return; // 本步不做任何事
     }
 
-    // ---- 卡牌生效：层数 +1（封顶防御——已满层不会再入池，这里是第二道闸）----
-    const CardId id = m_offeredCards.cards[chosen];       // 选中的卡 id
-    const int cardIndex = static_cast<int>(id);           // 层数数组下标（与 CardId 对应）
-    m_cardLevels[cardIndex] = gainCardLevel(id, m_cardLevels[cardIndex]); // 层数 +1（有限卡封顶）
+    // ---- 法术生效：层数 +1（封顶防御——已满层不会再入池，这里是第二道闸）----
+    const SpellId id = m_offeredSpells.spells[chosen]; // 选中的法术 id
+    const int spellIndex = static_cast<int>(id);       // 层数数组下标（与 SpellId 对应）
+    const int oldLevel = m_spellLevels[spellIndex];    // 选择前的层数（初学判定用）
+    m_spellLevels[spellIndex] = gainSpellLevel(oldLevel); // 层数 +1（统一 5 层封顶）
 
-    // 效果立即落地：从「基准 + 层数」重算全部受卡牌影响的数值并注入
-    //（幂等入口；例如伤害/移速/冷却/张角/击退/磁吸/生命上限一步到位）
-    applyCardEffects();
-
-    // 体魄的一次性效果：即时回血 20（上限刚在 applyCardEffects 里 +20）。
-    // 与重算路径分离的原因：applyCardEffects 幂等、不重复回血——「获得
-    // 该卡那一刻」的加血只在本次选择发放（restart 重算不会凭空加血）
-    if (id == CardId::Vitality) // 选中的是体魄？
+    // 初学（0 -> 1）：冷却置 0——学到的下一步就具备施放条件（有敌人时立即
+    // 打出第一发，成长反馈即时）；已学的叠层不动冷却（不打断既有节奏）。
+    // 与升级卡时代「体魄即时回血」同类的一次性动作：只在本次选择发放
+    if (oldLevel <= 0) // 首次学会本系
     {
-        m_playerHp = std::min(m_playerHp + kCardVitalityHealPerLevel, m_playerMaxHp); // 回血 20 并夹上限
+        m_spellCooldownLeft[spellIndex] = 0.0f; // 立即可施放（updateSpells 下一步尝试）
     }
 
-    // ---- 冒烟观测点：升级选择日志（规格文案「升级选择：卡片名（层数 x/上限）」；
-    //      无限卡上限写作「无限」）----
-    const CardDef& def = cardDef(id); // 卡定义（名称与上限文本的来源）
-    char limitText[16];               // 上限文本：数字或「无限」（16 字节绰绰有余）
-    if (def.maxLevel > 0)             // 有限卡：上限写数字
-    {
-        SDL_snprintf(limitText, sizeof(limitText), "%d", def.maxLevel); // 如 "5"
-    }
-    else                              // 无限卡：上限写「无限」
-    {
-        SDL_strlcpy(limitText, "无限", sizeof(limitText)); // 文案（UTF-8 6 字节）
-    }
+    // ---- 冒烟观测点：升级选择日志（批五B 文案「升级选择：法术名（层数 x/5）」）----
+    const SpellDef& def = spellDef(id); // 法术定义（名称来源）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "升级选择：%s（层数 %d/%s）",
-                def.name, m_cardLevels[cardIndex], limitText); // 选择日志
+                "升级选择：%s（层数 %d/%d）",
+                def.name, m_spellLevels[spellIndex], kSpellMaxLevel); // 选择日志
 
     // ---- 欠账消费与后续：未清再弹一组（连升连选）/ 清完回 Playing ----
     const bool hasMore = m_choiceQueue.consume(); // 消费一笔：返回是否还有欠账
     if (hasMore)
     {
-        openCardPanel(); // 欠账未清：立刻抽下一组（换面板继续选）
+        openSpellPanel(); // 欠账未清：立刻抽下一组（换面板继续选）
     }
     else
     {
@@ -2519,8 +2511,8 @@ void PlayScene::renderSpellHud(float screenW, float screenH) const
 // 经验结算：把 amount 点经验并入当前进度，按升级曲线循环结算（一枚宝石
 // 可连升多级），并逐级发放升级反馈（飘字/瞬闪/音效）。曲线计算走
 // LevelCurve 纯函数——本函数只负责「把结果落实到局面」。
-// M2：每级自动强化（旧三项属性成长）已退役——升级成长改为登记欠账并弹出
-// 三选一卡牌（选择生效后经 applyCardEffects 统一落地；见本函数末尾）
+// M2：每级自动强化（旧三项属性成长）已退役；批五B：升级成长改为登记欠账
+// 并弹出三选一法术（选择生效后即具备施法条件；见本函数末尾）
 void PlayScene::grantXp(int amount)
 {
     // 曲线结算：返回新等级 / 当前级新进度 / 连升级数（纯函数，输入输出皆为数据）
@@ -2533,8 +2525,9 @@ void PlayScene::grantXp(int amount)
     m_xp = result.xp;       // 当前级进度（恒小于本级需求）
     m_level = result.level; // 新等级（等级只增不减）
 
-    // 逐级发放升级反馈（一枚宝石连升多级时每级都发一份）。说明（M2）：
-    // 属性成长不在这里发生——只有反馈；成长全部来自卡牌选择
+    // 逐级发放升级反馈（一枚宝石连升多级时每级都发一份）。说明（M2；
+    // 批五B）：即时属性成长不在这里发生——只有反馈；成长来自法术选择
+    //（升级流程）与九项强化购买（商店）
     for (int levelReached = oldLevel + 1; levelReached <= m_level; ++levelReached)
     {
         // 1) 冒烟观测点：升级日志（规格文案「升级！等级 N」——自动化测试断言点）
@@ -2551,15 +2544,15 @@ void PlayScene::grantXp(int amount)
     }
 
     // 有升级才触发 HUD 瞬闪：短暂窗口内等级数字金白交替（渲染端消费本计时）。
-    // 三选一升级卡（M2）同点接入：连升的每一级记一笔欠账（逐次弹选）、
-    // 立即打开第一组选择面板（抽卡 + 进入 LevelUp——世界从下一固定步冻结）；
+    // 三选一法术（批五B）同点接入：连升的每一级记一笔欠账（逐次弹选）、
+    // 立即打开第一组选择面板（抽法术 + 进入 LevelUp——世界从下一固定步冻结）；
     // 升级音效在此按「本次升级」播放一次（连升多级不叠放）
     if (result.levelsGained > 0)
     {
         m_levelFlashLeft = kLevelFlashSeconds;  // 重置为满值（连升多级只刷一次时长）
         m_levelupSfx.play();                    // 升级音效（游戏层直读 levelup.wav；不可用安全静默）
         m_choiceQueue.add(result.levelsGained); // 欠账登记：每升一级欠一次选择
-        openCardPanel();                        // 打开选择面板（正常路径：抽到卡并进入 LevelUp）
+        openSpellPanel();                       // 打开选择面板（正常路径：抽到法术并进入 LevelUp）
     }
 }
 
@@ -2786,15 +2779,16 @@ void PlayScene::separateOverlappingMonsters()
 // 重开一局：把整局相关的数据全部恢复到初始状态
 void PlayScene::restart()
 {
-    // 三选一升级卡清零（M2：「R 重开清零全部层数与效果」的层数侧）：
-    // 层数与欠账全清、面板卡位清空、1/2/3 去重标记复位——新一局的卡池
-    // 从零层开始。卡池随机源不重播种：层数清零后卡池全开，沿用同一序列即可
-    for (int& level : m_cardLevels) // 逐卡遍历层数数组
+    // 强化与升级流程状态清零（M2 起源；批五B 拆分口径）：「R 重开清零
+    // 全部层数与效果」——九强化层数全清（商店购买从零开始）、欠账清空、
+    // 面板选项清空、1/2/3 去重标记复位；抽取随机源不重播种：层数清零后
+    // 法术池全开，沿用同一序列即可
+    for (int& level : m_cardLevels) // 逐项遍历强化层数数组
     {
-        level = 0; // 该卡层数归零
+        level = 0; // 本项层数归零
     }
     m_choiceQueue.clear();             // 欠账清零（未清完的选择不带进新一局）
-    m_offeredCards = CardDrawResult{}; // 面板卡位清空（count = 0）
+    m_offeredSpells = SpellDrawResult{}; // 面板选项清空（count = 0；类型/布局沿用三栏）
     m_choiceHandled[0] = false;        // 1 号去重标记复位
     m_choiceHandled[1] = false;        // 2 号去重标记复位
     m_choiceHandled[2] = false;        // 3 号去重标记复位
@@ -3294,23 +3288,24 @@ void PlayScene::renderHud()
     }
     else if (m_state == PlayState::LevelUp)
     {
-        // 升级三选一面板（M2；批五A：鼠标悬停高亮与点击选择）：
-        // 标题 + 卡片横排 + 操作提示。世界画面冻结在遮罩之下；卡片 =
-        // 色块底板 + 金色边框 + 编号/卡名/描述/层数（简洁版——观感美化
-        // 留 M3）。卡片矩形来自 CardLayout 的共享布局计算（渲染与鼠标
-        // 命中判定同一份——面板画在哪、就能在哪点，防坐标漂移）
+        // 升级三选一面板（M2；批五A：鼠标悬停高亮与点击选择；批五B：
+        // 选项改为法术池）：标题 + 卡片横排 + 操作提示。世界画面冻结在
+        // 遮罩之下；卡片 = 色块底板 + 金色边框 + 编号/法术名/描述/层数
+        //（简洁版——观感美化留 M3）。卡片矩形来自 CardLayout 的共享布局
+        // 计算（渲染与鼠标命中判定同一份——面板画在哪、就能在哪点，
+        // 防坐标漂移）
         const float centerX = screenW / 2.0f; // 水平中心：标题对齐基准
 
         // 标题（金色，屏幕上缘 11% 处）
         SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色：与升级高光同族
-        m_hudFont.drawCentered(m_renderer, "升级！选择强化（1/2/3）", centerX, screenH * 0.11f);
+        m_hudFont.drawCentered(m_renderer, "升级！选择法术（1/2/3）", centerX, screenH * 0.11f);
 
-        const int cardNum = m_offeredCards.count; // 实际张数（1~3）
+        const int cardNum = m_offeredSpells.count; // 实际张数（1~3）
 
         for (int i = 0; i < cardNum; ++i) // 逐卡绘制
         {
-            const CardId id = m_offeredCards.cards[i]; // 本卡的卡 id
-            const CardDef& def = cardDef(id);          // 本卡定义（名称/描述/上限）
+            const SpellId id = m_offeredSpells.spells[i]; // 本卡的法术 id
+            const SpellDef& def = spellDef(id);           // 本卡定义（名称/描述）
             // 本卡矩形：共享布局计算（与 handleCardChoice 的命中判定同源）
             const SDL_FRect cardRect = cardPanelRectAt(i, cardNum, screenW, screenH);
             const bool hovered = (i == m_hoverCard); // 是否鼠标悬停（每固定步刷新）：高亮判据
@@ -3351,7 +3346,7 @@ void PlayScene::renderHud()
             SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);    // 金色
             m_hudFont.draw(m_renderer, indexText, cardRect.x + 16.0f, cardRect.y + 14.0f); // 左上角绘制
 
-            // 卡名（居中，黄色，HUD 字号）
+            // 法术名（居中，黄色，HUD 字号）
             SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 黄色：与编号同族
             m_hudFont.drawCentered(m_renderer, def.name,
                                    cardRect.x + cardRect.w * 0.5f, cardRect.y + 76.0f);
@@ -3361,17 +3356,10 @@ void PlayScene::renderHud()
             m_cardFont.drawCentered(m_renderer, def.desc,
                                     cardRect.x + cardRect.w * 0.5f, cardRect.y + 158.0f);
 
-            // 当前层数（居中，浅灰小字）：有限卡「层数 x/上限」、无限卡「层数 x/无限」
-            const int level = m_cardLevels[static_cast<int>(id)]; // 本卡当前层数
-            char levelText[64]; // 容纳「层数 99/无限」，绰绰有余
-            if (def.maxLevel > 0) // 有限卡：上限写数字
-            {
-                SDL_snprintf(levelText, sizeof(levelText), "层数 %d/%d", level, def.maxLevel);
-            }
-            else // 无限卡：上限写「无限」
-            {
-                SDL_snprintf(levelText, sizeof(levelText), "层数 %d/无限", level);
-            }
+            // 当前层数（居中，浅灰小字）：法术统一 5 层上限——「层数 x/5」
+            const int level = m_spellLevels[static_cast<int>(id)]; // 本系当前层数
+            char levelText[64]; // 容纳「层数 5/5」，绰绰有余
+            SDL_snprintf(levelText, sizeof(levelText), "层数 %d/%d", level, kSpellMaxLevel); // 层数文本
             SDL_SetRenderDrawColor(m_renderer, 190, 190, 190, 255); // 浅灰
             m_cardFont.drawCentered(m_renderer, levelText,
                                     cardRect.x + cardRect.w * 0.5f, cardRect.y + 228.0f);

@@ -91,18 +91,19 @@
 //        42px、历时 0.18s；经碰撞滑动不穿墙；期间 WASD 输入被抑制）+
 //        红染 0.3s（ADD 红光叠加）；0.8s 无敌保留但静默（防连续扣血——
 //        旧版无敌闪烁已移除，渲染不再有任何跳隐）；
-//      - 成长闭环（批四起：宝石自动吸收；M2 起：升级三选一卡）：
+//      - 成长闭环（批四起：宝石自动吸收；M2 起：升级三选一；批五B：
+//        选项改为法术）：
 //        击杀掉落的经验宝石自动飞向玩家（homing：700~900px/s 加速、
 //        穿墙可达；抵达即 +10 经验——玩家无需走动；日志「经验被吸收」；
-//        M2 起经「慧眼」卡乘算提升）-> 按 LevelCurve 曲线循环结算
-//        （溢出一枚可连升多级）-> 每级记一笔「卡牌选择欠账」：进入
-//        LevelUp 状态（世界冻结）弹出三张随机升级卡（1/2/3 或鼠标点击
-//        卡片抉择——批五A；悬停高亮，三张不重复、排除已满层），选择
-//        立即生效并记录「升级选择」日志；
+//        M2 起经「慧眼」强化乘算提升——慧眼批五B 起由商店购买）-> 按
+//        LevelCurve 曲线循环结算（溢出一枚可连升多级）-> 每级记一笔
+//        「选择欠账」：进入 LevelUp 状态（世界冻结）弹出三张随机法术
+//        （1/2/3 或鼠标点击卡片抉择——批五A；悬停高亮，三张不重复、
+//        排除已满层），选择立即生效并记录「升级选择」日志；
 //        欠账未清继续弹下一组（连升连选），清完回 Playing；
 //        升级飘字/等级瞬闪/音效保留；M2 前的「每级自动强化」
-//        （levelup_*）已退役——成长全部由卡牌提供；R 重开清零全部
-//        层数与效果（基准 + 层数重算）
+//        （levelup_*）已退役——成长由法术（升级）+ 九项强化（商店）提供；
+//        R 重开清零全部层数与效果（基准 + 层数重算、法术层数清零）
 //      - 法术（批五B）：升级三选一改抽「法术池」（六种：火球术/冰霜新星/
 //        闪电链/治疗之光/灼烧光环/护盾术；未学可学、已学叠层上限 5），
 //        学会后自动施法（仅 Playing、各自冷却独立、无需按键、与横扫互不
@@ -221,20 +222,22 @@ private:
     // 状态判据天然排除 LevelUp，无需额外分支
     void handleInputEdges(const UpdateContext& ctx);
 
-    // 打开（或再弹）升级三选一面板（M2）：抽一组卡（三张不重复、排除
-    // 已满层、池不足按实际）-> 有卡则进入 LevelUp 展示并打面板日志。
-    // 池空（防御路径：卡池含两张无限卡、正常永不空）时逐笔消费欠账并
-    // 记录跳过，欠账清完后回到 Playing——「无卡可选」绝不卡死流程
-    void openCardPanel();
+    // 打开（或再弹）升级三选一面板（M2；批五B：抽取对象改为法术池）：
+    // 抽一组法术（三张不重复、排除已满层、池不足按实际）-> 有选项则进入
+    // LevelUp 展示并打面板日志。池空（六法术全部 5 层满——理论晚局可达）
+    // 时逐笔消费欠账并记录跳过，欠账清完后回到 Playing——「无选项可选」
+    // 绝不卡死流程
+    void openSpellPanel();
 
-    // 升级选择输入处理（LevelUp 状态每固定步调用，M2；批五A 支持鼠标）：
-    // 输入两路并存——键盘 1/2/3 动作的按下边缘（去重标记与暂停同款）；
-    // 鼠标左键「按下边缘」（pressed）命中某张卡。选中后 -> 卡层数 +1 ->
-    // 打「升级选择」日志 -> 消费一笔欠账 -> 未清再弹一组 / 清完回 Playing。
+    // 升级选择输入处理（LevelUp 状态每固定步调用，M2；批五A 支持鼠标；
+    // 批五B 选择对象改为法术）：输入两路并存——键盘 1/2/3 动作的按下
+    // 边缘（去重标记与暂停同款）；鼠标左键「按下边缘」（pressed）命中
+    // 某张卡。选中后 -> 法术层数 +1（初学冷却置 0 可立即施放）-> 打
+    //「升级选择」日志 -> 消费一笔欠账 -> 未清再弹一组 / 清完回 Playing。
     // 防误触（规格）：点击以「按下边缘」为准；面板打开后的首个固定步若
     // 玩家已按着左键（战斗中连扫），则进入「等待松开」——须先观测到
     // released 一次、其后新的点击才生效（见实现内分步注释）。
-    // 地图外点击（卡间隙/面板外）无效；按到空位（不足三张时按 3 等）时
+    // 卡外点击（卡间隙/面板外）无效；按到空位（不足三张时按 3 等）时
     // 本步不做任何事，面板继续等待。悬停高亮（m_hoverCard）也在此刷新——
     // 与点击判定共用 CardLayout 的同一份布局计算
     void handleCardChoice(const UpdateContext& ctx);
@@ -484,8 +487,9 @@ private:
     static constexpr float kDefaultMonsterReturnHealPercent = 0.0f; // 回巢回血缺省（monster_return_heal_percent，0=关闭）
     static constexpr int kDefaultXpLevelBase = 30;              // 升级曲线基数（xp_level_base）
     static constexpr float kDefaultXpLevelGrowth = 1.35f;       // 升级曲线倍率（xp_level_growth）
-    // 说明（M2）：每级自动强化的 kDefaultLevelup* 常量已退役删除——
-    // 升级成长全部由三选一卡牌提供（卡表与数值常量见 game/UpgradeCard.h）
+    // 说明（M2；批五B 修订）：每级自动强化的 kDefaultLevelup* 常量已退役
+    // 删除——升级成长由三选一法术提供（法术表与数值见 game/Spell.h），
+    // 九项强化由商店金币购买（表与价格见 game/UpgradeCard.h / Shop.h）
     static constexpr int kDefaultWorldChunks = 4;               // 世界区块数缺省值（world_chunks_x/y）：4x4 = 3072x3072
     static constexpr float kDefaultCameraSmoothTime = 0.12f;    // 相机平滑时间常数缺省值（camera_smooth_time，秒）
 
@@ -708,23 +712,25 @@ private:
     float m_cameraSmoothTime = kDefaultCameraSmoothTime;
 
     // ---- 升级配置与曲线（onEnter 读取；R 重开不重读）----
-    // M2 起升级成长由三选一卡牌提供（卡池表与数值常量见 game/UpgradeCard.h），
+    // 批五B：升级成长由三选一法术提供（法术表与数值见 game/Spell.h），
     // 本节只保留经验曲线（旧 levelup_* 自动强化成员已退役删除）
     LevelCurve m_levelCurve; // 经验曲线（base/growth 从 xp_* 键注入）
 
     // ---- 战斗运行时状态（restart 复位）----
     int m_playerHp = kDefaultPlayerHp;   // 玩家当前生命（归零 -> GameOver）
     int m_killCount = 0;                 // 本局累计击杀数（击杀日志/HUD/结算使用）
-    int m_coinCount = 0;                 // 局内货币：本局累计金币数（批三；restart 清零，本批不消费）
+    int m_coinCount = 0;                 // 局内货币：本局累计金币数（批三掉落；批五B 起由商店消费）
     int m_level = 1;                     // 当前等级（restart 复位为 1；升级只增不减）
     int m_xp = 0;                        // 当前级已积累经验（结算后恒小于本级需求；HUD 进度条）
     float m_levelFlashLeft = 0.0f;       // 等级数字瞬闪剩余时长（秒；升级时置满，仅 Playing 递减）
 
-    // ---- 三选一升级卡运行时状态（M2；批五B：数值卡退役，本区仅服务商店）----
+    // ---- 升级与强化运行时状态（M2 起源；批五B 拆分服务）----
+    // m_cardLevels 服务商店（九强化的层数/叠加数学/购买封顶）；欠账队列、
+    // 随机源与面板卡位服务升级流程（三选一抽取的对象已改为法术池）
     int m_cardLevels[kCardCount] = {};       // 九项强化当前层数（下标与 CardId 一一对应；R 重开全清零）
     LevelUpQueue m_choiceQueue;              // 连升欠账队列（每次升级 +1 笔；选择消费；>0 保持逐次弹选）
-    CardDrawResult m_offeredCards;           // 当前面板展示的卡（位序 1/2/3；count 为实际张数）
-    CardSeedRandom m_cardRng;                // 卡池抽取的种子化随机源（onEnter 播种；同种子可复现）
+    SpellDrawResult m_offeredSpells;         // 当前面板展示的法术（位序 1/2/3；count 为实际张数）
+    CardSeedRandom m_cardRng;                // 抽取的种子化随机源（onEnter 播种；法术三抽共用——同种子可复现）
     bool m_choiceHandled[3] = { false, false, false }; // 1/2/3 按下边缘去重标记（与暂停同款语义）
 
     // ---- 商店运行时（批五B；restart 复位面板状态）----
@@ -752,9 +758,9 @@ private:
     SDL_Texture* m_spellTextures[kSpellCount] = {};     // 六法术特效贴图（失败为 nullptr——表现跳过）
     SDL_Texture* m_spellIconTextures[kSpellCount] = {}; // HUD 图标（同上）
 
-    // ---- 卡牌鼠标选择运行时（批五A）----
+    // ---- 卡牌鼠标选择运行时（批五A；批五B 选择对象为法术）----
     int m_hoverCard = -1;                // 悬停卡位序（-1 = 无；LevelUp 每固定步刷新，渲染高亮消费）
-    bool m_cardPanelFresh = true;        // 面板打开后的首个固定步标记（防误触基线采样；openCardPanel 置位）
+    bool m_cardPanelFresh = true;        // 面板打开后的首个固定步标记（防误触基线采样；openSpellPanel 置位）
     bool m_cardClickNeedRelease = false; // 防误触：面板打开时按着左键 -> 须先观测到松开、新点击才生效
     bool m_cardClickHandled = false;     // 左键按下边缘去重标记（同帧多固定步只响应一次）
 
