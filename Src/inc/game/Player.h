@@ -60,6 +60,19 @@ class Camera;
 //      渲染在 render 覆写内完成；自批二起渲染位置经相机换算到屏幕
 //      （批二的贴图未变，只是坐标系从「窗口」升级为「世界」）。
 //      武器素材加载失败只警告：攻击结算照常，只是没有横扫画面
+//   6. 受击反馈（批五A 改版）：被怪物攻击命中时由场景调用
+//      applyHitKnockback——沿「伤害来源 -> 玩家」方向被推开：
+//        - 击退：初速 kHitKnockbackSpeed（480px/s）、指数衰减
+//          （时间常数 kHitKnockbackTau）、历时 kHitKnockbackSeconds
+//          （0.18s）、总位移约 42px（规格 40~50px）；位移经世界碰撞
+//          滑动（墙 + 实心盒），撞墙滑动不穿墙；
+//        - 输入抑制：击退窗口内 WASD 移动输入被抑制（约 0.18s，
+//          与击退同窗）；受击瞬间常规速度清零（冲击手感），
+//          窗口结束输入恢复、从静止重新加速；
+//        - 红染：受击后 kHitTintSeconds（0.3s）内 render 叠加红光
+//          （ADD，强度 = kHitTintGreenBlue 可调）；
+//        - 旧版「无敌闪烁（渲染跳隐）」已移除：无敌时长本身保留在
+//          场景层（0.8s，防连续扣血），但渲染不再做任何闪烁
 // ============================================================
 
 class Player : public Entity
@@ -167,6 +180,19 @@ public:
     // 让调用处（PlayScene::restart / onEnter）读起来更直观
     void reset(float x, float y);
 
+    // ---- 受击反馈入口（批五A，PlayScene 在怪物攻击命中时调用）----
+
+    // 受击击退 + 红染 + 输入抑制（契约见头文件顶部第 6 条）：
+    //   - 方向 = 来源中心 (fromCenterX, fromCenterY) -> 玩家中心（「远离
+    //     伤害来源」的被推开方向）；两中心完全重合（零向量退化）时
+    //     回退朝 +x（确定性方向，不产生 NaN）；
+    //   - 击退速度置满初速（480px/s），update 内指数衰减推进、0.18s 到期
+    //     清零（位移经世界碰撞滑动——撞墙滑动不穿墙）；
+    //   - 常规速度清零（受击冲击）——击退窗口内输入被抑制，速度保持 0；
+    //   - 红染计时置满（0.3s，render 叠加红光）。
+    // 连续受击：全部状态重新计时（以最后一次受击为准）
+    void applyHitKnockback(float fromCenterX, float fromCenterY);
+
     // ---- 主动攻击入口（PlayScene 每固定步在「左键按住」时调用）----
 
     // 尝试朝瞄准方向出手：
@@ -235,6 +261,13 @@ private:
     static constexpr float kDirectionEpsilon = 0.001f; // 方向归一化的退化阈值（长度小于它保留旧方向）
     static constexpr float kFlipDeadZone = 4.0f;       // 朝向跟随鼠标的死区（像素）：横向差小于它时保持朝向
 
+    // ---- 受击反馈参数（批五A；代码常量，不进配置——可调、改注释同步）----
+    static constexpr float kHitKnockbackSpeed = 480.0f;  // 击退初速（像素/秒）——规格约 480
+    static constexpr float kHitKnockbackTau = 0.11f;     // 指数衰减时间常数（秒）：总位移 ≈ 480 x 0.11 x (1-e^(-0.18/0.11)) ≈ 42px（规格 40~50）
+    static constexpr float kHitKnockbackSeconds = 0.18f; // 击退/输入抑制时长（秒）——规格约 0.18
+    static constexpr float kHitTintSeconds = 0.3f;       // 红染时长（秒）——规格约 0.3（比击退略长，受击信号更醒目）
+    static constexpr int kHitTintGreenBlue = 60;         // 红染强度：ADD 叠加前的绿/蓝通道（0~255，越低越红）——强度可调的落点
+
     // ---- 脚部碰撞盒（批四·碰撞体积与视觉解耦）----
     // 取值（像素）：32x26 的小盒摆在精灵底部——宽居中（偏移 (48-32)/2 = 8）、
     // 底边内收 4px（偏移 84-26-4 = 54）。可调：改这四个常量即改判定体积
@@ -257,6 +290,14 @@ private:
     float m_swingLeft = 0.0f;          // 横扫表现剩余时长（秒）：>0 时 render 绘制挥砍画面
     float m_swingDirX = 1.0f;          // 本次挥砍朝向 x 分量（单位向量，朝鼠标；初始向右）
     float m_swingDirY = 0.0f;          // 本次挥砍朝向 y 分量（同上）
+
+    // ---- 受击反馈运行时（批五A；reset 清零）----
+    // 击退位移在 update 内「先推进、后衰减」：本步完整贡献衰减前的速度位移，
+    // 计时归零的那一步仍带位移——总步数 = 0.18s x 120Hz ≈ 22 步（报告口径）
+    float m_knockbackVX = 0.0f;   // 击退速度 x（像素/秒；受击瞬间 = 方向 x 初速 480）
+    float m_knockbackVY = 0.0f;   // 击退速度 y（同上）
+    float m_knockbackLeft = 0.0f; // 击退剩余时长（秒；>0 = 击退窗口，输入被抑制）
+    float m_hitTintLeft = 0.0f;   // 红染剩余时长（秒；>0 时 render 叠加红光）
 
     SDL_Texture* m_weaponTexture = nullptr; // 武器纹理（assets/weapon.png；加载失败为 nullptr，横扫跳过）
 

@@ -1,12 +1,14 @@
 #include "game/scenes/PlayScene.h"
 #include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
 #include "game/Separation.h"       // computeSeparation：重叠兜底与怪怪软分离的最小分离量（批四）
+#include "game/CardLayout.h"       // cardPanelRectAt / cardPanelHitTest：卡面板布局共享计算（批五A）
 #include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
 #include "engine/Input.h"          // Input：ctx.input->pressed 查询暂停/重开/回菜单边缘
 #include "engine/Rect.h"           // rectsOverlap：接触伤害/拾取的 AABB 判定
 #include "engine/SceneManager.h"   // SceneManager：m_sceneManager->requestScene 需要完整类型
+#include <SDL3_image/SDL_image.h>  // IMG_LoadTexture：加载攻击反馈素材（批五A：alert/hit_fx）
 #include <algorithm>               // std::max / std::min：生命夹取、难度曲线封顶
-#include <cmath>                   // std::fmod / std::cos / std::sin：闪烁相位与出生环取点
+#include <cmath>                   // std::fmod / std::cos / std::sin：等级瞬闪相位与出生环取点
 #include <memory>                  // std::make_unique：构造 MenuScene
 #include <string>                  // std::string：拼接素材与字体的绝对路径
 
@@ -25,11 +27,31 @@ void formatSurvivalText(char* buffer, size_t size, float seconds)
 
 } // 匿名命名空间结束
 
-// 析构说明（批二后不再需要自定义析构）：场景自持资源已全部收敛到成员
-// 的 RAII——世界区块/素材纹理由 World 析构兜底释放，玩家/怪物/宝石纹理
-// 由各自 Entity 析构兜底释放，升级音效播放器（LevelupSfx）随成员收尾。
-// 关键时机不变：SceneManager 先析构旧场景、后销毁 renderer，
-// 上述释放发生时 renderer 尚在，安全
+// 析构（批五A 起恢复自定义实现）：除成员 RAII 的既有释放之外（世界区块/
+// 素材纹理由 World 兜底、玩家/怪物/宝石纹理由各 Entity 兜底、升级音效
+// 播放器随 LevelupSfx 收尾），新增的攻击反馈纹理（alert/hit_fx）由本类
+// 自持——在此显式释放。关键时机不变：SceneManager 先析构旧场景、后销毁
+// renderer，上述释放发生时 renderer 尚在，安全
+PlayScene::~PlayScene()
+{
+    releaseFeedbackTextures(); // 攻击反馈纹理释放（幂等；见实现）
+}
+
+// 释放攻击反馈纹理（批五A）：先判空、再销毁、最后置空——幂等，
+// 供析构兜底调用（renderer 销毁前必然已执行）
+void PlayScene::releaseFeedbackTextures()
+{
+    if (m_alertTexture != nullptr)
+    {
+        SDL_DestroyTexture(m_alertTexture); // 释放蓄力警示「!」纹理
+        m_alertTexture = nullptr;           // 置空：重复调用安全
+    }
+    if (m_monsterHitFxTexture != nullptr)
+    {
+        SDL_DestroyTexture(m_monsterHitFxTexture); // 释放命中爪痕纹理
+        m_monsterHitFxTexture = nullptr;           // 置空：重复调用安全
+    }
+}
 
 // 进入场景：保存 renderer 与音效系统、读取配置、加载资源、布置初始局面。
 // 每次进入都是新构造的 PlayScene 对象 => 天然是「全新一局」
@@ -196,6 +218,39 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
+    // 7.5) 攻击反馈纹理（批五A，可选增强）：蓄力警示「!」与命中爪痕——
+    //      与武器素材同一加载模式（IMG_LoadTexture + 最近邻采样），失败只
+    //      警告、对应表现跳过（游戏照常）。alert 一份共享注入全部怪物
+    //      槽位（见步骤 12）；hit_fx 由场景在命中结算时自绘
+    if (basePath != nullptr)
+    {
+        const std::string alertPath = std::string(basePath) + "assets/alert.png"; // 警示素材绝对路径
+        m_alertTexture = IMG_LoadTexture(m_renderer, alertPath.c_str()); // 读文件 -> 解码 -> 纹理
+        if (m_alertTexture != nullptr)
+        {
+            SDL_SetTextureScaleMode(m_alertTexture, SDL_SCALEMODE_NEAREST); // 像素风：最近邻采样
+        }
+        else
+        {
+            // 素材缺失/解码失败：警告后继续（蓄力少了警示，游戏照常可玩）
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "加载警示素材 %s 失败（%s），蓄力警示将跳过", alertPath.c_str(), SDL_GetError());
+        }
+
+        const std::string hitFxPath = std::string(basePath) + "assets/monster_hit_fx.png"; // 爪痕素材绝对路径
+        m_monsterHitFxTexture = IMG_LoadTexture(m_renderer, hitFxPath.c_str()); // 同一加载路径
+        if (m_monsterHitFxTexture != nullptr)
+        {
+            SDL_SetTextureScaleMode(m_monsterHitFxTexture, SDL_SCALEMODE_NEAREST); // 最近邻采样
+        }
+        else
+        {
+            // 素材缺失/解码失败：警告后继续（命中少了爪痕，游戏照常可玩）
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "加载命中特效素材 %s 失败（%s），命中特效将跳过", hitFxPath.c_str(), SDL_GetError());
+        }
+    }
+
     // 8) 注入玩家配置：加减速/动画节奏/扫程时长（不受卡牌影响的四项），
     //    受卡牌影响的数值（移速/攻击冷却/扫角）与其余卡效果走统一入口
     //    applyCardEffects 重算注入。必须在 load 之后设置——load 会把内置
@@ -250,6 +305,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         monster.setAiConfig(aiConfig);                       // AI 决策参数注入
         monster.setReturnHealPercent(m_monsterReturnHealPercent); // 回巢回血（0=关闭）
         monster.setAttackCooldown(m_monsterAttackCooldown);  // 攻击冷却（批四；出招间隔）
+        monster.setAlertTexture(m_alertTexture);             // 蓄力警示「!」（批五A；共享纹理、只借用）
     }
 
     // 13) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
@@ -353,6 +409,11 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
 // 调用时机：升级（grantXp 记完欠账）与选择后仍有欠账时
 void PlayScene::openCardPanel()
 {
+    // 防误触基线置位（批五A）：面板打开后的第一个固定步将采样「左键是否
+    // 按着」（见 handleCardChoice 第 0 步）——连升连选换组时同样重置，
+    // 与键盘「同一次按住不会连选下一组」的去重语义对齐
+    m_cardPanelFresh = true;
+
     // 欠账 > 0 才需要面板；循环处理「抽到卡」与「池空跳过」两种结果。
     // 正常流程第一轮就抽到卡返回；池空的循环只是防御兜底（不会死循环：
     // 每轮要么抽到卡返回、要么消费一笔欠账直到清零）
@@ -392,15 +453,38 @@ void PlayScene::openCardPanel()
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择完毕，恢复对局"); // 观测点
 }
 
-// 升级选择输入处理（LevelUp 状态每固定步调用，M2）：
-// 1/2/3 动作的按下边缘（去重标记与暂停同款）-> 选中的卡层数 +1 ->
-// 打「升级选择」日志 -> 消费一笔欠账 -> 未清再弹一组 / 清完回 Playing。
-// 说明：pressed 在整帧的所有固定步都为 true——去重标记保证「一次按住」
-// 恰好选一张；连选下一组不会被同一帧的重复边沿误消费（下一帧 pressed
-// 已消失，需玩家重新按键）
+// 升级选择输入处理（LevelUp 状态每固定步调用，M2；批五A：鼠标点击）。
+// 完整契约（两路并存/防误触/悬停刷新）见头文件声明处
 void PlayScene::handleCardChoice(const UpdateContext& ctx)
 {
-    // 本步的三个选择动作边沿（ctx.input 为 nullptr 时按「都没按」安全降级）
+    // ---- 0) 防误触基线（批五A）：面板打开后的第一个固定步采样 ----
+    // 规格：点击以「按下边缘」为准；若面板弹出时玩家已按着左键（战斗中
+    // 连扫的持续按住），须松开后新的一次点击才生效。「打开时是否按着」
+    // 在面板弹出后的第一个固定步读取——openCardPanel 无输入上下文，
+    // 此处即最早可读的稳定状态（两者相隔恰好 1 个固定步，语义等价）
+    if (m_cardPanelFresh)
+    {
+        m_cardPanelFresh = false; // 基线只采样一次（后续步骤不再重置）
+        m_cardClickNeedRelease = ctx.input != nullptr && ctx.input->held("attack"); // 按着 -> 等松开
+    }
+
+    // ---- 1) 悬停刷新（批五A）：每固定步用共享布局计算命中哪张卡 ----
+    // 渲染（renderHud 的高亮分支）直接消费本值；无输入系统时按「无悬停」
+    if (ctx.input != nullptr)
+    {
+        int outW = 0; // 渲染输出宽（物理像素——与 renderHud 的布局同一条数源）
+        int outH = 0; // 渲染输出高（同上）
+        SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
+        const Vec2 mouse = ctx.input->mousePosition(); // 鼠标屏幕坐标（窗口客户区快照）
+        m_hoverCard = cardPanelHitTest(mouse.x, mouse.y, m_offeredCards.count,
+                                       static_cast<float>(outW), static_cast<float>(outH));
+    }
+    else
+    {
+        m_hoverCard = -1; // 无输入系统：无悬停高亮
+    }
+
+    // ---- 2) 键盘选择（照常）：1/2/3 动作的按下边缘（去重标记与暂停同款）----
     const bool choice1Pressed = ctx.input != nullptr && ctx.input->pressed("choice_1");
     const bool choice2Pressed = ctx.input != nullptr && ctx.input->pressed("choice_2");
     const bool choice3Pressed = ctx.input != nullptr && ctx.input->pressed("choice_3");
@@ -420,13 +504,49 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
         chosen = 2; // 按 3：第 3 张
     }
 
+    // ---- 3) 鼠标点击选择（批五A）：「左键按下边缘」+ 卡片命中 ----
+    // 左键按下边缘（pressed）：单击与「按住连扫」的持续按住天然区分
+    //（按住期间 pressed 只在最初一帧为真——面板弹出前早已消耗）
+    const bool clickPressed = ctx.input != nullptr && ctx.input->pressed("attack");
+
+    // 等待松开（防误触）：先在「面板打开时按着」的状态下观测到一次
+    // released（松开下降沿），之后的新点击才允许生效；等待期内点击
+    //（含恰好重叠的按下边缘）一律忽略——规格「须松开后新的一次点击」
+    if (m_cardClickNeedRelease)
+    {
+        if (ctx.input != nullptr && ctx.input->released("attack"))
+        {
+            m_cardClickNeedRelease = false; // 已松开：解锁点击
+        }
+    }
+
+    // 点击生效条件（全部满足才处理）：键盘本步未选中（键盘优先）+ 按下
+    // 边缘未被本帧消费过（同帧多固定步去重）+ 已解锁 + 命中某张卡
+    //（卡间隙/面板外 = -1 -> 无效点击：不选、不消费，面板继续等待）
+    if (chosen < 0 && clickPressed && !m_cardClickHandled && !m_cardClickNeedRelease)
+    {
+        int outW = 0; // 渲染输出宽（与悬停检测同一数源——同一次布局）
+        int outH = 0; // 渲染输出高
+        SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
+        const Vec2 mouse = ctx.input->mousePosition(); // 鼠标屏幕坐标快照
+        const int hit = cardPanelHitTest(mouse.x, mouse.y, m_offeredCards.count,
+                                         static_cast<float>(outW), static_cast<float>(outH));
+        if (hit >= 0)
+        {
+            chosen = hit; // 命中卡片：等价按对应数字键（走同一套选择生效流程）
+        }
+    }
+
     // 记录本步采样（去重基线）：上升沿消失前不再重复响应——面板换组后，
-    // 同一次按住不会连选下一组（与暂停/重开的去重语义完全一致）
+    // 同一次按住不会连选下一组（与暂停/重开的去重语义完全一致）；
+    // 鼠标按下边缘同款去重（批五A）
     m_choiceHandled[0] = choice1Pressed; // 1 号采样记录
     m_choiceHandled[1] = choice2Pressed; // 2 号采样记录
     m_choiceHandled[2] = choice3Pressed; // 3 号采样记录
+    m_cardClickHandled = clickPressed;   // 点击采样记录
 
-    // 无有效选择（没按 / 按的是空位——不足三张时按 3 等）：面板继续等待
+    // 无有效选择（没按 / 按的是空位——不足三张时按 3 等 / 点击在卡外）：
+    // 面板继续等待
     if (chosen < 0 || chosen >= m_offeredCards.count)
     {
         return; // 本步不做任何事
@@ -592,6 +712,14 @@ void PlayScene::update(const UpdateContext& ctx)
     // 统一清理已到期的飘字（寿命归零 = 已淡尽，保留其余元素的遍历语义）
     std::erase_if(m_floatingTexts, [](const FloatingText& text) { return text.isExpired(); });
 
+    // 命中特效寿命递减与清理（批五A）：与飘字同一条门控——暂停/结束时
+    // 本函数提前返回，特效随世界一起冻结；寿命归零即移除（渲染渐隐）
+    for (MonsterHitFx& fx : m_monsterHitFxs)
+    {
+        fx.left = std::max(fx.left - ctx.deltaTime, 0.0f); // 递减并夹到 0
+    }
+    std::erase_if(m_monsterHitFxs, [](const MonsterHitFx& fx) { return fx.left <= 0.0f; });
+
     // 鼠标世界坐标（批二）：把本帧鼠标的「屏幕位置」经相机换算到世界，
     // 注入玩家作为朝向翻转的基准——屏幕->世界的换算收敛在场景层，
     // 玩家与相机互不认识（无输入系统时保持朝向不动，与旧行为等价）
@@ -717,7 +845,7 @@ void PlayScene::update(const UpdateContext& ctx)
         const float monsterCenterX = monsterRect.x + monsterRect.w * 0.5f;   // 中心 x
         const float monsterCenterY = monsterRect.y + monsterRect.h * 0.5f;   // 中心 y
 
-        // 非激活区：跳过本步更新（动画/移动/闪白计时全部冻结——暂停语义）
+        // 非激活区：跳过本步更新（动画/移动/红染计时全部冻结——暂停语义）
         if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY))
         {
             continue; // 非激活：本步不推进（渲染端同样跳过）
@@ -731,7 +859,7 @@ void PlayScene::update(const UpdateContext& ctx)
 
         monster.setTarget(playerBox); // 注入追踪目标（批四：玩家碰撞盒 → 中心点 + 完整盒）
         monster.setChaseSpeed(speed); // 注入本步速度（难度曲线：随时间爬升）
-        monster.update(ctx);          // 执行：移动（碰撞滑动）+ 动画 + 闪白 + 攻击状态机
+        monster.update(ctx);          // 执行：移动（碰撞滑动）+ 动画 + 红染/残影 + 攻击状态机
 
         // ---- 攻击结算消费（批四·蓄力前扑，替换旧「纯接触即伤」）----
         // 每只怪物每步至多发布一条结果（consumeAttackResult 返回并清除）
@@ -744,8 +872,9 @@ void PlayScene::update(const UpdateContext& ctx)
         }
         else if (attack == MonsterAttackResult::Hit)
         {
-            // 玩家无敌期内：本次打击无效（无伤害/无日志/无回弹）——
-            // 「受击保护窗口」的语义由「跳过结算」表达（怪物照常进冷却）
+            // 玩家无敌期内：本次打击无效（无伤害/无日志/无击退/无特效/无
+            // 回弹）——「受击保护窗口」的语义由「跳过结算」表达（怪物照常
+            // 进冷却）。批五A：静默保护——跳过即完全无反馈，不再有闪烁
             if (m_playerInvincibleLeft <= 0.0f)
             {
                 // 1) 扣生命（夹到 0：日志展示永远不为负）
@@ -756,21 +885,38 @@ void PlayScene::update(const UpdateContext& ctx)
                             monsterTypeName(monster.type()),
                             m_monsterDamage, m_playerHp, m_playerMaxHp);
 
-                // 2) 打击音效（低频闷响）：与渲染闪烁共同构成「被打」反馈
+                // 2) 打击音效（低频闷响）：受击反馈的听觉层（视觉 = 击退 + 红染）
                 m_audio->play(SoundId::Hit);
 
-                // 3) 玩家无敌：从下一步起攻击结算跳过；渲染每 0.1s 显隐闪烁
+                // 3) 玩家无敌：从下一步起攻击结算跳过（批五A：静默——无任何闪烁）
                 m_playerInvincibleLeft = kPlayerInvincibleSeconds;
 
-                // 4) 怪物小幅回弹（约 40px，替换旧版 150px 弹开）：沿
-                //    「玩家盒中心 -> 怪物中心」方向瞬移；knockback 内部
-                //    做世界可走校验（被墙挡逐级缩短）并快照防拉丝
+                // 4) 玩家受击击退 + 红染（批五A）：沿「怪物中心 -> 玩家中心」
+                //    方向被推开（初速 480px/s 指数衰减、约 42px / 0.18s，
+                //    期间输入被抑制；位移走碰撞滑动不穿墙）。怪物中心取
+                //    「回弹之前」的本步位置——打击来源的真实落点
+                const SDL_FRect monsterCol = monster.collisionRect();              // 怪物脚盒（本步位置）
+                const float monsterCenterX = monsterCol.x + monsterCol.w * 0.5f;   // 怪物盒中心 x
+                const float monsterCenterY = monsterCol.y + monsterCol.h * 0.5f;   // 怪物盒中心 y
+                m_player.applyHitKnockback(monsterCenterX, monsterCenterY);        // 以怪物为来源推开玩家
+
+                // 5) 玩家盒中心快照（以下两处消费：特效中点与回弹方向）——
+                //    都取「命中瞬间」的接触口径（回弹瞬移之后位置已变）
                 const float playerCenterX = playerBox.x + playerBox.w * 0.5f; // 玩家盒中心 x
                 const float playerCenterY = playerBox.y + playerBox.h * 0.5f; // 玩家盒中心 y
+
+                // 6) 接触点命中特效（批五A）：爪痕/爆点在双方中心的中点浮现
+                //    （接触处的近似——贴身对碰时中点即接触带），0.15s 渐隐
+                spawnMonsterHitFx((playerCenterX + monsterCenterX) * 0.5f,
+                                  (playerCenterY + monsterCenterY) * 0.5f);
+
+                // 7) 怪物小幅回弹（约 40px；批四口径）：沿「玩家盒中心 ->
+                //    怪物中心」方向瞬移；knockback 内部做世界可走校验
+                //    （被墙挡逐级缩短）并快照防拉丝
                 monster.knockback(playerCenterX, playerCenterY,
                                   Monster::kAttackRecoilDistance);
 
-                // 5) 生命归零：本步提前结束怪物遍历（GameOver 由循环后的
+                // 8) 生命归零：本步提前结束怪物遍历（GameOver 由循环后的
                 //    统一检查收口；后续怪物不再留下会结算的 Hit）
                 if (m_playerHp <= 0)
                 {
@@ -963,7 +1109,7 @@ void PlayScene::resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& p
 // 扫程推进（每个固定步调用）：刀锋同步命中的核心。
 // 扫程活跃期间，取「上一步刀锋角 -> 本步刀锋角」的扫过区间，对每只
 // 存活且本扫程未命中的怪物：中心在扇形内（距离/中轴夹角）且角度落在
-// 本步扫过区间内 -> 此刻结算（伤害/飘字/闪白/击退/死亡掉落）。
+// 本步扫过区间内 -> 此刻结算（伤害/飘字/红染/击退/死亡掉落）。
 // 收尾步（剩余归零后的第一次推进）把最后一段补扫到终点角、清理命中
 // 记录并给出「挥空」观测点。多目标命中按刀锋先后自然错开若干固定步
 void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
@@ -1038,7 +1184,7 @@ void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
         m_sweepHit[i] = true; // 标记：本扫程不再重复命中该槽位
         ++m_sweepHitCount;    // 本次扫程命中计数 +1（收尾判挥空用）
 
-        // 1) 扣血（闪白在 takeDamage 内自动触发；返回是否致死）
+        // 1) 扣血（红染在 takeDamage 内自动触发；返回是否致死）
         const bool died = monster.takeDamage(m_attackDamage);
 
         // 2) 伤害飘字：在怪物位置弹出「-当前伤害值」（上浮+淡出）。
@@ -1152,6 +1298,23 @@ void PlayScene::dropCoinsAt(float x, float y, int count)
         coin.setPosition(x + offsetX - coin.width() * 0.5f,
                          y + offsetY - coin.height() * 0.5f);
     }
+}
+
+// 生成一处命中特效（批五A）：怪物攻击命中时由场景调用（契约见头文件）
+void PlayScene::spawnMonsterHitFx(float centerX, float centerY)
+{
+    // 原位构造一条特效记录（vector 元素为纯数据，无指针成员——
+    // 扩容搬移安全；频率低、容量自然稳定）
+    m_monsterHitFxs.emplace_back();
+    MonsterHitFx& fx = m_monsterHitFxs.back(); // 引用新记录：完成落位
+    fx.x = centerX;                        // 特效中心 x（接触点近似）
+    fx.y = centerY;                        // 特效中心 y（同上）
+    fx.left = kMonsterHitFxSeconds;        // 寿命置满（0.15s 渐隐）
+
+    // 冒烟观测点：命中特效日志（连拍核验的时序对齐依据——特效与
+    // 「怪物攻击命中」日志同一步产生）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "命中特效（爪痕，位置 %.1f,%.1f）", centerX, centerY);
 }
 
 // 经验结算：把 amount 点经验并入当前进度，按升级曲线循环结算（一枚宝石
@@ -1437,6 +1600,13 @@ void PlayScene::restart()
     m_choiceHandled[1] = false;        // 2 号去重标记复位
     m_choiceHandled[2] = false;        // 3 号去重标记复位
 
+    // 鼠标选择状态复位（批五A）：悬停清空、防误触基线与点击去重标记回
+    // 初始值——新一局的面板（首个）打开时重新采样
+    m_hoverCard = -1;               // 无悬停高亮残留
+    m_cardPanelFresh = true;        // 下个面板打开后采样防误触基线
+    m_cardClickNeedRelease = false; // 解锁状态清零（新局从「未等待」起）
+    m_cardClickHandled = false;     // 点击去重标记复位
+
     // 卡牌效果撤销 + 全部数值复位（M2 统一入口）：层数已清零，重算即等价于
     // 「移速/攻击冷却/伤害/范围/张角/击退/生命上限/磁吸」全部回到基准，
     // 并重新注入 Player 实体（移速/冷却/扫角立即恢复配置初值）
@@ -1479,7 +1649,7 @@ void PlayScene::restart()
     m_world.updateActiveChunks(m_renderer, m_camera);
 
     // 怪物池全部回收：槽位标记未激活（不再更新/渲染/碰撞），
-    // 等刷新时刻从空槽位重新生成；despawn 同时清掉追踪目标与闪白残留
+    // 等刷新时刻从空槽位重新生成；despawn 同时清掉追踪目标与红染残留
     for (Monster& monster : m_monsters)
     {
         monster.despawn();
@@ -1503,6 +1673,9 @@ void PlayScene::restart()
 
     // 场上漂浮文字清空：上一局未播完的伤害/升级飘字不跨局残留
     m_floatingTexts.clear();
+
+    // 场上命中特效清空（批五A）：上一局未播完的爪痕不跨局残留
+    m_monsterHitFxs.clear();
 
     // 最后切回 Playing，新一局正式开始
     m_state = PlayState::Playing;
@@ -1540,17 +1713,10 @@ void PlayScene::render(float alpha)
     // 背景图自批二起退役（区块地板取代；MenuScene 仍继续使用 background.png）
     m_world.render(m_renderer, m_camera);
 
-    // 玩家按插值位置绘制（经相机换算）；无敌期间每 0.1 秒显/隐交替
-    //（闪烁提示保护中）。相位判定：剩余无敌时间对「两倍半周期」取模，
-    // 模值小于半周期时显示——随剩余时间递减自然交替。暂停/结束时剩余值
-    // 冻结，相位一并冻结，画面保持静止（与「暂停=完全冻结」的承诺一致）
-    const bool playerVisible =
-        m_playerInvincibleLeft <= 0.0f ||
-        std::fmod(m_playerInvincibleLeft, kPlayerBlinkHalfPeriod * 2.0f) < kPlayerBlinkHalfPeriod;
-    if (playerVisible)
-    {
-        m_player.render(m_renderer, alpha, m_camera);
-    }
+    // 玩家按插值位置绘制（经相机换算）。批五A：无敌期间不再闪烁跳隐——
+    // 受击反馈由玩家自身的击退位移与红染（Player::render 内叠加）承担，
+    // 每帧连续绘制保证「逐帧无跳隐」的画面（冒烟连拍核验点）
+    m_player.render(m_renderer, alpha, m_camera);
 
     // 怪物：只绘制「存活 + 激活区」槽位（与 update 同一门控——空槽位与
     // 非激活区都不可见，渲染开销随活跃区域有界）
@@ -1567,7 +1733,25 @@ void PlayScene::render(float alpha)
         {
             continue; // 激活窗口外：跳过绘制
         }
-        monster.render(m_renderer, alpha, m_camera); // 存活且激活：绘制（含闪白叠加）
+        monster.render(m_renderer, alpha, m_camera); // 存活且激活：绘制（含残影/警示/红染叠加）
+    }
+
+    // 命中特效（批五A）：接触点的爪痕/爆点——世界层绘制（怪物之上、
+    // 飘字之下），经相机换算；透明度随剩余寿命线性渐隐（画完还原）
+    if (m_monsterHitFxTexture != nullptr && !m_monsterHitFxs.empty())
+    {
+        for (const MonsterHitFx& fx : m_monsterHitFxs)
+        {
+            const Vec2 screen = m_camera.worldToScreen(fx.x, fx.y); // 特效中心的屏幕坐标
+            const SDL_FRect dst{ screen.x - kMonsterHitFxSize * 0.5f, // 以接触点为绘制中心
+                                 screen.y - kMonsterHitFxSize * 0.5f,
+                                 kMonsterHitFxSize,                    // 绘制宽（与素材一致）
+                                 kMonsterHitFxSize };                  // 绘制高（同上）
+            const float ratio = fx.left / kMonsterHitFxSeconds; // 剩余寿命比例 [0,1]
+            SDL_SetTextureAlphaMod(m_monsterHitFxTexture, static_cast<Uint8>(255.0f * ratio)); // 渐隐
+            SDL_RenderTexture(m_renderer, m_monsterHitFxTexture, nullptr, &dst); // 整张绘制（单帧素材）
+        }
+        SDL_SetTextureAlphaMod(m_monsterHitFxTexture, 255); // 还原不透明（防污染后续绘制）
     }
 
     // 说明：原「挥击弧光」特效已退役——攻击表现改由 Player 在自身 render
@@ -1851,56 +2035,72 @@ void PlayScene::renderHud()
     }
     else if (m_state == PlayState::LevelUp)
     {
-        // 升级三选一面板（M2）：标题 + 三卡横排 + 操作提示。
-        // 世界画面冻结在遮罩之下；卡片 = 色块底板 + 金色边框 + 编号/卡名/
-        // 描述/层数（简洁版——观感美化留 M3）
-        const float centerX = screenW / 2.0f; // 水平中心：标题与卡片行的对齐基准
+        // 升级三选一面板（M2；批五A：鼠标悬停高亮与点击选择）：
+        // 标题 + 卡片横排 + 操作提示。世界画面冻结在遮罩之下；卡片 =
+        // 色块底板 + 金色边框 + 编号/卡名/描述/层数（简洁版——观感美化
+        // 留 M3）。卡片矩形来自 CardLayout 的共享布局计算（渲染与鼠标
+        // 命中判定同一份——面板画在哪、就能在哪点，防坐标漂移）
+        const float centerX = screenW / 2.0f; // 水平中心：标题对齐基准
 
         // 标题（金色，屏幕上缘 11% 处）
         SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色：与升级高光同族
         m_hudFont.drawCentered(m_renderer, "升级！选择强化（1/2/3）", centerX, screenH * 0.11f);
 
-        // 卡片几何常量（像素）：宽 300、高 300、间距 30——三张总宽 960，
-        // 1280 窗口下居中后左右各留 160，观感舒展（面板按实际张数排布）
-        constexpr float kCardW = 300.0f;  // 卡宽（像素）
-        constexpr float kCardH = 300.0f;  // 卡高（像素）
-        constexpr float kCardGap = 30.0f; // 卡间距（像素）
-
-        const int cardNum = m_offeredCards.count;                         // 实际张数（1~3）
-        const float totalW = cardNum * kCardW + (cardNum - 1) * kCardGap; // 卡片行总宽
-        const float startX = centerX - totalW * 0.5f;                     // 首卡左边界（整体居中）
-        const float cardY = screenH * 0.30f;                              // 卡片上边界（标题之下）
+        const int cardNum = m_offeredCards.count; // 实际张数（1~3）
 
         for (int i = 0; i < cardNum; ++i) // 逐卡绘制
         {
-            const CardId id = m_offeredCards.cards[i];            // 本卡的卡 id
-            const CardDef& def = cardDef(id);                     // 本卡定义（名称/描述/上限）
-            const float x = startX + i * (kCardW + kCardGap);     // 本卡左边界
-            const SDL_FRect cardRect{ x, cardY, kCardW, kCardH }; // 本卡矩形
+            const CardId id = m_offeredCards.cards[i]; // 本卡的卡 id
+            const CardDef& def = cardDef(id);          // 本卡定义（名称/描述/上限）
+            // 本卡矩形：共享布局计算（与 handleCardChoice 的命中判定同源）
+            const SDL_FRect cardRect = cardPanelRectAt(i, cardNum, screenW, screenH);
+            const bool hovered = (i == m_hoverCard); // 是否鼠标悬停（每固定步刷新）：高亮判据
 
-            // 底板：深色半透明（世界画面隐约透出）——填充需要混合模式
+            // 底板：深色半透明（世界画面隐约透出）——填充需要混合模式；
+            // 悬停时底色变亮一档（「微亮」高亮的底板侧）
             SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND); // 打开混合
-            SDL_SetRenderDrawColor(m_renderer, 28, 32, 46, 232);         // 深蓝灰底（近乎不透明）
+            if (hovered)
+            {
+                SDL_SetRenderDrawColor(m_renderer, 52, 58, 82, 244); // 悬停：亮一档的蓝灰
+            }
+            else
+            {
+                SDL_SetRenderDrawColor(m_renderer, 28, 32, 46, 232); // 常规：深蓝灰底（近乎不透明）
+            }
             SDL_RenderFillRect(m_renderer, &cardRect);                   // 填充底板
             SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE);  // 恢复默认混合
 
-            // 边框：金色描边（SDL_RenderRect 画空心矩形）
-            SDL_SetRenderDrawColor(m_renderer, 205, 175, 70, 255); // 金色
+            // 边框：金色描边（SDL_RenderRect 画空心矩形）；悬停时换亮金
+            // 并再套一圈外扩 3px 的描边（「金色边框加粗」的悬停高亮）。
+            // 外扩量远小于卡间隙 30，不与相邻卡重叠
+            SDL_SetRenderDrawColor(m_renderer, 205, 175, 70, 255); // 金色（常规）
             SDL_RenderRect(m_renderer, &cardRect);                 // 画边框
+            if (hovered)
+            {
+                SDL_SetRenderDrawColor(m_renderer, 255, 225, 120, 255); // 亮金：悬停主色
+                SDL_RenderRect(m_renderer, &cardRect);                  // 原框重描（提亮）
+                const SDL_FRect hoverFrame{ cardRect.x - 3.0f,          // 外扩 3px 的加粗圈
+                                            cardRect.y - 3.0f,
+                                            cardRect.w + 6.0f,          // 宽：两侧各扩 3px
+                                            cardRect.h + 6.0f };        // 高：上下各扩 3px
+                SDL_RenderRect(m_renderer, &hoverFrame);                // 外圈：加粗观感
+            }
 
             // 编号（左上角，金色）：与 1/2/3 按键一一对应
             char indexText[8]; // 容纳 "1"~"3"，绰绰有余
             SDL_snprintf(indexText, sizeof(indexText), "%d", i + 1); // 位序即按键号
             SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);    // 金色
-            m_hudFont.draw(m_renderer, indexText, x + 16.0f, cardY + 14.0f); // 左上角绘制
+            m_hudFont.draw(m_renderer, indexText, cardRect.x + 16.0f, cardRect.y + 14.0f); // 左上角绘制
 
             // 卡名（居中，黄色，HUD 字号）
             SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 黄色：与编号同族
-            m_hudFont.drawCentered(m_renderer, def.name, x + kCardW * 0.5f, cardY + 76.0f);
+            m_hudFont.drawCentered(m_renderer, def.name,
+                                   cardRect.x + cardRect.w * 0.5f, cardRect.y + 76.0f);
 
             // 效果描述（居中，白色，小字号）
             SDL_SetRenderDrawColor(m_renderer, 235, 235, 235, 255); // 近白
-            m_cardFont.drawCentered(m_renderer, def.desc, x + kCardW * 0.5f, cardY + 158.0f);
+            m_cardFont.drawCentered(m_renderer, def.desc,
+                                    cardRect.x + cardRect.w * 0.5f, cardRect.y + 158.0f);
 
             // 当前层数（居中，浅灰小字）：有限卡「层数 x/上限」、无限卡「层数 x/无限」
             const int level = m_cardLevels[static_cast<int>(id)]; // 本卡当前层数
@@ -1914,12 +2114,17 @@ void PlayScene::renderHud()
                 SDL_snprintf(levelText, sizeof(levelText), "层数 %d/无限", level);
             }
             SDL_SetRenderDrawColor(m_renderer, 190, 190, 190, 255); // 浅灰
-            m_cardFont.drawCentered(m_renderer, levelText, x + kCardW * 0.5f, cardY + 228.0f);
+            m_cardFont.drawCentered(m_renderer, levelText,
+                                    cardRect.x + cardRect.w * 0.5f, cardRect.y + 228.0f);
         }
 
-        // 底部操作提示（浅灰，居中，卡片行之下）
+        // 底部操作提示（浅灰，居中，卡片行之下）——批五A：补「点击卡片」
+        // 文案（键盘与鼠标两路并存；位置取共享布局的首卡底边，任何张数
+        // 都对齐同一行列）
         SDL_SetRenderDrawColor(m_renderer, 200, 200, 200, 255); // 浅灰
-        m_hudFont.drawCentered(m_renderer, "按对应数字键选择", centerX, cardY + kCardH + 40.0f);
+        const SDL_FRect firstCard = cardPanelRectAt(0, cardNum, screenW, screenH); // 首卡矩形
+        m_hudFont.drawCentered(m_renderer, "按对应数字键或点击卡片选择", centerX,
+                               firstCard.y + firstCard.h + 40.0f);
     }
 }
 

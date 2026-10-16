@@ -292,9 +292,13 @@ if (MSVC)
     target_compile_options(card_test PRIVATE /utf-8)
 endif()
 
-# 头文件搜索路径：UpgradeCard.h 位于游戏仓 Src/inc（按 "game/UpgradeCard.h" 引用）
+# 头文件搜索路径：UpgradeCard.h 位于游戏仓 Src/inc（按 "game/UpgradeCard.h" 引用）；
+# 批五A 起增加 vendor 的 SDL3 头目录——CardLayout.h（面板布局纯函数）
+# 需要 SDL_rect.h 的 SDL_FRect / SDL_PointInRectFloat（仅类型与内联函数，
+# 不链接 SDL3 运行库）
 target_include_directories(card_test PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
 
 # 产物统一输出到 tests\bin\，与其余测试一致
 set_target_properties(card_test PROPERTIES
@@ -452,6 +456,68 @@ add_custom_command(TARGET monster_attack_test POST_BUILD
 
 # 产物统一输出到 tests\bin\，与其余测试一致
 set_target_properties(monster_attack_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
+
+# ============================================================
+#  玩家受击反馈单元测试（player_hit_test，批五A）
+#
+#  被测对象：Src/cpp/game/Player.cpp 的受击击退部分——applyHitKnockback
+#  的方向/初速/衰减推进、输入抑制窗口、碰撞滑动（贴墙截停）与重置归位。
+#
+#  与 world_test / monster_attack_test 同模式：编译 Player.cpp + World.cpp
+#  + Entity.cpp + Input.cpp 并链接 SDL3 与 SDL3_image（日志/纹理/键盘查询
+#  符号）。实际跑到的路径不加载纹理、不创建窗口；输入经 updateFromKeyArray
+#  注入合成按键——任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\player_hit_test.exe
+# ============================================================
+
+add_executable(player_hit_test
+    player_hit_test.cpp
+    ../Src/cpp/game/Player.cpp
+    ../Src/cpp/game/World.cpp
+    ../libs/GameEngine/src/Entity.cpp
+    ../libs/GameEngine/src/Input.cpp
+)
+
+if (MSVC)
+    target_compile_options(player_hit_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Player.h 等游戏头在 Src/inc，引擎头在子模块，SDL 头在 vendor
+target_include_directories(player_hit_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL3_image/include")
+
+# 链接主工程构建出的 SDL3 与 SDL3_image 导入库
+#（Player/World/Entity 引用 SDL_Log 与 IMG_LoadTexture 等符号；
+#  Input 引用 SDL_GetKeyboardState / SDL_GetMouseState）
+target_link_libraries(player_hit_test PRIVATE
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib"
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL3_image/SDL3_image.lib")
+
+# 运行目录放一份 SDL3.dll 与 SDL3_image.dll（与主工程同一份构建产物）
+add_custom_command(TARGET player_hit_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3.dll"
+    "$<TARGET_FILE_DIR:player_hit_test>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3_image.dll"
+    "$<TARGET_FILE_DIR:player_hit_test>"
+)
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(player_hit_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"

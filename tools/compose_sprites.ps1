@@ -466,7 +466,97 @@ Save-Png -bitmap $decorBmp -path (Join-Path $assetsDir "decor_sheet.png")
 $decorBmp.Dispose()
 
 # ============================================================
-# 7) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
+# 7) 攻击反馈素材（批五A：程序化绘制）
+# ============================================================
+# 说明（报告口径）：DungeonTileset II 素材包内没有「警示感叹号」与
+# 「爪痕爆点」两类帧，无法从原始帧组装——本节的 alert 与 hit_fx
+# 由脚本直接程序化绘制（System.Drawing 画矩形/线段/圆），输出仍是
+# 与其余素材一致的成品 PNG；脚本整体依旧「幂等」：重复运行覆盖同
+# 内容文件，结果一致。
+#   alert.png           怪物蓄力警示「!」：24x36（金黄感叹号 + 暗色
+#                       底影 + 近白高光，暗色地图上高对比可见）
+#   monster_hit_fx.png  命中爪痕/爆点：48x48（三条橙红斜爪痕 + 中心
+#                       黄爆点 + 白心，绘制在接触点 0.15s 渐隐）
+
+# ---- 7.1 alert.png（24x36：竖条 + 点，两层色 + 高光）----
+$alertBmp = New-Canvas -width 24 -height 36
+# 获取警示画布的 Graphics 绘图对象
+$alertG = [System.Drawing.Graphics]::FromImage($alertBmp)
+try {
+    # 竖条与圆点的几何（放大后像素网格直接落笔；圆点与竖条间留 4px 缝）
+    # 底影（暗棕，相对主体右下各偏 1px）：让「!」在亮暗底色上都有轮廓
+    $alertShadow = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 120, 70, 20))
+    # 主体（金黄）：警示的主色，与受击红染（红）在色相上区分层次
+    $alertMain = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 214, 64))
+    # 高光（近白偏黄）：竖条/圆点左缘的一道亮线，做伪立体
+    $alertHi = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 245, 200))
+    try {
+        # 底影：竖条与圆点各画一块（右下偏 1px）
+        $alertG.FillRectangle($alertShadow, 9, 4, 9, 21)  # 竖条底影
+        $alertG.FillRectangle($alertShadow, 9, 29, 9, 8)  # 圆点底影
+        # 主体：竖条（x 8..16, y 3..23）与圆点（x 8..16, y 28..35）
+        $alertG.FillRectangle($alertMain, 8, 3, 9, 21)    # 竖条主体
+        $alertG.FillRectangle($alertMain, 8, 28, 9, 8)    # 圆点主体
+        # 高光：竖条与圆点各在左缘画一道 3px 亮线
+        $alertG.FillRectangle($alertHi, 10, 3, 3, 21)     # 竖条高光
+        $alertG.FillRectangle($alertHi, 10, 28, 3, 8)     # 圆点高光
+    } finally {
+        # 三支画刷用完释放（关闭 GDI 句柄）
+        $alertShadow.Dispose()
+        $alertMain.Dispose()
+        $alertHi.Dispose()
+    }
+} finally {
+    # 释放警示画布 Graphics（内部持有临时资源）
+    $alertG.Dispose()
+}
+# 保存警示图（幂等覆盖）
+Save-Png -bitmap $alertBmp -path (Join-Path $assetsDir "alert.png")
+# 释放警示画布位图
+$alertBmp.Dispose()
+
+# ---- 7.2 monster_hit_fx.png（48x48：三条斜爪痕 + 中心爆点）----
+$fxBmp = New-Canvas -width 48 -height 48
+# 获取特画画布的 Graphics 绘图对象
+$fxG = [System.Drawing.Graphics]::FromImage($fxBmp)
+try {
+    # 爪痕主色（橙红）：与受击红染同族，读作「打中了」
+    $fxClawPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 240, 66, 50), 5)
+    # 爪痕内芯（亮橙）：叠在粗痕上，做「撕裂发光」的层次
+    $fxCorePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 255, 150, 70), 2)
+    # 爆点（黄底 + 白心）
+    $fxBurstBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 210, 80))
+    $fxCoreBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 250, 240))
+    try {
+        # 三条平行斜痕（左上 -> 右下 45°），错开分布在中心两侧
+        $fxG.DrawLine($fxClawPen, 6, 16, 32, 42)   # 左下痕
+        $fxG.DrawLine($fxClawPen, 6, 6, 42, 42)    # 中痕（过中心）
+        $fxG.DrawLine($fxClawPen, 16, 6, 42, 32)   # 右上痕
+        # 亮橙内芯叠在三条粗痕中央（视觉上像痕内的高温）
+        $fxG.DrawLine($fxCorePen, 6, 16, 32, 42)   # 左下痕内芯
+        $fxG.DrawLine($fxCorePen, 6, 6, 42, 42)    # 中痕内芯
+        $fxG.DrawLine($fxCorePen, 16, 6, 42, 32)   # 右上痕内芯
+        # 中心爆点：黄圆 r≈8、白心 r≈4（画在爪痕之上，读作打击核心）
+        $fxG.FillEllipse($fxBurstBrush, 16, 16, 16, 16) # 黄圆（中心 24,24）
+        $fxG.FillEllipse($fxCoreBrush, 20, 20, 8, 8)    # 白心
+    } finally {
+        # 全部画笔/画刷用完释放（关闭 GDI 句柄）
+        $fxClawPen.Dispose()
+        $fxCorePen.Dispose()
+        $fxBurstBrush.Dispose()
+        $fxCoreBrush.Dispose()
+    }
+} finally {
+    # 释放特画画布 Graphics
+    $fxG.Dispose()
+}
+# 保存特画图（幂等覆盖）
+Save-Png -bitmap $fxBmp -path (Join-Path $assetsDir "monster_hit_fx.png")
+# 释放特画画布位图
+$fxBmp.Dispose()
+
+# ============================================================
+# 8) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
 # ============================================================
 # 与代码常量的对应关系（任一处改动必须两边同步）：
 #   player_sheet: 5 帧 x 48 宽 = 240，高 84（Player 的 m_w=48 / m_h=84）
@@ -504,6 +594,10 @@ Assert-PngSize -path (Join-Path $assetsDir "background.png") -expectedWidth 1280
 Assert-PngSize -path (Join-Path $assetsDir "tiles_floor.png") -expectedWidth 384 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "tiles_wall.png") -expectedWidth 48 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "decor_sheet.png") -expectedWidth 96 -expectedHeight 72
+
+#   攻击反馈素材（批五A）：警示「!」24x36；爪痕爆点 48x48
+Assert-PngSize -path (Join-Path $assetsDir "alert.png") -expectedWidth 24 -expectedHeight 36
+Assert-PngSize -path (Join-Path $assetsDir "monster_hit_fx.png") -expectedWidth 48 -expectedHeight 48
 
 # 全部完成提示
 Write-Host "全部成品素材组装并校验完成。"

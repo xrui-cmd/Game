@@ -6,7 +6,7 @@
 #include "engine/Rect.h"    // rectsOverlap：额外实心盒（怪物盒）的重叠判定
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载武器素材（可选增强）
 #include <algorithm>      // std::min / std::max / std::clamp：速度逼近与边界
-#include <cmath>          // std::sqrt / std::cos / std::sin / std::atan2：方向归一化与横扫曲线
+#include <cmath>          // std::sqrt / std::exp / std::cos / std::sin / std::atan2：方向归一化、击退衰减与横扫曲线
 #include <string>         // std::string：拼接武器素材的绝对路径
 
 // 本编译单元私有的移动小工具（不对外暴露）
@@ -215,6 +215,13 @@ void Player::update(const UpdateContext& ctx)
         m_swingLeft = std::max(m_swingLeft - ctx.deltaTime, 0.0f);
     }
 
+    // 受击红染计时递减（批五A）：纯渲染反馈的剩余时长，与固定步长同源
+    // （暂停时随 update 门控冻结，画面保持静止的既有承诺不变）
+    if (m_hitTintLeft > 0.0f)
+    {
+        m_hitTintLeft = std::max(m_hitTintLeft - ctx.deltaTime, 0.0f);
+    }
+
     // 1) 读取输入方向（逐轴独立，取值 -1 / 0 / +1）。
     //    每一轴 = 正方向动作按下（+1）与负方向动作按下（-1）的合成，
     //    同时按下相反方向时两值互相抵消（净输入为 0，视为无输入）。
@@ -240,6 +247,16 @@ void Player::update(const UpdateContext& ctx)
         {
             inputX += 1.0f; // 右
         }
+    }
+
+    // 击退窗口内抑制移动输入（批五A）：受击后约 0.18s 内 WASD 方向输入
+    // 视为 0——击退位移接管移动、操作权短暂交还物理；窗口结束的下一步
+    // 输入自动恢复（玩家从静止重新加速）。攻击输入不在此列（左键横扫
+    // 照常可出——「被打了还能反击」的既有手感保留）
+    if (m_knockbackLeft > 0.0f)
+    {
+        inputX = 0.0f; // 抑制水平输入
+        inputY = 0.0f; // 抑制垂直输入
     }
 
     // 2) 朝向翻转（批二改版）：跟随鼠标——指针在玩家中心右侧朝右、左侧
@@ -297,9 +314,11 @@ void Player::update(const UpdateContext& ctx)
     //    （取代旧版「窗口边框 clamp」——玩家活动范围 = 世界边界，由边界墙
     //    自然形成；判定在实体内部、按注入的 World 执行）。
     //    自批四（碰撞体积与视觉解耦）：滑动判定输入改用「脚部碰撞盒」
-    //    （左上角 = 精灵左上角 + 偏移）——身体可叠压墙脚、脚盒不穿透
-    const float stepDX = m_velocityX * dt; // 本步期望水平位移（像素）
-    const float stepDY = m_velocityY * dt; // 本步期望垂直位移（像素）
+    //    （左上角 = 精灵左上角 + 偏移）——身体可叠压墙脚、脚盒不穿透。
+    //    批五A：击退速度并入同一位移提交（窗口外恒为 0）——击退同样走
+    //    碰撞滑动，「撞墙滑动不穿墙」由同一条路径保证
+    const float stepDX = m_velocityX * dt + m_knockbackVX * dt; // 本步期望水平位移（像素）
+    const float stepDY = m_velocityY * dt + m_knockbackVY * dt; // 本步期望垂直位移（像素）
 
     if (m_world != nullptr)
     {
@@ -319,6 +338,24 @@ void Player::update(const UpdateContext& ctx)
         // 世界未注入（防御分支）：退化为无碰撞位移——不限制、不崩溃
         m_x += stepDX; // 直接推进 x
         m_y += stepDY; // 直接推进 y
+    }
+
+    // 4.5) 击退推进收尾（批五A）：本步位移已按衰减前的速度完整计入（上一步），
+    //      现在做指数衰减并递减窗口计时；计时归零时残余低速直接清零——击退
+    //      历时恰为 kHitKnockbackSeconds（0.18s ≈ 22 个固定步；末速约 98px/s
+    //      被截断，对应亚像素级的瞬时收尾，肉眼不可辨）。顺序说明：先位移、
+    //      后衰减，保证「计时归零的那一步」仍贡献完整位移（总位移口径稳定）
+    if (m_knockbackLeft > 0.0f)
+    {
+        const float decay = std::exp(-dt / kHitKnockbackTau); // 本步指数衰减因子（固定步下为常量）
+        m_knockbackVX *= decay;                                 // 衰减 x 速度（供下一步位移使用）
+        m_knockbackVY *= decay;                                 // 衰减 y 速度（同上）
+        m_knockbackLeft = std::max(m_knockbackLeft - dt, 0.0f); // 窗口计时递减（夹到 0）
+        if (m_knockbackLeft <= 0.0f)
+        {
+            m_knockbackVX = 0.0f; // 窗口结束：残余速度清零（不再产生位移）
+            m_knockbackVY = 0.0f; // 同上（y 轴）
+        }
     }
 
     // 5) 行走动画推进与子区间切换（固定帧时长与渲染帧率解耦）：
@@ -344,6 +381,22 @@ void Player::render(SDL_Renderer* renderer, float alpha, const Camera& camera) c
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
     //（基类内部完成世界坐标 -> 屏幕坐标的相机换算）
     Entity::render(renderer, alpha, camera);
+
+    // 受击红染（批五A）：受击后 kHitTintSeconds 内把同一帧以「红光叠加」
+    // 再画一遍——ADD 混合 + 颜色调制压掉大部分绿蓝通道（与怪物红染/出招
+    // 脉冲同一技法：素材复用、不加新图）。强度 = kHitTintGreenBlue
+    //（0~255，越低越红——可调常量）。旧版无敌闪烁（渲染跳隐）已移除：
+    // 受击的可读反馈由「击退位移 + 红染」承担，不再有逐帧显隐
+    if (m_hitTintLeft > 0.0f && m_texture != nullptr)
+    {
+        SDL_SetTextureColorMod(m_texture, 255,
+                               static_cast<Uint8>(kHitTintGreenBlue),
+                               static_cast<Uint8>(kHitTintGreenBlue)); // 偏红：只留少量绿蓝参与加色
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);         // 叠加混合：在底色上「加光」
+        Entity::render(renderer, alpha, camera);                       // 第二次绘制：红光叠加
+        SDL_SetTextureColorMod(m_texture, 255, 255, 255);              // 还原颜色调制（防污染后续绘制）
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);       // 还原混合模式
+    }
 
     // 只有「横扫表现期内」且武器纹理已加载时才画剑；其余时刻直接结束
     //（早退不触碰纹理 alpha 状态——上一帧的绘制末尾已恢复 255）
@@ -423,6 +476,41 @@ void Player::render(SDL_Renderer* renderer, float alpha, const Camera& camera) c
     drawBlade(bladeAngleRad, 255);
 }
 
+// 受击击退（批五A）：沿「伤害来源 -> 玩家」方向被推开 + 红染 + 输入抑制
+//（契约见头文件；PlayScene 在怪物攻击命中时调用）
+void Player::applyHitKnockback(float fromCenterX, float fromCenterY)
+{
+    // 方向 = 来源中心 -> 玩家中心（「远离伤害来源」的被推开方向）。
+    // 用中心点计算：与击退/飘字等既有方向换算同口径，尺寸差不会偏方向
+    const float centerX = m_x + m_w * 0.5f; // 玩家中心 x（世界坐标）
+    const float centerY = m_y + m_h * 0.5f; // 玩家中心 y（世界坐标）
+    const float dx = centerX - fromCenterX; // 水平分量（正右负左）
+    const float dy = centerY - fromCenterY; // 垂直分量（正下负上）
+    const float length = std::sqrt(dx * dx + dy * dy); // 方向长度（像素）
+
+    // 归一化后乘以初速；两中心几乎重合（长度过小）时回退朝 +x——
+    // 与击退/挥砍等既有方向零向量防御同一口径：确定性方向、绝不 NaN
+    if (length > kDirectionEpsilon)
+    {
+        m_knockbackVX = dx / length * kHitKnockbackSpeed; // 单位方向 x x 初速
+        m_knockbackVY = dy / length * kHitKnockbackSpeed; // 单位方向 y x 初速
+    }
+    else
+    {
+        m_knockbackVX = kHitKnockbackSpeed; // 重合退化：默认朝右（确定性）
+        m_knockbackVY = 0.0f;               // 水平方向
+    }
+
+    // 受击冲击：常规速度清零——击退窗口内输入被抑制、速度保持 0，
+    // 窗口结束后玩家从静止重新加速（「被打退又站稳」的手感顺序）
+    m_velocityX = 0.0f; // 水平速度清零
+    m_velocityY = 0.0f; // 垂直速度清零
+
+    // 击退/输入抑制窗口与红染计时置满（连续受击时各自重新计时）
+    m_knockbackLeft = kHitKnockbackSeconds; // 击退窗口（约 0.18s）
+    m_hitTintLeft = kHitTintSeconds;        // 红染（约 0.3s，比击退略长）
+}
+
 // 重开归位：委托基类的 setPosition 瞬间覆盖坐标（不经过速度/时间累积），
 // 并清零速度与攻击状态——否则重开后玩家会带着上一局的动量/冷却/横扫继续
 void Player::reset(float x, float y)
@@ -434,6 +522,13 @@ void Player::reset(float x, float y)
     // 且不残留上一局未播完的挥砍画面
     m_attackCooldownLeft = 0.0f; // 冷却清零：新一局立即可以出手
     m_swingLeft = 0.0f;          // 横扫表现清零：清除未播完的挥砍画面
+
+    // 受击反馈状态清零（批五A）：上一局的击退/红染绝不带进新一局——
+    // 新一局第一帧起输入立即可用、画面无红光残留
+    m_knockbackVX = 0.0f;   // 击退速度 x 清零
+    m_knockbackVY = 0.0f;   // 击退速度 y 清零
+    m_knockbackLeft = 0.0f; // 击退窗口关闭（输入不再被抑制）
+    m_hitTintLeft = 0.0f;   // 红染熄灭
 
     // 挥砍朝向回初始（向右）：新一局的第一个固定步会按鼠标位置重新
     // 决定朝向与瞄准方向，这里只是把状态归到与构造时一致的起点

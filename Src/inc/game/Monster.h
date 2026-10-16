@@ -15,7 +15,7 @@ class Camera;
 //
 // 本批改造（批三·怪物生态）：行为升级为「巡逻/仇恨/栓绳回巢」状态机，
 // 决策核心抽到 game/MonsterAi.h（纯逻辑、可单测），本类负责执行：
-// 移动（含绕墙轻量改进）、动画、闪白、血条、日志与回血落账。
+// 移动（含绕墙轻量改进）、动画、受击红染（批五A）、血条、日志与回血落账。
 //
 // 继承自 Entity 获得的能力（与 Player/XpGem 共用，不再各自复制）：
 //   - 位置/尺寸数据与 rect()、setPosition()、width()/height() 查询
@@ -50,9 +50,11 @@ class Camera;
 //      位移经世界碰撞处理（分轴滑动 + 卡死检测 + 持久化侧滑，见 update
 //      与 moveWithCollision 内注释）。巡逻速度 = 变体基础速度 x 0.5
 //      （不随难度成长——挑战来自追击；难度曲线只作用于 Chase/Return）
-//   4. 战斗反馈（沿用上一版）：受击闪白（约 0.1s，render 叠加加色绘制）
-//      + 击退（沿背离伤害来源的方向瞬移，落点做世界可走校验）；死亡转
-//      「未激活」（对象池语义：不再更新/渲染/碰撞，槽位等下一次 spawnAt 复用）
+//   4. 战斗反馈（批五A 改版，玩家/怪物同款）：受击红染（约 0.18s，render
+//      叠加 ADD 红光——旧版白闪退役；与场景的玩家受击红染同技法同色调）
+//      + 击退照旧（沿背离伤害来源的方向瞬移，落点做世界可走校验）；死亡
+//      转「未激活」（对象池语义：不再更新/渲染/碰撞，槽位等下一次
+//      spawnAt 复用）
 //   5. 生成 / 击退 / 回收都是「状态突变类操作」：落点定稿后必须快照
 //      prev=cur，否则渲染插值会从旧位置拉丝到新位置（延续既有纪律）
 //   6. 动画节奏：4 帧循环、每帧 0.2 秒（代码常量），由基类 render 的
@@ -67,15 +69,19 @@ class Camera;
 //      36x30、底部内收 6px（setCollisionBox）——移动滑动、击退落点、
 //      游荡点校验、玩家互碰全部改用碰撞盒；渲染/血条照旧用完整精灵
 //      （48x48）。俯视角下「身体可叠压墙脚、脚盒不穿透」
-//  10. 攻击（批四·蓄力前扑，替换旧「纯接触即伤」）：玩家进入接触范围
-//      （双方碰撞盒触接 + 小余量）且冷却就绪时出招——蓄力 0.3s
-//      （移速归零 + 沿出招反方向轻微后倾 4px，给玩家躲避窗口，方向在
-//      出招瞬间朝玩家一次性锁定）→ 前扑（朝锁定方向短促前冲 10px，
-//      视觉与逻辑同步——位移经碰撞滑动）→ 结算：玩家仍在接触范围 =
-//      Hit、否则 Miss（蓄力落空）。结果经 consumeAttackResult 交场景
-//      消费（扣血/无敌/回弹/音效是场景职责）；出招后进入冷却
-//      （monster_attack_cooldown 注入）。出招瞬间的红色脉冲（0.1s）
-//      由 render 叠加绘制——素材复用不加新图
+//  10. 攻击（批五A 升级·蓄力前扑强化版，替换批四轻量版）：玩家进入接触
+//      范围（双方碰撞盒触接 + 小余量）且冷却就绪时出招——
+//        - 蓄力 0.35s：移速归零 + 后倾加深 8px（沿出招反方向后退，
+//          给玩家躲避窗口；方向在出招瞬间朝玩家一次性锁定）+ 头顶警示
+//          「!」（alert 纹理由场景注入，蓄力期间显示、前扑开始消失）；
+//        - 前扑：朝锁定方向冲 24px / 0.12s（快出慢收曲线——初速为
+//          2 倍平均、线性收势到 0），期间拖 1~2 重渐隐残影（复用武器
+//          残影思路：半透明副本画在两个自然采样点上）；
+//        - 结算：玩家仍在接触范围 = Hit、否则 Miss（蓄力落空）；
+//        - 落空收势：Miss 后原地收势 0.2s 再回追击（扑空的恢复节奏）；
+//      结果经 consumeAttackResult 交场景消费（扣血/无敌/回弹/音效/
+//      命中爪痕特效都是场景职责）；出招后进入冷却（monster_attack_cooldown
+//      注入）。出招瞬间的红色脉冲（0.1s）保留——素材复用不加新图
 // ============================================================
 
 // 怪物攻击结算结果（批四）：Monster 每步至多发布一次，场景消费一次
@@ -185,7 +191,7 @@ public:
     // 当前生命上限（出生时按变体数值表写入；血条比例与回血夹取都读它）
     int maxHp() const { return m_maxHp; }
 
-    // 受击：扣血 + 重置闪白计时。返回本次受击是否导致死亡：
+    // 受击：扣血 + 重置红染计时。返回本次受击是否导致死亡：
     // true = 生命归零、本对象转入「未激活」（调用方负责击杀计数/掉落）；
     // false = 仍存活（调用方通常再施加击退）。
     // 负数伤害属于调用方错误：忽略并警告，不改变任何状态
@@ -200,13 +206,13 @@ public:
     void spawnAt(float centerX, float centerY);
 
     // 回收：从场上移除本怪物（重开清场/未来清屏技使用），槽位可被再次
-    // spawnAt 复用。清掉追踪目标、闪白状态与 AI/侧滑运行时——
+    // spawnAt 复用。清掉追踪目标、红染状态与 AI/侧滑运行时——
     // 复用前的残留数据（追踪目标/状态机/卡死检测窗口）全部归零
     void despawn()
     {
         m_alive = false;     // 未激活：不再更新/渲染/碰撞
         m_hasTarget = false; // 清追踪目标：下次激活等场景重新注入
-        m_flashLeft = 0.0f;  // 清闪白：新生成的怪物不带受击光效
+        m_hitTintLeft = 0.0f; // 清受击红染：新生成的怪物不带受击光效
         m_ai.clear();        // AI 状态回巡逻（巢保留——下次 spawnAt 会重写）
         clearMotionState();  // 清持久化侧滑与卡死检测窗口
         clearAttackState();  // 清攻击状态（批四：出招阶段/冷却/脉冲不跨生命周期）
@@ -242,26 +248,33 @@ public:
     // 负数属于配置错误：忽略并警告，保留原冷却；0 允许（连续出招）
     void setAttackCooldown(float seconds);
 
+    // 注入蓄力警示「!」纹理（批五A；场景加载一份后注入全部槽位——只借用
+    // 不持有，纹理生命周期归场景）。传 nullptr = 无警示（加载失败降级：
+    // 蓄力表现只剩后倾与警示缺失，游戏照常）；render 在蓄力期间绘制
+    void setAlertTexture(SDL_Texture* texture) { m_alertTexture = texture; }
+
     // 消费本步攻击结算结果（场景在每个 update 之后调用一次）：返回并
     // 立即清除——Hit/Miss 各自只发布一次，绝不重复结算
     MonsterAttackResult consumeAttackResult();
 
-    // 攻击是否进行中（蓄力或前扑）：冒烟与单测的查询点
+    // 攻击动作是否进行中（蓄力 / 前扑 / 落空收势）：冒烟与单测的查询点
     bool attacking() const { return m_attackPhase != AttackPhase::None; }
 
-    // 覆写更新：AI 状态决策（MonsterAi）+ 帧动画 + 闪白计时 + 朝目标移动
-    //（移动经世界碰撞与绕墙轻量改进）；状态切换/回巢事件的日志也在此处
-    //（含变体名——冒烟断言用）。签名与基类保持一致
+    // 覆写更新：AI 状态决策（MonsterAi）+ 帧动画 + 受击红染/残影计时 +
+    // 朝目标移动（移动经世界碰撞与绕墙轻量改进）；状态切换/回巢事件的
+    // 日志也在此处（含变体名——冒烟断言用）。签名与基类保持一致
     void update(const UpdateContext& ctx) override;
 
-    // 覆写渲染：基础绘制（经相机世界->屏幕换算）之外，
-    // 受击闪白期间额外叠加一次加色绘制；受损后（hp < maxHp）在头顶
-    // 绘制屏幕空间小血条（满血隐藏）
+    // 覆写渲染：前扑残影（1~2 重渐隐副本）-> 基础绘制（经相机世界->屏幕
+    // 换算）-> 出招染色脉冲（出招瞬间 0.1s）/ 受击红染（批五A：红光叠加，
+    // 与玩家同款）-> 蓄力警示「!」（蓄力期间显示）-> 受损后（hp < maxHp）
+    // 在头顶绘制屏幕空间小血条（满血隐藏）
     void render(SDL_Renderer* renderer, float alpha, const Camera& camera) const override;
 
 private:
     static constexpr float kSize = 48.0f;           // 怪物边长（正方形），也是单帧宽高
-    static constexpr float kHitFlashSeconds = 0.1f; // 受击闪白时长（秒；代码常量，不进配置）
+    static constexpr float kHitTintSeconds = 0.18f; // 受击红染时长（秒；规格约 0.18——代码常量，不进配置）
+    static constexpr float kHitTintGreenBlue = 60;  // 红染强度：ADD 叠加前的绿/蓝通道（0~255，越低越红）——与玩家红染同款
 
     // ---- 脚部碰撞盒（批四）：判定的「体积」与 48x48 的视觉解耦 ----
     // 取值（像素）：36x30 的小盒摆在精灵底部——宽居中（偏移 (48-36)/2 = 6）、
@@ -310,21 +323,35 @@ private:
     static constexpr float kHpBarHeight = 5.0f;  // 血条高（像素；规格 5）
     static constexpr float kHpBarGapY = 6.0f;    // 头顶与血条底边的间隙（像素）
 
-    // ---- 攻击（批四·蓄力前扑）：常量与内部状态机 ----
-    // 蓄力/前冲/回弹为「代码常量并注释」（规格口径）——回弹距离公开见
-    // 上方 kAttackRecoilDistance（场景命中结算消费），其余仅本类内部使用
+    // ---- 蓄力警示「!」（批五A）：素材尺寸与头顶锚位 ----
+    static constexpr float kAlertWidth = 24.0f;   // 警示绘制宽（像素；与 alert.png 尺寸一致）
+    static constexpr float kAlertHeight = 36.0f;  // 警示绘制高（像素；同上）
+    static constexpr float kAlertOffsetY = 24.0f; // 警示底边相对精灵顶部上移量（像素；高于血条区，同屏不重叠）
+
+    // ---- 攻击（批五A 升级·蓄力前扑强化版）：常量与内部状态机 ----
+    // 蓄力/前扑/收势/回弹为「代码常量并注释」（规格口径）——回弹距离公开
+    // 见上方 kAttackRecoilDistance（场景命中结算消费），其余仅本类内部使用
     static constexpr float kDefaultAttackCooldown = 1.2f;  // 缺省冷却（秒）：monster_attack_cooldown 缺键回退
-    static constexpr float kAttackWindupSeconds = 0.3f;    // 蓄力时长（秒；规格 0.2~0.4 取中值）——躲避窗口
-    static constexpr float kAttackLungeDistance = 10.0f;   // 前冲距离（像素；规格约 10）
-    static constexpr float kAttackLungeSeconds = 0.1f;     // 前冲时长（秒）：前冲速度 = 距离/时长 = 100px/s
-    static constexpr float kAttackLeanDistance = 4.0f;     // 蓄力后倾距离（像素）：沿反方向的「轻微后倾」总位移
+    static constexpr float kAttackWindupSeconds = 0.35f;   // 蓄力时长（秒）——批五A：0.3 -> 0.35（躲避窗口加长、警示更从容）
+    static constexpr float kAttackLeanDistance = 8.0f;     // 蓄力后倾距离（像素）：沿反方向的后退总位移——批五A：4 -> 8（蓄势更深）
+    static constexpr float kAttackLungeDistance = 24.0f;   // 前冲距离（像素）——批五A：10 -> 24（大幅前扑；被玩家碰撞盒截停时实际更短）
+    static constexpr float kAttackLungeSeconds = 0.12f;    // 前冲时长（秒）——批五A：0.1 -> 0.12；位移走「快出慢收」曲线（初速 2 倍平均）
+    static constexpr float kAttackRecoverySeconds = 0.2f;  // 落空收势时长（秒）：Miss 后原地收势（扑空惩罚窗口）再回追击
     static constexpr float kAttackPulseSeconds = 0.1f;     // 出招染色脉冲时长（秒；规格约 0.1）
     static constexpr float kAttackContactMargin = 6.0f;    // 接触范围余量（像素）：碰撞盒触接之外再放宽 6px
     static constexpr float kAttackDirEpsilon = 0.001f;     // 出招方向零向量阈值（长度小于它退回默认方向）
 
-    // 攻击阶段（内部状态机）：None 平时 / Windup 蓄力 / Lunge 前扑。
-    // 「结算」不单列阶段——前扑走完的那一步就地判定 Hit/Miss 并回 None
-    enum class AttackPhase { None, Windup, Lunge };
+    // ---- 前扑残影（批五A）：复用武器残影思路的半透明副本 ----
+    static constexpr int kLungeGhostCount = 2;             // 残影数量（重）：前扑起点 1 重 + 过半 1 重
+    static constexpr float kLungeGhostLifeSeconds = 0.18f; // 每重残影的渐隐寿命（秒）：覆盖前扑全程并留一点尾巴
+    static constexpr int kLungeGhostStartAlpha = 115;      // 残影起始透明度（0~255；约 0.45，越旧越淡）
+    static constexpr float kLungeGhostSample = 0.5f;       // 第 2 重残影的采样进度（前扑归一化进度过半时记录）
+
+    // 攻击阶段（内部状态机）：None 平时 / Windup 蓄力 / Lunge 前扑 /
+    // Recovery 落空收势（批五A 新增——Miss 后的原地收势窗口）。
+    // 「命中结算」不单列阶段——前扑走完的那一步就地判定 Hit/Miss：
+    // Hit 直接回 None；Miss 先进 Recovery 再回 None
+    enum class AttackPhase { None, Windup, Lunge, Recovery };
 
     static constexpr int kFrameCount = 4; // 每个变体精灵表的总帧数（4 帧 x 48px = 192px 宽）
 
@@ -333,7 +360,7 @@ private:
     bool m_alive = false;     // 是否在场：spawnAt 置 true，受击致死/回收置 false
     int m_hp = 0;             // 当前生命值（spawnAt 时按变体数值表写入）
     int m_maxHp = 0;          // 当前生命上限（同上；血条比例与回血夹取读它）
-    float m_flashLeft = 0.0f; // 受击闪白剩余时长（秒；>0 时 render 叠加提亮）
+    float m_hitTintLeft = 0.0f; // 受击红染剩余时长（秒；>0 时 render 叠加红光）
 
     bool m_hasTarget = false;  // 玩家目标是否已注入（false 时 AI 视为玩家不可见）
     float m_targetX = 0.0f;    // 目标点 x（世界坐标，玩家碰撞盒中心）
@@ -341,16 +368,28 @@ private:
     SDL_FRect m_targetBox{};   // 玩家碰撞盒快照（批四：接触范围判定用完整盒）
     float m_chaseSpeed = 0.0f; // 本步移动速度（像素/秒，由场景注入）
 
-    // ---- 攻击运行时（批四）：状态机与待消费结果 ----
-    AttackPhase m_attackPhase = AttackPhase::None; // 当前攻击阶段（平时/蓄力/前扑）
+    // ---- 攻击运行时（批四）；批五A：前扑进度 + 残影 + 收势 ----
+    AttackPhase m_attackPhase = AttackPhase::None; // 当前攻击阶段（平时/蓄力/前扑/落空收势）
     float m_attackCooldown = kDefaultAttackCooldown; // 冷却总时长（秒）：setAttackCooldown 注入
     float m_attackCooldownLeft = 0.0f; // 冷却剩余（秒）：<=0 且接触才可出招
-    float m_attackPhaseLeft = 0.0f;    // 当前阶段剩余时长（秒）：蓄力倒计时 / 前冲窗口兜底
-    float m_lungeRemaining = 0.0f;     // 前冲剩余距离（像素）：按实际位移扣减，走完即结算
+    float m_attackPhaseLeft = 0.0f;    // 当前阶段剩余时长（秒）：蓄力/前扑/收势共用倒计时
+    float m_lungeMoved = 0.0f;         // 前扑已分配位移（像素）：按「快出慢收」曲线逐步逼近 24px 预算
     float m_attackDirX = 1.0f;         // 出招锁定方向 x（单位向量；蓄力开始时朝玩家一次性锁定）
     float m_attackDirY = 0.0f;         // 出招锁定方向 y（同上）
     float m_attackPulseLeft = 0.0f;    // 出招染色脉冲剩余时长（秒）：>0 时 render 叠加偏红
     MonsterAttackResult m_attackResult = MonsterAttackResult::None; // 待消费结果（每步至多一条）
+
+    // ---- 前扑残影运行时（批五A）----
+    struct LungeGhost
+    {
+        float x = 0.0f;    // 残影位置 x（记录时的精灵左上角世界坐标）
+        float y = 0.0f;    // 残影位置 y（同上）
+        float left = 0.0f; // 剩余寿命（秒；>0 时 render 按比例渐隐绘制）
+    };
+    LungeGhost m_lungeGhosts[kLungeGhostCount]; // 残影槽位（记录顺序 0 -> 1）
+    int m_lungeGhostNext = 0; // 下一个待记录的残影槽位（0..kLungeGhostCount；>= 数量 = 已录满）
+
+    SDL_Texture* m_alertTexture = nullptr; // 蓄力警示「!」纹理（场景注入的共享资源；nullptr = 不绘制）
 
     // AI 状态机（决策核心；参数/巢/回血百分比都封装在内部，见 MonsterAi）
     MonsterAi m_ai;
@@ -381,16 +420,43 @@ private:
     }
 
     // 清攻击运行时（despawn 与 spawnAt 复用）：池槽位复用时旧怪物的
-    // 出招阶段/冷却/脉冲/待消费结果绝不带进新怪物——「池复用后新怪
-    // 不带旧攻击状态」的判据（冒烟与单测覆盖）
+    // 出招阶段/冷却/脉冲/待消费结果/残影绝不带进新怪物——「池复用后
+    // 新怪不带旧攻击状态」的判据（冒烟与单测覆盖）
     void clearAttackState()
     {
         m_attackPhase = AttackPhase::None;          // 阶段回平时
         m_attackCooldownLeft = 0.0f;                // 冷却清空：新怪接触即可出招
         m_attackPhaseLeft = 0.0f;                   // 阶段计时清零
-        m_lungeRemaining = 0.0f;                    // 前冲预算清零
+        m_lungeMoved = 0.0f;                        // 前扑位移进度清零
         m_attackPulseLeft = 0.0f;                   // 染色脉冲熄灭
         m_attackResult = MonsterAttackResult::None; // 待消费结果丢弃（不跨生命周期发布）
+        clearLungeGhosts();                         // 前扑残影清空（批五A：不跨生命周期）
+    }
+
+    // 清前扑残影（批五A）：寿命清零（render 不再绘制）并复位记录槽位——
+    // despawn/spawnAt/每次出招开始时调用（旧残影绝不出现在新动作里）
+    void clearLungeGhosts()
+    {
+        for (LungeGhost& ghost : m_lungeGhosts)
+        {
+            ghost.left = 0.0f; // 寿命归零：该槽位不再绘制
+        }
+        m_lungeGhostNext = 0; // 记录槽位回起点（两重可重新记录）
+    }
+
+    // 记录一重前扑残影（批五A）：把当前精灵左上角写入下一个空槽位、
+    // 寿命置满（render 按剩余寿命渐隐绘制）；两重录满后本调用为无操作
+    void recordLungeGhost()
+    {
+        if (m_lungeGhostNext >= kLungeGhostCount)
+        {
+            return; // 已录满（本动作残影数量上限）
+        }
+        LungeGhost& ghost = m_lungeGhosts[m_lungeGhostNext]; // 本重写入的槽位
+        ghost.x = m_x;                    // 记录当前 x（世界坐标左上角）
+        ghost.y = m_y;                    // 记录当前 y（同上）
+        ghost.left = kLungeGhostLifeSeconds; // 寿命置满（渐隐起算）
+        ++m_lungeGhostNext;               // 槽位推进（下一重写下一个）
     }
 
     // 攻击状态机单步推进（蓄力后倾 -> 前扑前冲 -> 结算）：仅 update 内调用。

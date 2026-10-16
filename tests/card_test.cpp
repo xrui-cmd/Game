@@ -10,15 +10,19 @@
 //             ⑥ 等权性（大样本首抽频率统计）
 //             ⑦ 欠账队列（连升连选：add/consume/pending/clear）
 //             ⑧ 模拟一局（抽取 -> 选择 -> 封顶 -> 池缩到两张无限卡）
+//             ⑨ 卡面板布局（批五A：CardLayout 居中/间距/命中/越界防御——
+//                渲染与鼠标命中同一份计算，防坐标漂移）
 //
-//  与其余测试的差异 : 本测试测的是「无任何依赖」的纯逻辑头文件——
-//  既不链接 SDL3，也不需要窗口/音频/文件，任何机器上都能确定性运行
+//  与其余测试的差异 : ①~⑧ 测「无任何依赖」的纯逻辑头文件；⑨ 额外引入
+//  CardLayout.h（同样 header-only 纯函数，只依赖 SDL_rect.h 的类型与
+//  内联点测——不链接 SDL3 运行时），任何机器上都能确定性运行
 //  （构建接线见 tests/CMakeLists.txt 的 card_test 目标）
 //
 //  退出码 : main 返回"失败用例数"（全部通过 = 0）
 // ============================================================================
 
 #include "game/UpgradeCard.h" // 被测类型：CardId / CardDef / 抽取 / 叠加数学 / 欠账队列
+#include "game/CardLayout.h"  // 被测函数：cardPanelRectAt / cardPanelHitTest（批五A 布局）
 
 #include <cmath>    // std::fabs：浮点容差比较
 #include <cstdio>   // std::printf
@@ -597,6 +601,55 @@ int main()
         expectTrue("重开清零后：有限卡重新入池", anyFiniteSeen);
     }
     endCase(8, p0, f0);
+
+    // ------------------------------------------------------------------
+    // CASE 9 卡面板布局（批五A）：CardLayout 共享计算——渲染与命中同源
+    // ------------------------------------------------------------------
+    beginCase(9, "卡面板布局（居中/间距/命中/越界防御；渲染与命中同一份计算）");
+    p0 = gPass; f0 = gFail;
+    {
+        // 1280x720（默认窗口）：三张卡总宽 3x300 + 2x30 = 960，
+        // 居中后首卡左边界 = 640 - 480 = 160；卡片行上边界 = 720 x 0.30 = 216
+        const SDL_FRect c3_0 = cardPanelRectAt(0, 3, 1280.0f, 720.0f); // 三张：卡 0
+        const SDL_FRect c3_1 = cardPanelRectAt(1, 3, 1280.0f, 720.0f); // 三张：卡 1
+        const SDL_FRect c3_2 = cardPanelRectAt(2, 3, 1280.0f, 720.0f); // 三张：卡 2
+        expectNear("三张：卡 0 左边界（居中）", c3_0.x, 160.0f, 0.001f);
+        expectNear("三张：卡 1 左边界（含间距 30）", c3_1.x, 490.0f, 0.001f);
+        expectNear("三张：卡 2 左边界", c3_2.x, 820.0f, 0.001f);
+        expectNear("三张：卡片行上边界（屏高 30%）", c3_0.y, 216.0f, 0.001f);
+        expectNear("三张：卡宽", c3_0.w, 300.0f, 0.001f);
+        expectNear("三张：卡高", c3_0.h, 300.0f, 0.001f);
+        // 右边界对称性：末卡右缘 = 屏宽 - 首卡左边界（居中不偏）
+        expectNear("三张：末卡右缘与首卡左边界对称", 1280.0f - (c3_2.x + c3_2.w), c3_0.x, 0.001f);
+
+        // 两张：总宽 630 -> 首卡 325；一张：总宽 300 -> 首卡 490
+        const SDL_FRect c2_0 = cardPanelRectAt(0, 2, 1280.0f, 720.0f); // 两张：卡 0
+        expectNear("两张：卡 0 左边界（重新居中）", c2_0.x, 325.0f, 0.001f);
+        const SDL_FRect c1_0 = cardPanelRectAt(0, 1, 1280.0f, 720.0f); // 一张：卡 0
+        expectNear("一张：卡 0 左边界（单卡居中）", c1_0.x, 490.0f, 0.001f);
+
+        // 越界防御：非法位序/空张数 -> 空矩形（w = h = 0；不崩、可判无效）
+        const SDL_FRect invalidNeg = cardPanelRectAt(-1, 3, 1280.0f, 720.0f); // 负位序
+        const SDL_FRect invalidOver = cardPanelRectAt(3, 3, 1280.0f, 720.0f); // 越上界
+        const SDL_FRect invalidZero = cardPanelRectAt(0, 0, 1280.0f, 720.0f); // 空张数
+        expectTrue("越界防御：负位序返回空矩形", invalidNeg.w == 0.0f && invalidNeg.h == 0.0f);
+        expectTrue("越界防御：越上界返回空矩形", invalidOver.w == 0.0f && invalidOver.h == 0.0f);
+        expectTrue("越界防御：空张数返回空矩形", invalidZero.w == 0.0f && invalidZero.h == 0.0f);
+
+        // 命中测试：与渲染同一份布局——各卡中心必然命中对应位序
+        expectInt("命中：卡 0 中心 -> 0", cardPanelHitTest(310.0f, 366.0f, 3, 1280.0f, 720.0f), 0);
+        expectInt("命中：卡 1 中心 -> 1", cardPanelHitTest(640.0f, 366.0f, 3, 1280.0f, 720.0f), 1);
+        expectInt("命中：卡 2 中心 -> 2", cardPanelHitTest(970.0f, 366.0f, 3, 1280.0f, 720.0f), 2);
+        // 贴边内侧 0.5px 命中（左上角附近）；右缘外 1px 属间隙不算
+        expectInt("命中：卡 0 左上角内侧 0.5px", cardPanelHitTest(160.5f, 216.5f, 3, 1280.0f, 720.0f), 0);
+        expectInt("命中：卡 0 右缘外 1px（间隙）-> -1", cardPanelHitTest(461.0f, 366.0f, 3, 1280.0f, 720.0f), -1);
+        expectInt("命中：卡 1/卡 2 间隙中点 -> -1", cardPanelHitTest(805.0f, 366.0f, 3, 1280.0f, 720.0f), -1);
+        expectInt("命中：面板外（屏左上）-> -1", cardPanelHitTest(10.0f, 10.0f, 3, 1280.0f, 720.0f), -1);
+        expectInt("命中：卡片行上方（标题区）-> -1", cardPanelHitTest(640.0f, 100.0f, 3, 1280.0f, 720.0f), -1);
+        // 两张面板：卡 1 中心（655+150=805, 366）命中 1
+        expectInt("命中：两张面板的卡 1 中心 -> 1", cardPanelHitTest(805.0f, 366.0f, 2, 1280.0f, 720.0f), 1);
+    }
+    endCase(9, p0, f0);
 
     // ------------------------------------------------------------------
     const int total = gPass + gFail;

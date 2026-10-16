@@ -2,7 +2,7 @@
 #include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
 #include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
 #include "engine/Rect.h"    // rectsOverlap：攻击接触范围（碰撞盒 + 余量）的 AABB 判定
-#include <algorithm> // std::clamp / std::max：闪白计时、滑移权重与战斗数值的上下界
+#include <algorithm> // std::clamp / std::max：红染计时、滑移权重与战斗数值的上下界
 #include <cmath>     // std::sqrt：归一化方向、距离与侧滑权重的计算
 
 // 本编译单元私有的变体数值表与工具（不对外暴露）
@@ -54,6 +54,29 @@ int variantIndex(MonsterType type)
     // 枚举值直接作为下标使用；越界（未来加枚举忘加表项）夹到最后一项，
     // 宁可外观/数值不符也绝不越界读表
     return std::clamp(static_cast<int>(type), 0, static_cast<int>(MonsterType::Count) - 1);
+}
+
+// 前扑「快出慢收」缓出映射（批五A）：把归一化进度 p ∈ [0,1] 映射成
+// 位移分配位置 f(p) = 1 - (1-p)²——
+//   f'(0) = 2：出手速度为平均速度的 2 倍（规格「快出」的数学表达）；
+//   f'(1) = 0：收势速度归零，冲到位时没有急刹感。
+// 与 AttackArc 的挥砍缓出（1-(1-t)²）同族——全项目运动观感一致；
+// 边界防御：非正（含 NaN）按 0、达到/超过 1 按 1（夹到端点，绝不外溢）
+float easeOutLunge(float p)
+{
+    // 非正与 NaN 防御：!(p > 0) 一并接住 0、负值与 NaN（NaN 比较恒假）
+    if (!(p > 0.0f))
+    {
+        return 0.0f; // 未开始：停在起点
+    }
+    // 达到/超过 1（含 +inf）：停在终点（冲量已全部释放）
+    if (p >= 1.0f)
+    {
+        return 1.0f; // 已完成：位移分配到位
+    }
+    // 二次缓出主体：1 - (1-p)² = 2p - p²，前快后慢
+    const float inv = 1.0f - p; // 剩余进度（1-p）
+    return 1.0f - inv * inv;    // 缓出后的位移分配比例
 }
 
 } // 匿名命名空间结束
@@ -112,7 +135,7 @@ void Monster::setTarget(const SDL_FRect& targetRect)
     m_hasTarget = true;                             // 标记玩家可见：AI 开始做仇恨判定
 }
 
-// 受击：扣血 + 闪白；返回是否死亡（生命归零）
+// 受击：扣血 + 红染；返回是否死亡（生命归零）
 bool Monster::takeDamage(int amount)
 {
     // 负数伤害是调用方错误（等价于治疗且逻辑不通）：警告并忽略，状态不变
@@ -126,8 +149,10 @@ bool Monster::takeDamage(int amount)
     // 扣血并把生命夹到 0：日志/血条永远看不到负数生命
     m_hp = std::max(m_hp - amount, 0);
 
-    // 闪白计时重置为满值：连续受击时白光从本次受击重新起算（视觉连续）
-    m_flashLeft = kHitFlashSeconds;
+    // 受击红染计时重置为满值（批五A）：连续受击时红光从本次受击重新
+    // 起算（视觉连续）；旧版白闪（ADD 全白提亮）已退役——玩家/怪物
+    // 统一为「红染」受击语言
+    m_hitTintLeft = kHitTintSeconds;
 
     // 生命归零：转入「未激活」——不再更新/渲染/碰撞，槽位等 spawnAt 复用
     if (m_hp == 0)
@@ -154,7 +179,7 @@ void Monster::spawnAt(float centerX, float centerY)
     m_alive = true;                     // 本对象进入战场：更新/渲染/碰撞自此生效
     m_maxHp = std::max(spec.hp, 1);     // 生命上限（血条比例与回血夹取都读它）
     m_hp = m_maxHp;                     // 出生满血（0 血出生会在首帧判定为已死）
-    m_flashLeft = 0.0f;                 // 新生怪物不带受击光效
+    m_hitTintLeft = 0.0f;               // 新生怪物不带受击红染
     m_hasTarget = false;                // 玩家目标等场景下个固定步注入
 
     // AI 复位（批三）：随机源就位 -> 巢 = 出生点（出生点即巢）-> 状态全量
@@ -288,8 +313,9 @@ void Monster::beginWindup()
     }
 
     m_attackPhase = AttackPhase::Windup;      // 进入蓄力（本步起常规移动被接管）
-    m_attackPhaseLeft = kAttackWindupSeconds; // 蓄力倒计时（0.3s）
-    m_lungeRemaining = kAttackLungeDistance;  // 前冲预算就位（前扑阶段消费）
+    m_attackPhaseLeft = kAttackWindupSeconds; // 蓄力倒计时（0.35s——批五A 加长，警示与后倾更从容）
+    m_lungeMoved = 0.0f;                      // 前扑位移进度清零（进 Lunge 后按曲线重新分配）
+    clearLungeGhosts();                       // 清旧残影（连续出招时不留上一轮的影）
     m_attackPulseLeft = kAttackPulseSeconds;  // 出招瞬间染色脉冲（0.1s）
 
     // 冒烟观测点：出招日志（含变体名——自动化测试断言「接触才出招」）
@@ -315,13 +341,14 @@ bool Monster::playerInContactRange() const
     return rectsOverlap(expanded, collisionRect()); // 与自身脚盒相交 = 在范围内
 }
 
-// 攻击状态机单步推进：蓄力（后倾）-> 前扑（前冲）-> 结算 Hit/Miss
+// 攻击状态机单步推进：蓄力（后倾）-> 前扑（快出慢收冲量 + 残影）->
+// Hit/Miss 结算 -> 落空收势（批五A 升级版）
 void Monster::advanceAttack(float dt)
 {
     if (m_attackPhase == AttackPhase::Windup)
     {
-        // 蓄力：移速归零（常规移动已被本状态接管）+ 轻微后倾——沿出招
-        // 反方向以恒低速后退（总位移 ≈ kAttackLeanDistance 4px / 0.3s）。
+        // 蓄力：移速归零（常规移动已被本状态接管）+ 后倾——沿出招反方向
+        // 以恒低速后退（总位移 ≈ kAttackLeanDistance 8px / 0.35s）。
         // 后倾是真实位移（经碰撞滑动；贴墙时会被挡住——可接受的边界），
         // 「视觉后倾与逻辑同一位置」由此保证
         const float leanSpeed = kAttackLeanDistance / kAttackWindupSeconds; // 后倾速度（px/s）
@@ -332,37 +359,66 @@ void Monster::advanceAttack(float dt)
         if (m_attackPhaseLeft <= 0.0f)
         {
             m_attackPhase = AttackPhase::Lunge;      // 蓄力结束 -> 前扑
-            m_attackPhaseLeft = kAttackLungeSeconds; // 前冲窗口（时长兜底：被挡也能收招）
+            m_attackPhaseLeft = kAttackLungeSeconds; // 前扑时长（0.12s 固定窗口）
+            m_lungeMoved = 0.0f;                     // 位移进度归零（曲线分配的起点）
+            recordLungeGhost();                      // 第 1 重残影：后倾终点（扑出前的站位）
         }
         return; // 本步只走蓄力阶段
     }
 
-    // ---- Lunge（前扑）：朝锁定方向短促前冲（视觉与逻辑同步）----
-    const float lungeSpeed = kAttackLungeDistance / kAttackLungeSeconds; // 前冲速度（100px/s）
-    const float step = std::min(lungeSpeed * dt, m_lungeRemaining);       // 本步前冲量（不超预算）
-
-    const float beforeX = m_x; // 前冲前的精灵 x（统计实际位移用）
-    const float beforeY = m_y; // 前冲前的精灵 y
-    applyAttackMotion(m_attackDirX * step,  // 朝锁定方向前冲（经碰撞滑动）
-                      m_attackDirY * step);
-    const float movedX = m_x - beforeX; // 实际位移 x（被墙/玩家挡会变短）
-    const float movedY = m_y - beforeY; // 实际位移 y
-    const float moved = std::sqrt(movedX * movedX + movedY * movedY); // 实际前冲距离（像素）
-
-    // 预算按「实际走完的距离」扣减（被挡到挪不动时靠时长兜底收招——
-    // 两者取先到者，绝不会滞留在前扑阶段）
-    m_lungeRemaining -= moved;
-    m_attackPhaseLeft -= dt;
-
-    // 预算耗尽或窗口超时：一次出招结束 -> 就地结算命中
-    if (m_lungeRemaining <= 0.01f || m_attackPhaseLeft <= 0.0f)
+    if (m_attackPhase == AttackPhase::Lunge)
     {
-        // 结算：玩家是否仍在接触范围（碰撞盒触接 + 余量）——「蓄力落空
-        // （玩家已离开）」与命中由此区分；是否真扣血由场景按无敌状态裁决
-        m_attackResult = playerInContactRange() ? MonsterAttackResult::Hit
-                                                : MonsterAttackResult::Miss;
-        m_attackPhase = AttackPhase::None;       // 阶段复位：回归常规 AI 移动
-        m_attackCooldownLeft = m_attackCooldown; // 出招后进入冷却（monster_attack_cooldown）
+        // ---- 前扑：朝锁定方向冲量，「快出慢收」曲线分配 24px 位移 ----
+        // 每步的位移增量 = 曲线在本步末的累计位移 - 上一步末的累计位移。
+        // 初速为平均速度的 2 倍（快出）、末速归零（收势）——见 easeOutLunge
+        m_attackPhaseLeft -= dt; // 前扑倒计时先走（本步按新剩余量换算进度）
+        const float remaining = std::max(m_attackPhaseLeft, 0.0f);              // 剩余时长（夹到 0，防负）
+        const float progress = 1.0f - remaining / kAttackLungeSeconds;          // 归一化进度 [0,1]
+        const float targetMoved = kAttackLungeDistance * easeOutLunge(progress); // 本步末应累计的位移
+        const float step = targetMoved - m_lungeMoved;                           // 本步位移增量（像素）
+
+        applyAttackMotion(m_attackDirX * step,  // 朝锁定方向前冲（经碰撞滑动）
+                          m_attackDirY * step);
+        // 进度落定：按「曲线分配量」而非实际位移记——被墙/玩家盒截停时
+        // 实际位移更短，但曲线不停（时长尾段用于收势，不会突然补冲）
+        m_lungeMoved = targetMoved;
+
+        // 第 2 重残影：进度过半时记录在当前位置（前扑路径的两个自然采样点，
+        // 与残影寿命共同构成「1~2 重渐隐拖尾」）
+        if (progress >= kLungeGhostSample)
+        {
+            recordLungeGhost(); // 内部自带录满检查：两重后为无操作
+        }
+
+        // 时长走完：一次出招结束 -> 就地结算命中（固定 0.12s 窗口制；
+        // 被挡到挪不动也按时收招——动作时长稳定、可预期）
+        if (m_attackPhaseLeft <= 0.0f)
+        {
+            // 结算：玩家是否仍在接触范围（碰撞盒触接 + 余量）——「蓄力落空
+            // （玩家已离开）」与命中由此区分；是否真扣血由场景按无敌状态裁决
+            if (playerInContactRange())
+            {
+                m_attackResult = MonsterAttackResult::Hit; // 命中：直接回归常规 AI
+                m_attackPhase = AttackPhase::None;
+            }
+            else
+            {
+                m_attackResult = MonsterAttackResult::Miss;  // 落空：先进收势
+                m_attackPhase = AttackPhase::Recovery;       // 扑空惩罚：原地收势
+                m_attackPhaseLeft = kAttackRecoverySeconds;  // 收势窗口（0.2s）
+            }
+            m_attackCooldownLeft = m_attackCooldown; // 出招后进入冷却（无论 Hit/Miss）
+        }
+        return; // 本步只走前扑阶段
+    }
+
+    // ---- Recovery（落空收势，批五A）：原地收招 0.2s 再回追击 ----
+    // 移速归零（常规移动被本状态接管）、只走倒计时——扑空后的动作停顿
+    // 让「躲开」获得可读的代价窗口（与蓄力窗口对称的节奏感）
+    m_attackPhaseLeft -= dt; // 收势倒计时（固定步递减）
+    if (m_attackPhaseLeft <= 0.0f)
+    {
+        m_attackPhase = AttackPhase::None; // 收势结束：回归常规 AI 移动
     }
 }
 
@@ -447,9 +503,10 @@ bool Monster::nudge(float dx, float dy)
     return false; // 三个候选全被挡：原地不动（下一帧再试——绝不推动玩家）
 }
 
-// 覆写更新：AI 状态决策 + 帧动画 + 闪白计时 + 朝目标点移动（移动经世界碰撞）。
-// 分工：AI（MonsterAi）只做状态/目标决策；本函数把决策执行成位移，
-// 并在状态切换/到巢事件上打日志、结回血——「场景注入、实体执行」的延续
+// 覆写更新：AI 状态决策 + 帧动画 + 受击红染/残影计时 + 朝目标点移动
+//（移动经世界碰撞）。分工：AI（MonsterAi）只做状态/目标决策；本函数把
+// 决策执行成位移，并在状态切换/到巢事件上打日志、结回血——「场景注入、
+// 实体执行」的延续
 void Monster::update(const UpdateContext& ctx)
 {
     // 第一行固定动作：快照「本步开始前的位置」作为渲染插值起点。
@@ -460,13 +517,24 @@ void Monster::update(const UpdateContext& ctx)
     // 跑动/蠕动动画在巡逻/追击全程持续播放
     m_animTime += ctx.deltaTime;
 
-    // 受击闪白计时递减并夹到 0：与固定步长同源，暂停时随 update 门控冻结
-    if (m_flashLeft > 0.0f)
+    // 受击红染计时递减并夹到 0（批五A）：与固定步长同源，暂停时随
+    // update 门控冻结（红光相位一并冻结——画面静止承诺不变）
+    if (m_hitTintLeft > 0.0f)
     {
-        m_flashLeft = std::max(m_flashLeft - ctx.deltaTime, 0.0f);
+        m_hitTintLeft = std::max(m_hitTintLeft - ctx.deltaTime, 0.0f);
     }
 
-    // 出招染色脉冲计时递减（批四）：与闪白同款固定步递减——脉冲只亮
+    // 前扑残影寿命递减并夹到 0（批五A）：残影在前扑后自然渐隐熄灭；
+    // 非激活区怪物的 update 冻结时残影一并冻结（与其余计时同一门控）
+    for (LungeGhost& ghost : m_lungeGhosts)
+    {
+        if (ghost.left > 0.0f)
+        {
+            ghost.left = std::max(ghost.left - ctx.deltaTime, 0.0f);
+        }
+    }
+
+    // 出招染色脉冲计时递减（批四）：与红染同款固定步递减——脉冲只亮
     // 出招瞬间的 0.1s，之后自然熄灭（render 据此决定是否叠加偏红）
     if (m_attackPulseLeft > 0.0f)
     {
@@ -835,15 +903,44 @@ void Monster::refreshSlideSide(float stepDX, float stepDY)
     m_slideHoldLeft = kSlideHoldSeconds; // 刷新维持窗口（新方向又维持一段）
 }
 
-// 覆写渲染：常规帧 + 受击闪白帧 + 头顶血条（均经相机世界->屏幕换算）
+// 覆写渲染：前扑残影 + 常规帧 + 出招脉冲 + 受击红染 + 蓄力警示「!」+
+// 头顶血条（均经相机世界->屏幕换算）
 void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) const
 {
+    // ---- 前扑残影（批五A）：1~2 重渐隐副本先画（压在本体之下）----
+    // 残影 = 记录位置的半透明副本（复用武器残影思路）：透明度随剩余寿命
+    // 线性衰减（越旧越淡）。源矩形取精灵表第 0 帧——高速残影下与当前帧
+    // 的差异不可辨，换来实现简单（不与基类帧号换算重复）
+    if (m_texture != nullptr)
+    {
+        bool anyGhost = false; // 本帧是否画过残影（决定是否需要还原 alpha 状态）
+        for (const LungeGhost& ghost : m_lungeGhosts)
+        {
+            if (ghost.left <= 0.0f)
+            {
+                continue; // 已熄灭的残影槽位：跳过
+            }
+            // 记录点（世界坐标左上角）经相机换算到屏幕——与本体同一条换算
+            const Vec2 screen = camera.worldToScreen(ghost.x, ghost.y);
+            const SDL_FRect dst{ screen.x, screen.y, m_w, m_h }; // 整帧矩形（同尺寸）
+            const SDL_FRect src{ 0.0f, 0.0f, m_w, m_h };         // 精灵表第 0 帧
+            const float ratio = ghost.left / kLungeGhostLifeSeconds; // 剩余寿命比例 [0,1]
+            SDL_SetTextureAlphaMod(m_texture, static_cast<Uint8>(kLungeGhostStartAlpha * ratio)); // 渐隐
+            SDL_RenderTexture(renderer, m_texture, &src, &dst); // 半透明副本
+            anyGhost = true; // 标记：纹理 alpha 已被改写
+        }
+        if (anyGhost)
+        {
+            SDL_SetTextureAlphaMod(m_texture, 255); // 还原不透明（防污染本体与后续绘制）
+        }
+    }
+
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
     //（基类内部完成世界坐标 -> 屏幕坐标的相机换算）
     Entity::render(renderer, alpha, camera);
 
     // 出招染色脉冲（批四）：出招瞬间 0.1s 内把同一帧以「偏红加色」再画
-    // 一遍——出招信号的视觉电报（素材复用，不加新图）。同受击闪白的
+    // 一遍——出招信号的视觉电报（素材复用，不加新图）。与红染同一套
     // 「叠加混合」技巧：ADD 混合 + 颜色调制压掉大部分绿蓝通道 = 红光脉冲
     if (m_attackPulseLeft > 0.0f && m_texture != nullptr)
     {
@@ -855,18 +952,39 @@ void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) 
         SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
     }
 
-    // 闪白叠加：只有「正在闪白」且纹理已加载时执行
-    if (m_flashLeft > 0.0f && m_texture != nullptr)
+    // 受击红染（批五A，替换旧版白闪）：红染计时内把同一帧以「红光叠加」
+    // 再画一遍——与玩家红染同款同色（ADD + 绿蓝通道压到 kHitTintGreenBlue）。
+    // 旧白闪的「整体提亮」读作治疗感，红色明确读作「掉血了」
+    if (m_hitTintLeft > 0.0f && m_texture != nullptr)
     {
-        // 受击闪白 = 用加色混合（ADD）把同一帧再画一遍：像素颜色与自身相加后
-        // 整体提亮，各变体本体色被推亮成偏白的高光（史莱姆的绿、骷髅的白骨
-        // 都会明显「发光」一下）。
-        // 为什么不用颜色调制（SDL_SetTextureColorMod）：乘法调制只能压暗，
-        // 无法把本体「提亮成白光」；叠加混合才能做出闪光效果
-        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);
-        Entity::render(renderer, alpha, camera); // 第二次绘制：叠加提亮（同一相机换算）
-        // 还原默认混合模式：纹理状态若残留 ADD，会污染后续普通绘制
+        SDL_SetTextureColorMod(m_texture, 255,
+                               static_cast<Uint8>(kHitTintGreenBlue),
+                               static_cast<Uint8>(kHitTintGreenBlue)); // 偏红：只留少量绿蓝参与加色
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);         // 叠加混合：在底色上「加光」
+        Entity::render(renderer, alpha, camera);                       // 第二次绘制：红光叠加
+        // 还原纹理状态：残留 ADD/颜色调制会污染后续绘制
+        SDL_SetTextureColorMod(m_texture, 255, 255, 255);
         SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
+    }
+
+    // ---- 蓄力警示「!」（批五A）：蓄力期间显示、前扑开始消失 ----
+    // 阶段判据即规格：只有 Windup 阶段绘制（进 Lunge 自然消失）；
+    // 画在怪物头顶上方（底边高于血条区，同屏不重叠）。纹理由场景注入
+    // 共享（nullptr = 加载失败：警示缺失、其余表现照常）
+    if (m_attackPhase == AttackPhase::Windup && m_alertTexture != nullptr)
+    {
+        // 插值位置：与本体绘制使用同一条「prev -> cur 按 alpha 线性插值」
+        // 公式（怪物移动/后倾时警示贴着头顶走，不脱节）
+        const float interpX = m_prevX + (m_x - m_prevX) * alpha; // 插值左上角 x
+        const float interpY = m_prevY + (m_y - m_prevY) * alpha; // 插值左上角 y
+        // 屏幕锚点：怪物水平中心、精灵顶部再上移 kAlertOffsetY（警示底边）
+        const Vec2 screen = camera.worldToScreen(interpX + m_w * 0.5f,
+                                                 interpY - kAlertOffsetY);
+        const SDL_FRect dst{ screen.x - kAlertWidth * 0.5f, // 水平居中于怪物
+                             screen.y - kAlertHeight,        // 底边锚在头顶上方
+                             kAlertWidth,                    // 绘制宽（与素材一致）
+                             kAlertHeight };                 // 绘制高（同上）
+        SDL_RenderTexture(renderer, m_alertTexture, nullptr, &dst); // 整张绘制（单帧素材）
     }
 
     // ---- 头顶血条（批三）：受损后显示、满血隐藏 ----
