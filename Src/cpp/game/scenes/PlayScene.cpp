@@ -347,23 +347,52 @@ void PlayScene::handleEvent(const SDL_Event& event)
 }
 
 // 输入动作的按下边缘处理（每个上升沿恰好响应一次）。
-// 调用位置：update 的最开头——暂停/重开/回菜单在任何状态下都要能响应
+// 调用位置：update 的最开头——暂停/重开/回菜单/商店在任何状态下都要能响应
 //（包括 Paused/GameOver 的冻结分支；PlayScene 世界冻结但输入始终可用）
-// 例外（M2）：LevelUp（升级三选一面板）期间三个动作都不响应（防误触）——
-// 各分支的状态判据（Playing/Paused/GameOver）天然排除 LevelUp，无需额外
-// 分支；去重标记照常记录，面板期间按下的键不会在回到 Playing 后迟到触发
+// 例外（M2/批五B）：LevelUp（升级三选一面板）期间暂停/重开/回菜单不响应
+//（防误触）——各分支的状态判据（Playing/Paused/GameOver）天然排除 LevelUp，
+// 无需额外分支；去重标记照常记录，面板期间按下的键不会在回到 Playing 后
+// 迟到触发。批五B 新增 shop 动作：Playing 按 B 打开商店、Shop 中 B/ESC
+// 关闭（ESC 的语义在暂停分支内按 Shop 状态分流——见下）
 void PlayScene::handleInputEdges(const UpdateContext& ctx)
 {
     // 本步的边沿采样（ctx.input 为 nullptr 时按「都没按」安全降级）。
-    // 三个动作的语义与物理键位的对应关系由 config 的 bind_* 决定
+    // 四个动作的语义与物理键位的对应关系由 config 的 bind_* 决定
     const bool pausePressed = ctx.input != nullptr && ctx.input->pressed("pause");
     const bool restartPressed = ctx.input != nullptr && ctx.input->pressed("restart");
     const bool menuPressed = ctx.input != nullptr && ctx.input->pressed("menu");
+    const bool shopPressed = ctx.input != nullptr && ctx.input->pressed("shop");
+
+    // ---- 商店开关（批五B；先于暂停处理：Shop 中 ESC 的语义是「关闭商店」，
+    //      须在暂停分支看到它之前先把状态算清楚）----
+    // 「随时可开」= 战斗进行中（Playing）按 B 一拍即开（世界因此冻结、同
+    // 暂停语义）；Paused/LevelUp/GameOver 下不响应（防误触——与 LevelUp
+    // 的既有纪律一致）。shopToggled：本步 B 已切换过商店状态——同帧恰好
+    // 又按到 ESC 时暂停分支据此跳过，两个关闭/切换键不互相打架
+    //（单独按 B / 单独按 ESC 各自都能关闭商店——「互不冲突」的口径）
+    bool shopToggled = false; // 本步商店状态是否已由 B 切换
+    if (shopPressed && !m_shopHandled)
+    {
+        if (m_state == PlayState::Playing)
+        {
+            openShop();           // 打开：切 Shop + 面板基线 + 日志（见实现）
+            shopToggled = true;   // 标记：本步已切换
+        }
+        else if (m_state == PlayState::Shop)
+        {
+            closeShop();          // B 关闭：切回 Playing + 日志（见实现）
+            shopToggled = true;   // 标记：本步已切换
+        }
+    }
+    m_shopHandled = shopPressed; // 记录本步采样：边沿消失前不再重复处理
 
     // 暂停/恢复：在 Playing 与 Paused 之间切换（GameOver 下不响应）。
-    // 去重标记：同一帧补多个固定步时 pressed 恒 true，只在「首次见到上升沿」
-    // 的那一步执行切换，避免一帧内反复横跳
-    if (pausePressed && !m_pauseHandled)
+    // 批五B：Shop 中按 ESC = 关闭商店（不进入暂停——ESC 在商店语境下是
+    // 「退出面板」）；本步 B 已关闭过商店（shopToggled）时整段跳过，
+    // 保证同帧双键也只产生一次关闭。去重标记：同一帧补多个固定步时
+    // pressed 恒 true，只在「首次见到上升沿」的那一步执行切换，
+    // 避免一帧内反复横跳
+    if (pausePressed && !m_pauseHandled && !shopToggled)
     {
         if (m_state == PlayState::Playing)
         {
@@ -382,6 +411,12 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
             m_audio->play(SoundId::Pause);
             // 冒烟观测点：确认恢复触发（自动化测试据此断言）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "对局恢复");
+        }
+        else if (m_state == PlayState::Shop)
+        {
+            // ESC 关闭商店：与 B 关闭同一落点（回 Playing、打关闭日志）——
+            // 批五B 规格「B 或 ESC 关闭」的 ESC 一侧
+            closeShop(); // 内部实现：状态切换 + 日志
         }
     }
     m_pauseHandled = pausePressed; // 记录本步采样：边沿消失前不再重复处理
@@ -598,10 +633,202 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
     }
 }
 
-// 卡牌效果应用（M2；onEnter / 选择生效 / restart 三处调用的统一入口）：
-// 从「基准值 x 当前层数」重算全部受卡牌影响的数值并注入（幂等——重复调用
+// ============================================================
+// 商店（批五B：九强化迁移、金币购买、鼠标/键盘交互）
+// ============================================================
+
+// 打开商店（Playing 按 B）：切到 Shop 状态（世界从下一固定步起冻结）+
+// 清提示消息 + 面板防误触基线置位 + 打「商店开启」日志
+void PlayScene::openShop()
+{
+    m_state = PlayState::Shop; // 状态切换：update 的冻结分支接管（世界暂停）
+
+    // 提示消息清空：新打开的面板不带上一次的「已购买/金币不足」残留
+    m_shopMessage[0] = '\0'; // 空串 = 无消息（渲染据此跳过）
+
+    // 面板防误触基线置位（与升级卡面板同款）：打开后的第一个固定步
+    // 采样「左键是否按着」（战斗中连扫的持续按住）——须先松开再点
+    m_shopPanelFresh = true; // handleShopInput 首个固定步消费本标记
+
+    // 冒烟观测点：商店开启（含当前金币——自动化测试据此断言状态切换）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "商店开启（金币 %d）", m_coinCount);
+}
+
+// 关闭商店（B 或 ESC）：切回 Playing（世界恢复推进）并打「商店关闭」日志
+void PlayScene::closeShop()
+{
+    m_state = PlayState::Playing; // 恢复对局：下一固定步起世界继续推进
+
+    // 冒烟观测点：商店关闭（与开启成对——冒烟断言开/关各恰好一次）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "商店关闭");
+}
+
+// 商店面板输入处理（Shop 状态每固定步调用）：悬停刷新 + 1~9 购买 +
+// 鼠标点击购买。完整契约（两路并存/防误触/悬停刷新）见头文件声明处
+void PlayScene::handleShopInput(const UpdateContext& ctx)
+{
+    // ---- 0) 防误触基线（与升级卡面板同款）：面板打开后的第一个固定步采样 ----
+    // 规格：点击以「按下边缘」为准；若面板弹出时玩家已按着左键（战斗中
+    // 连扫的持续按住），须松开后新的一次点击才生效。「打开时是否按着」
+    // 在面板弹出后的第一个固定步读取——openShop 无输入上下文，
+    // 此处即最早可读的稳定状态（两者相隔恰好 1 个固定步，语义等价）
+    if (m_shopPanelFresh)
+    {
+        m_shopPanelFresh = false; // 基线只采样一次（后续步骤不再重置）
+        m_shopClickNeedRelease = ctx.input != nullptr && ctx.input->held("attack"); // 按着 -> 等松开
+    }
+
+    // ---- 1) 悬停刷新：每固定步用共享布局计算命中哪一项 ----
+    // 渲染（renderHud 的商店分支）直接消费本值；无输入系统时按「无悬停」
+    if (ctx.input != nullptr)
+    {
+        int outW = 0; // 渲染输出宽（物理像素——与 renderHud 的布局同一条数源）
+        int outH = 0; // 渲染输出高（同上）
+        SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
+        const Vec2 mouse = ctx.input->mousePosition(); // 鼠标屏幕坐标（窗口客户区快照）
+        m_hoverShopItem = shopPanelHitTest(mouse.x, mouse.y,
+                                           static_cast<float>(outW), static_cast<float>(outH));
+    }
+    else
+    {
+        m_hoverShopItem = -1; // 无输入系统：无悬停高亮
+    }
+
+    // ---- 2) 数字键 1~9 购买（动作 shop_1~shop_9 的按下边缘，去重与暂停同款）----
+    int chosen = -1; // 选中的商品下标（0~8）；-1 = 本步无购买
+    for (int i = 0; i < kShopItemCount; ++i) // 完整遍历全部九项（采样必须全覆盖）
+    {
+        char action[16]; // 动作名缓冲（"shop_1"~"shop_9"，最长 6 字节）
+        SDL_snprintf(action, sizeof(action), "shop_%d", i + 1); // 商品序号 -> 动作名
+
+        // 本步该动作的按下边缘；去重标记保证同帧多固定步只响应一次。
+        // 多个键同帧按下时只取序号最小的一个（chosen < 0 门控）；
+        // 全项都要记录采样——否则被跳过项的边沿会推迟到下一帧误触发
+        const bool pressed = ctx.input != nullptr && ctx.input->pressed(action);
+        if (pressed && !m_shopKeyHandled[i] && chosen < 0)
+        {
+            chosen = i; // 本项按下：进入购买流程
+        }
+        m_shopKeyHandled[i] = pressed; // 记录本步采样（边沿去重基线，全项更新）
+    }
+
+    // ---- 3) 鼠标点击购买：「左键按下边缘」+ 命中 + 防误触解锁 ----
+    // 左键按下边缘（pressed）：单击与「按住连扫」的持续按住天然区分
+    const bool clickPressed = ctx.input != nullptr && ctx.input->pressed("attack");
+
+    // 等待松开（防误触）：先在「面板打开时按着」的状态下观测到一次
+    // released（松开下降沿），之后的新点击才允许生效；等待期内点击
+    //（含恰好重叠的按下边缘）一律忽略
+    if (m_shopClickNeedRelease)
+    {
+        if (ctx.input != nullptr && ctx.input->released("attack"))
+        {
+            m_shopClickNeedRelease = false; // 已松开：解锁点击
+        }
+    }
+
+    // 点击生效条件（全部满足才处理）：键盘本步未选中（键盘优先）+ 按下
+    // 边缘未被本帧消费过（同帧多固定步去重）+ 已解锁 + 命中某项
+    //（卡间隙/面板外 = -1 -> 无效点击：不买、不消费，面板继续等待）
+    if (chosen < 0 && clickPressed && !m_shopClickHandled && !m_shopClickNeedRelease)
+    {
+        int outW = 0; // 渲染输出宽（与悬停检测同一数源——同一次布局）
+        int outH = 0; // 渲染输出高
+        SDL_GetRenderOutputSize(m_renderer, &outW, &outH);
+        const Vec2 mouse = ctx.input->mousePosition(); // 鼠标屏幕坐标快照
+        const int hit = shopPanelHitTest(mouse.x, mouse.y,
+                                         static_cast<float>(outW), static_cast<float>(outH));
+        if (hit >= 0)
+        {
+            chosen = hit; // 命中商品：等价按对应数字键（走同一套购买流程）
+        }
+    }
+    m_shopClickHandled = clickPressed; // 点击采样记录（边沿去重基线）
+
+    // ---- 4) 购买：有选中就走购买流程（满层/金币不足/成交三分支在内部）----
+    if (chosen >= 0)
+    {
+        tryPurchaseShopItem(chosen); // 购买结算与提示/日志都在内部完成
+    }
+}
+
+// 商店购买（批五B）：契约见头文件声明处。购买成功日志为规格文案
+//「商店购买：卡片名（层数 x/上限，花费 N 金币）」——冒烟断言点
+void PlayScene::tryPurchaseShopItem(int itemIndex)
+{
+    // 下标越界（理论不可达——chosen 由布局/循环产生）：静默忽略（防御）
+    if (itemIndex < 0 || itemIndex >= kShopItemCount)
+    {
+        return; // 不崩、不消费
+    }
+
+    const CardId id = static_cast<CardId>(itemIndex); // 商品下标 -> 强化 id（顺序一致）
+    const int level = m_cardLevels[itemIndex];        // 当前层数
+    const CardDef& def = cardDef(id);                 // 强化定义（名称/上限）
+
+    // ---- 分支 1：已满层（层级上限照旧——不再售卖）----
+    if (isCardFull(id, level))
+    {
+        SDL_strlcpy(m_shopMessage, "已达上限", sizeof(m_shopMessage)); // 面板提示（常驻至下次操作）
+        // 冒烟观测点：满层购买被拒（不扣金币）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "商店购买失败：已达上限（%s）", def.name);
+        return; // 不扣金币、不加层
+    }
+
+    const int price = shopPrice(id, level); // 当前价格 = 基础价 x（层数 + 1）
+
+    // ---- 分支 2：金币不足（恰好等于价格可以买——差 1 即不足）----
+    if (m_coinCount < price)
+    {
+        SDL_strlcpy(m_shopMessage, "金币不足", sizeof(m_shopMessage)); // 面板提示（灰显之外的文字提示）
+        // 冒烟观测点：金币不足（需要/持有——冒烟据它断言「差 1 不成交」）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "商店购买失败：金币不足（需要 %d，持有 %d）", price, m_coinCount);
+        return; // 不扣金币、不加层
+    }
+
+    // ---- 分支 3：成交——扣金币 -> 层数 +1（封顶防御）-> 效果重算 ----
+    m_coinCount -= price;                             // 金币扣减（本局货币的唯一消费点）
+    m_cardLevels[itemIndex] = gainCardLevel(id, level); // 层数 +1（有限卡封顶——第二道闸）
+
+    // 效果立即落地：从「基准 + 层数」重算全部受强化影响的数值并注入
+    //（幂等入口；与升级选择走同一条路径——applyCardEffects）
+    applyCardEffects();
+
+    // 体魄的一次性效果：即时回血 20（上限刚在 applyCardEffects 里 +20）。
+    // 与重算路径分离的原因：applyCardEffects 幂等、不重复回血——「购买
+    // 该强化那一刻」的加血只在本次成交发放（restart 重算不会凭空加血）
+    if (id == CardId::Vitality) // 买到的是体魄？
+    {
+        m_playerHp = std::min(m_playerHp + kCardVitalityHealPerLevel, m_playerMaxHp); // 回血 20 并夹上限
+    }
+
+    // ---- 冒烟观测点：商店购买日志（规格文案「商店购买：卡片名（层数 x/上限，
+    //      花费 N 金币）」；无限卡上限写作「无限」）----
+    char limitText[16];           // 上限文本：数字或「无限」（16 字节绰绰有余）
+    if (def.maxLevel > 0)         // 有限卡：上限写数字
+    {
+        SDL_snprintf(limitText, sizeof(limitText), "%d", def.maxLevel); // 如 "5"
+    }
+    else                          // 无限卡：上限写「无限」
+    {
+        SDL_strlcpy(limitText, "无限", sizeof(limitText)); // 文案（UTF-8 6 字节）
+    }
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "商店购买：%s（层数 %d/%s，花费 %d 金币）",
+                def.name, m_cardLevels[itemIndex], limitText, price); // 购买日志
+
+    // 面板提示（常驻至下次操作/关闭）与成交音效（升级音同款的正反馈）
+    SDL_snprintf(m_shopMessage, sizeof(m_shopMessage), "已购买：%s", def.name); // 提示文案
+    m_levelupSfx.play(); // 成交音效（游戏层直读 levelup.wav；不可用安全静默）
+}
+
+// 强化效果应用（M2 升级卡；批五B 起是商店购买的生效入口）。
+// 调用处：onEnter / 升级选择生效 / 商店购买成交 / restart 四处统一入口：
+// 从「基准值 + 当前层数」重算全部受强化影响的数值并注入（幂等——重复调用
 // 结果一致；层数清零后调用即等价于「效果全部撤销」）。
-// 「即时回血」等一次性效果不在此列（选择流程单独发放——重算路径绝不重复回血）
+// 「即时回血」等一次性效果不在此列（选择/购买流程单独发放——重算路径绝不
+// 重复回血）
 void PlayScene::applyCardEffects()
 {
     // 利刃：伤害 = 基准 + 5 x 层数（横扫结算与飘字读取同一个字段）
@@ -662,6 +889,14 @@ void PlayScene::update(const UpdateContext& ctx)
         if (m_state == PlayState::LevelUp)
         {
             handleCardChoice(ctx); // 选择生效/换面板/恢复对局都在内部完成
+        }
+        // Shop（批五B）：处理购买输入（悬停/1~9/点击）——面板操作只改
+        // 局面数值（金币/层数/效果）与面板自身状态，世界本体（实体/计时/
+        // 特效）保持冻结；关店（B/ESC）在上方 handleInputEdges 完成，
+        // 本步因此仍按冻结处理（世界下一固定步才恢复）
+        else if (m_state == PlayState::Shop)
+        {
+            handleShopInput(ctx); // 悬停刷新/购买结算/提示消息都在内部完成
         }
 
         // 冻结期间的插值自查（重要）：把各实体的插值快照对齐到当前位置。
@@ -1607,6 +1842,19 @@ void PlayScene::restart()
     m_cardClickNeedRelease = false; // 解锁状态清零（新局从「未等待」起）
     m_cardClickHandled = false;     // 点击去重标记复位
 
+    // 商店面板状态复位（批五B）：新一局的商店从干净状态开始——悬停清空、
+    // 提示消息清空、防误触基线与全部去重标记回初始值（首个面板打开时重采样）
+    m_shopMessage[0] = '\0';        // 提示消息清空（不带上一局的「已购买」）
+    m_hoverShopItem = -1;           // 无悬停高亮残留
+    m_shopPanelFresh = true;        // 下个面板打开后采样防误触基线
+    m_shopClickNeedRelease = false; // 解锁状态清零（新局从「未等待」起）
+    m_shopClickHandled = false;     // 点击去重标记复位
+    for (bool& handled : m_shopKeyHandled) // 1~9 去重标记逐项复位
+    {
+        handled = false; // 该项采样回「未按」
+    }
+    m_shopHandled = false;          // B 动作去重标记复位
+
     // 卡牌效果撤销 + 全部数值复位（M2 统一入口）：层数已清零，重算即等价于
     // 「移速/攻击冷却/伤害/范围/张角/击退/生命上限/磁吸」全部回到基准，
     // 并重新注入 Player 实体（移速/冷却/扫角立即恢复配置初值）
@@ -1799,12 +2047,12 @@ void PlayScene::renderHud()
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    // Paused / LevelUp / GameOver 叠层加半透明暗化遮罩：把游戏世界
-    //（区块/玩家/怪物）整体压暗，让叠层文字从画面中浮出来（LevelUp 的
-    // 升级面板同样悬浮在压暗的世界之上）。绘制顺序：遮罩放在最前——
+    // Paused / LevelUp / Shop / GameOver 叠层加半透明暗化遮罩：把游戏
+    //世界（区块/玩家/怪物）整体压暗，让叠层文字从画面中浮出来（LevelUp/
+    // Shop 的面板同样悬浮在压暗的世界之上）。绘制顺序：遮罩放在最前——
     // 之后绘制的 FPS 行与叠层文字都压在遮罩之上，保持全亮
     if (m_state == PlayState::Paused || m_state == PlayState::LevelUp ||
-        m_state == PlayState::GameOver)
+        m_state == PlayState::Shop || m_state == PlayState::GameOver)
     {
         // 打开混合模式：颜色按 alpha 与画面混合（默认模式会直接覆盖）
         if (!SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND))
@@ -1853,11 +2101,11 @@ void PlayScene::renderHud()
         }
     }
 
-    // ---- 生存 HUD（Playing / LevelUp / Paused 都显示）----
-    // 暂停与升级选择时保留完整 HUD：玩家能看清冻结时刻的生命/等级/经验/
-    // 击杀/存活（升级面板悬浮其上）；GameOver 不显示（结束界面有自己的排版）
+    // ---- 生存 HUD（Playing / LevelUp / Shop / Paused 都显示）----
+    // 暂停/升级/商店时保留完整 HUD：玩家能看清冻结时刻的生命/等级/经验/
+    // 击杀/存活（升级与商店面板悬浮其上）；GameOver 不显示（结束界面有自己的排版）
     if (m_state == PlayState::Playing || m_state == PlayState::Paused ||
-        m_state == PlayState::LevelUp)
+        m_state == PlayState::LevelUp || m_state == PlayState::Shop)
     {
         // 条状 HUD 几何常量（左上角第一块内容）
         constexpr float kBarX = 20.0f;    // 条左边界（与后续文字同一条左边线）
@@ -2125,6 +2373,138 @@ void PlayScene::renderHud()
         const SDL_FRect firstCard = cardPanelRectAt(0, cardNum, screenW, screenH); // 首卡矩形
         m_hudFont.drawCentered(m_renderer, "按对应数字键或点击卡片选择", centerX,
                                firstCard.y + firstCard.h + 40.0f);
+    }
+    else if (m_state == PlayState::Shop)
+    {
+        // 商店面板（批五B）：标题（金币）+ 3x3 强化卡 + 提示消息 + 底部
+        // 操作提示。世界画面冻结在遮罩之下；卡片 = 色块底板 + 金色边框 +
+        // 名称/层数/价格（悬停高亮；金币不足灰显 + 价格红字；满层灰显
+        // 「已满级」）。卡片矩形来自 ShopLayout 的共享布局计算（渲染与
+        // 鼠标命中同一份——面板画在哪、就能在哪点，防坐标漂移）
+        const float centerX = screenW / 2.0f; // 水平中心：标题对齐基准
+
+        // 标题（金色，屏幕上缘 7.5% 处）：「商店（金币: N）」——金币余额
+        // 是购买决策的第一信息（规格：面板显示金币与各项层数/价格）
+        SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色：财富主题
+        char shopTitle[64]; // 容纳「商店（金币: 99999）」，绰绰有余
+        SDL_snprintf(shopTitle, sizeof(shopTitle), "商店（金币: %d）", m_coinCount);
+        m_hudFont.drawCentered(m_renderer, shopTitle, centerX, screenH * 0.075f);
+
+        for (int i = 0; i < kShopItemCount; ++i) // 逐项绘制（0~8，行优先）
+        {
+            const CardId id = static_cast<CardId>(i); // 本项强化 id（与表顺序一致）
+            const CardDef& def = cardDef(id);         // 本项定义（名称/上限）
+            const int level = m_cardLevels[i];        // 当前层数
+            const bool full = isCardFull(id, level);  // 已满层（灰显「已满级」）
+            const int price = shopPrice(id, level);   // 当前价格（层数夹取后——与购买同一函数）
+            const bool affordable = shopCanBuy(id, level, m_coinCount); // 可买？（满层/金币双判据）
+            const SDL_FRect cardRect = shopPanelRectAt(i, screenW, screenH); // 共享布局
+            const bool hovered = (i == m_hoverShopItem); // 悬停高亮（每固定步刷新）
+
+            // 底板：深色半透明（世界画面隐约透出）；悬停时底色变亮一档
+            //（与升级卡面板同款观感——两处面板的高亮语言一致）
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND); // 打开混合
+            if (hovered)
+            {
+                SDL_SetRenderDrawColor(m_renderer, 52, 58, 82, 244); // 悬停：亮一档的蓝灰
+            }
+            else
+            {
+                SDL_SetRenderDrawColor(m_renderer, 28, 32, 46, 232); // 常规：深蓝灰底（近乎不透明）
+            }
+            SDL_RenderFillRect(m_renderer, &cardRect);                  // 填充底板
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
+
+            // 边框：可买金色 / 不可买（满层或金币不足）暗金——「灰显」的
+            // 边框侧信号；悬停时亮金重描 + 外扩 3px 加粗（与升级卡同款）
+            if (affordable)
+            {
+                SDL_SetRenderDrawColor(m_renderer, 205, 175, 70, 255); // 金：可买
+            }
+            else
+            {
+                SDL_SetRenderDrawColor(m_renderer, 110, 100, 70, 255); // 暗金：不可买
+            }
+            SDL_RenderRect(m_renderer, &cardRect); // 画边框
+            if (hovered)
+            {
+                SDL_SetRenderDrawColor(m_renderer, 255, 225, 120, 255); // 亮金：悬停主色
+                SDL_RenderRect(m_renderer, &cardRect);                  // 原框重描（提亮）
+                const SDL_FRect hoverFrame{ cardRect.x - 3.0f,          // 外扩 3px 的加粗圈
+                                            cardRect.y - 3.0f,
+                                            cardRect.w + 6.0f,          // 宽：两侧各扩 3px
+                                            cardRect.h + 6.0f };        // 高：上下各扩 3px
+                SDL_RenderRect(m_renderer, &hoverFrame);                // 外圈：加粗观感
+            }
+
+            // 名称（左上，HUD 字号）：可买金色 / 不可买灰（灰显的主体信号）
+            if (affordable)
+            {
+                SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色：可买
+            }
+            else
+            {
+                SDL_SetRenderDrawColor(m_renderer, 130, 130, 130, 255); // 灰色：灰显
+            }
+            m_hudFont.draw(m_renderer, def.name, cardRect.x + 18.0f, cardRect.y + 10.0f); // 名称
+
+            // 层数行（左对齐第二行，卡片字号）：「层数 x/上限」（无限卡写「无限」）
+            const int levelIndex = static_cast<int>(id); // 层数数组下标（与 id 一致）
+            char levelText[64]; // 容纳「层数 99/无限」，绰绰有余
+            if (def.maxLevel > 0) // 有限卡：上限写数字
+            {
+                SDL_snprintf(levelText, sizeof(levelText), "层数 %d/%d",
+                             m_cardLevels[levelIndex], def.maxLevel);
+            }
+            else // 无限卡：上限写「无限」
+            {
+                SDL_snprintf(levelText, sizeof(levelText), "层数 %d/无限", m_cardLevels[levelIndex]);
+            }
+            if (affordable) // 可买：近白；不可买：暗灰
+            {
+                SDL_SetRenderDrawColor(m_renderer, 235, 235, 235, 255); // 近白
+            }
+            else
+            {
+                SDL_SetRenderDrawColor(m_renderer, 120, 120, 120, 255); // 暗灰
+            }
+            m_cardFont.draw(m_renderer, levelText, cardRect.x + 18.0f, cardRect.y + 56.0f); // 层数行
+
+            // 价格行（左对齐第三行，卡片字号）：满层「已满级」（灰）；
+            // 金币不足「价格 N 金币」（红字——灰显之外的第二提示信号）；
+            // 可买「价格 N 金币」（金色）
+            char priceText[64]; // 容纳「价格 99999 金币」，绰绰有余
+            if (full) // 满层：不再有价格
+            {
+                SDL_strlcpy(priceText, "已满级", sizeof(priceText)); // 文案
+                SDL_SetRenderDrawColor(m_renderer, 120, 120, 120, 255); // 暗灰
+            }
+            else if (affordable) // 可买：金色价格
+            {
+                SDL_snprintf(priceText, sizeof(priceText), "价格 %d 金币", price); // 价格文案
+                SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色
+            }
+            else // 金币不足：红字价格（差多少一目了然）
+            {
+                SDL_snprintf(priceText, sizeof(priceText), "价格 %d 金币", price); // 价格文案
+                SDL_SetRenderDrawColor(m_renderer, 220, 90, 90, 255); // 红色：不可负担
+            }
+            m_cardFont.draw(m_renderer, priceText, cardRect.x + 18.0f, cardRect.y + 90.0f); // 价格行
+        }
+
+        // 提示消息（上一操作的结果：已购买/金币不足/已达上限；常驻不淡出
+        // ——「冻结画面像素完全静止」的承诺不被消息动画破坏）——
+        // 位置：底部操作提示之上
+        if (m_shopMessage[0] != '\0') // 空串 = 无消息
+        {
+            SDL_SetRenderDrawColor(m_renderer, 255, 220, 120, 255); // 浅黄：提示语
+            m_hudFont.drawCentered(m_renderer, m_shopMessage, centerX, screenH * 0.885f);
+        }
+
+        // 底部操作提示（浅灰，居中）——键盘与鼠标两路并存 + 关闭键说明
+        SDL_SetRenderDrawColor(m_renderer, 200, 200, 200, 255); // 浅灰
+        m_hudFont.drawCentered(m_renderer, "按 1~9 或点击购买 · B/ESC 关闭", centerX,
+                               screenH * 0.93f);
     }
 }
 

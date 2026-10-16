@@ -1,20 +1,28 @@
 #ifndef __UPGRADECARD_H__
 #define __UPGRADECARD_H__
 
+#include "game/ChoiceDraw.h" // ChoiceDraw：通用不重复抽取（批五B 从本文件抽出——卡池/法术池共用）
 #include <algorithm> // std::min：层数封顶
 #include <cmath>     // std::lround：经验乘算取整
 #include <cstdint>   // std::uint32_t：种子化随机源的状态类型
 
 // ============================================================
-// UpgradeCard：三选一升级卡（M2 肉鸽灵魂，game 层纯逻辑，header-only）
+// UpgradeCard：九项强化表（M2 升级卡 → 批五B 商店在售，game 层纯逻辑）
 // ============================================================
 //
-// 职责：把「升级卡池」「三抽不重复」「卡牌效果的叠加数学」「连升欠账
-// 队列」「种子化随机源」全部收敛成可单测的纯逻辑（tests/card_test.cpp
-// 直测）——不依赖 SDL、窗口与任何运行时状态。PlayScene 只负责把结果
-// 落实到局面（数值注入/面板绘制/输入处理）。
+// 职责：把「九项强化表」「层数封顶/叠加数学」「连升欠账队列」「种子化
+// 随机源」全部收敛成可单测的纯逻辑（tests/card_test.cpp 直测）——
+// 不依赖 SDL、窗口与任何运行时状态。PlayScene 只负责把结果落实到局面
+// （数值注入/面板绘制/输入处理）。
 //
-// 卡池（9 张，代码表；上限 0 = 无限）：
+// 批五B 迁移（规格批准）：九项强化退出「升级三选一」（升级改发法术，
+// 见 game/Spell.h），改为商店在售——对局中随时按 B 开商店（世界冻结），
+// 用局内金币购买升级（价格公式见 game/Shop.h）。本文件的层数工具与
+// 叠加数学原样服务商店购买路径（applyCardEffects 统一重算注入）；
+// 抽取逻辑泛化到 ChoiceDraw.h（drawUpgradeCards 保留——行为与 M2 逐
+// 字节一致，card_test 回归即检验）。
+//
+// 强化池（9 张，代码表；上限 0 = 无限）：
 //   1) 利刃 Blade    ：伤害 +5（无限）
 //   2) 疾风 Swift    ：攻速 +12%（冷却 x0.88/层，限 5）——乘法叠乘
 //   3) 长臂 Reach    ：攻击范围 +15（限 4）
@@ -276,60 +284,43 @@ struct CardSeedRandom
 // 兜底时池至少 2 张）与池空（防御路径，理论不可达）
 struct CardDrawResult
 {
-    CardId cards[3] = {}; // 抽到的卡（按展示位序 1/2/3；仅前 count 个有效）
-    int count = 0;        // 实际张数（0~3；0 = 池空，无卡可展示）
+    CardId cards[kChoiceDrawMax] = {}; // 抽到的卡（按展示位序 1/2/3；仅前 count 个有效）
+    int count = 0;                     // 实际张数（0~3；0 = 池空，无卡可展示）
 };
 
-// 抽取一次升级选择的三张卡：
+// 抽取一次升级选择的三张卡（保留 M2 接口与行为；批五B 起抽取核心泛化
+// 到 ChoiceDraw.h——本函数只做「构建候选池 -> 通用抽取 -> 索引还原」）：
 //   1. 候选池 = 全部未满层的卡（排除已满层——「满层不再入池」）；
-//   2. 洗牌式逐张抽取：剩余池中按注入随机源均匀取一、抽走处用池尾填补——
-//      不重复且池内等权（等权性可由统计法单测）；
+//   2. 洗牌式逐张抽取（ChoiceDraw::drawDistinctFromPool）：剩余池中按注入
+//      随机源均匀取一、抽走处用池尾填补——不重复且池内等权；
 //   3. 池不足 3 张时按实际张数返回（count < 3；0 = 池空）。
 // levels 为各卡当前层数数组（下标与 CardId 一一对应，长度 kCardCount）。
 // fn 为随机源（nullptr 时退化为常量 0.5——确定性兜底，不崩）；fn 的
 // 非法输出（NaN/负/≥1）一律夹到合法索引（防御，单测覆盖）
 inline CardDrawResult drawUpgradeCards(const int* levels, CardRandomFn fn, void* context)
 {
-    // ---- 1) 构建候选池：顺序扫过卡表，未满层的卡依次入池 ----
-    CardId pool[kCardCount]; // 候选池（最坏 9 张；池尺寸 = 卡池张数）
-    int poolSize = 0;        // 池内张数
+    // ---- 1) 构建候选池：顺序扫过卡表，未满层的卡索引依次入池 ----
+    int pool[kCardCount]; // 候选池（卡索引；最坏 9 张——池尺寸 = 卡池张数）
+    int poolSize = 0;     // 池内张数
     for (int i = 0; i < kCardCount; ++i) // 遍历全部卡位
     {
         const CardId id = static_cast<CardId>(i); // 当前卡 id
         if (!isCardFull(id, levels[i]))           // 未满层才入池（满层排除）
         {
-            pool[poolSize] = id;                  // 写池尾
-            ++poolSize;                           // 尺寸 +1
+            pool[poolSize] = i; // 写池尾（记录索引——通用抽取只认识索引）
+            ++poolSize;         // 尺寸 +1
         }
     }
 
-    // ---- 2) 洗牌式逐张抽取（每张在剩余池中均匀取一，抽走处池尾填补）----
-    CardDrawResult result;                                   // 抽取结果（默认 count=0）
-    const int drawCount = (poolSize < 3) ? poolSize : 3;     // 实际张数（不足三张按实际）
-    result.count = drawCount;                                // 落定张数
-    for (int k = 0; k < drawCount; ++k)                      // 逐张抽取
+    // ---- 2) 通用抽取核心（批五B 泛化）：洗牌式取最多 3 个不重复索引 ----
+    const ChoiceDrawResult drawn = drawDistinctFromPool(pool, poolSize, fn, context);
+
+    // ---- 3) 索引还原为卡 id（展示位序照旧：结果位序 = 抽取位序）----
+    CardDrawResult result;    // 抽取结果（默认 count=0）
+    result.count = drawn.count; // 张数照搬（池不足按实际、池空为 0）
+    for (int k = 0; k < drawn.count; ++k) // 逐张还原
     {
-        const int remaining = poolSize - k;                  // 剩余候选数（本次抽取的分母）
-
-        // 随机数 -> 池索引：非法输出统一夹到合法域（NaN/负 -> 0；≥1 -> 末位）
-        float u = (fn != nullptr) ? fn(context) : 0.5f;      // 采样随机源（可空兜底 0.5）
-        if (!(u >= 0.0f))                                    // NaN 与负值（NaN 比较恒假）：
-        {
-            u = 0.0f;                                        // 压到 0（确定性防御）
-        }
-        int idx = static_cast<int>(u * static_cast<float>(remaining)); // [0,1) x 剩余数 -> 截断取整
-        if (idx >= remaining)                                // u 接近 1 时的舍入上溢：
-        {
-            idx = remaining - 1;                             // 夹到末位
-        }
-        if (idx < 0)                                         // 极端浮点情形再防一次：
-        {
-            idx = 0;                                         // 夹到首位
-        }
-
-        result.cards[k] = pool[idx];                         // 本张落位（展示位序 k）
-        pool[idx] = pool[remaining - 1];                     // 池尾填补被抽走的洞
-        // 说明：池尾元素已前移，下一轮 remaining 收缩——本轮抽中的卡绝不再入
+        result.cards[k] = static_cast<CardId>(drawn.indices[k]); // 索引 -> 卡 id
     }
     return result; // 交还抽取结果
 }

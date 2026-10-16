@@ -14,7 +14,9 @@
 #include "game/LevelCurve.h"    // LevelCurve：升级经验曲线（纯逻辑，tests/xp_test.cpp 直测）
 #include "game/FloatingText.h"  // FloatingText：漂浮文字（伤害飘字与升级飘字共用）
 #include "game/LevelupSfx.h"    // LevelupSfx：升级音效（游戏层直读；引擎加 SoundId::LevelUp 前的过渡）
-#include "game/UpgradeCard.h"   // UpgradeCard：三选一升级卡（卡池表/抽取/叠加数学/欠账队列；纯逻辑）
+#include "game/UpgradeCard.h"   // UpgradeCard：九项强化表（批五B 起由商店购买；抽取/叠加数学/欠账队列）
+#include "game/Shop.h"          // Shop：商店价格公式与可购判定（纯逻辑，tests/shop_test.cpp 直测）
+#include "game/ShopLayout.h"    // ShopLayout：商店九宫格布局（渲染与鼠标命中共享，防坐标漂移）
 #include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
 #include <array>                // std::array：本扫程命中记录（按怪物池槽位的定长布尔表）
 #include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
@@ -137,6 +139,10 @@
 //              「按下边缘」为准，面板弹出时已按住左键需先松开再点——
 //              防误触）与 F3（ESC/M/R 不响应——防误触）；选择生效，
 //              欠账未清再弹下一组（连升连选），清完回 Playing
+//   Shop     ：商店面板（批五B）：世界冻结（同暂停语义），随时可按 B 从
+//              Playing 打开；鼠标悬停/点击与 1~9 购买九项强化（金币
+//              消费，价格随层递增），B 或 ESC 关闭回 Playing（F3 照常；
+//              R/M 不响应——防误触）
 //   Paused   ：世界冻结（含存活计时与飘字动画），ESC 恢复、M 回主菜单
 //   GameOver ：世界冻结（仅因玩家生命归零触发），显示本局等级/击杀/存活与三项最佳战绩，
 //              被破项旁标「新纪录！」并播 record 音效；等待 R 重开或 M 回主菜单
@@ -147,6 +153,7 @@ enum class PlayState
 {
     Playing,  // 正在游戏：接受输入、推进战斗、检测碰撞与刷新
     LevelUp,  // 升级三选一：世界冻结，仅响应 1/2/3（F3 走事件通道独立生效）
+    Shop,     // 商店（批五B）：世界冻结，鼠标/1~9 购买，B/ESC 关闭（F3 照常）
     Paused,   // 暂停：世界冻结，ESC 恢复、M 回主菜单
     GameOver  // 本局结束：世界冻结，等待玩家按 R 重开或按 M 回主菜单
 };
@@ -213,6 +220,32 @@ private:
     // 本步不做任何事，面板继续等待。悬停高亮（m_hoverCard）也在此刷新——
     // 与点击判定共用 CardLayout 的同一份布局计算
     void handleCardChoice(const UpdateContext& ctx);
+
+    // ---- 商店（批五B：九强化迁移、金币购买）----
+
+    // 打开商店（Playing 按 B 时由 handleInputEdges 调用）：切到 Shop 状态
+    //（世界从下一固定步起冻结、同暂停语义）-> 清提示消息 -> 面板防误触
+    // 基线置位（首个固定步采样左键按住状态）-> 打「商店开启」日志
+    void openShop();
+
+    // 关闭商店（B 或 ESC 触发）：切回 Playing（世界恢复推进）并打
+    // 「商店关闭」日志。开/关互不冲突的编排见 handleInputEdges
+    void closeShop();
+
+    // 商店面板输入处理（Shop 状态每固定步调用，批五B）：悬停刷新（渲染
+    // 高亮共用 ShopLayout）+ 1~9 数字键购买（动作 shop_1~9 的按下边缘，
+    // 去重标记与暂停同款）+ 鼠标点击购买（左键按下边缘 + 命中 + 防误触
+    // 解锁，与升级卡同款的「须先松开」口径）。命中项经
+    // tryPurchaseShopItem 走购买流程；点击卡间隙/面板外无效（不消费）
+    void handleShopInput(const UpdateContext& ctx);
+
+    // 商店购买（批五B）：itemIndex 为强化表下标（0~8）。分支：
+    //   - 满层 -> 提示「已达上限」+ 日志（不扣金币）；
+    //   - 金币不足 -> 提示「金币不足」+ 日志（不扣金币）；
+    //   - 可买 -> 扣金币（m_coinCount）-> 层数 +1（gainCardLevel 封顶）->
+    //     applyCardEffects 统一重算生效 -> 体魄即时回血（与升级选择同款）
+    //     -> 打「商店购买」日志（规格文案）-> 面板提示与购买音效
+    void tryPurchaseShopItem(int itemIndex);
 
     // 卡牌效果应用（M2；onEnter / 选择生效 / restart 三处调用的统一入口）：
     // 从「基准值 + 当前层数」重算全部受卡牌影响的数值并注入（幂等——重复
@@ -520,12 +553,23 @@ private:
     int m_xp = 0;                        // 当前级已积累经验（结算后恒小于本级需求；HUD 进度条）
     float m_levelFlashLeft = 0.0f;       // 等级数字瞬闪剩余时长（秒；升级时置满，仅 Playing 递减）
 
-    // ---- 三选一升级卡运行时状态（M2；restart 复位）----
-    int m_cardLevels[kCardCount] = {};       // 各卡当前层数（下标与 CardId 一一对应；R 重开全清零）
+    // ---- 三选一升级卡运行时状态（M2；批五B：数值卡退役，本区仅服务商店）----
+    int m_cardLevels[kCardCount] = {};       // 九项强化当前层数（下标与 CardId 一一对应；R 重开全清零）
     LevelUpQueue m_choiceQueue;              // 连升欠账队列（每次升级 +1 笔；选择消费；>0 保持逐次弹选）
     CardDrawResult m_offeredCards;           // 当前面板展示的卡（位序 1/2/3；count 为实际张数）
     CardSeedRandom m_cardRng;                // 卡池抽取的种子化随机源（onEnter 播种；同种子可复现）
     bool m_choiceHandled[3] = { false, false, false }; // 1/2/3 按下边缘去重标记（与暂停同款语义）
+
+    // ---- 商店运行时（批五B；restart 复位面板状态）----
+    // 提示消息常驻（不自动淡出）：下一条操作覆盖、开/关面板清空——
+    // 「冻结画面像素完全静止」的承诺因此不被消息动画破坏
+    char m_shopMessage[80] = {};         // 面板底部提示（已购买/金币不足/已达上限）
+    int m_hoverShopItem = -1;            // 悬停项下标（-1 = 无；Shop 每固定步刷新，渲染高亮消费）
+    bool m_shopPanelFresh = true;        // 面板打开后的首个固定步标记（防误触基线采样；openShop 置位）
+    bool m_shopClickNeedRelease = false; // 防误触：打开时按着左键 -> 须先观测到松开、新点击才生效
+    bool m_shopClickHandled = false;     // 左键按下边缘去重标记（同帧多固定步只响应一次）
+    bool m_shopKeyHandled[kShopItemCount] = {}; // 1~9 按下边缘去重标记（下标 = 商品序号）
+    bool m_shopHandled = false;          // shop 动作本帧是否已处理（B 开/关边缘去重）
 
     // ---- 卡牌鼠标选择运行时（批五A）----
     int m_hoverCard = -1;                // 悬停卡位序（-1 = 无；LevelUp 每固定步刷新，渲染高亮消费）

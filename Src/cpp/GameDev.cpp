@@ -161,6 +161,28 @@ void GameDev::bindInputActions()
     bindAction("choice_2", "bind_choice_2", "2", SDL_SCANCODE_2);
     bindAction("choice_3", "bind_choice_3", "3", SDL_SCANCODE_3);
 
+    // 商店开/关（批五B；pressed 边缘：Playing 按 B 打开、Shop 中 B/ESC
+    // 关闭——ESC 一侧复用 pause 动作的边沿，在场景侧按状态分流）
+    bindAction("shop", "bind_shop", "B", SDL_SCANCODE_B);
+
+    // 商店购买快捷键（批五B；pressed 边缘：面板按 1~9 购买对应强化项，
+    // 与鼠标点击等价）。动作名 shop_1~shop_9、配置键 bind_shop_1~9、
+    // 默认键 1~9——循环装配（数字 '1'~'9' 的扫描码是连续区段）
+    for (int i = 1; i <= 9; ++i)
+    {
+        char actionName[16]; // 动作名缓冲（"shop_1"~"shop_9"，最长 6 字节）
+        char configKey[24];  // 配置键缓冲（"bind_shop_1"~"bind_shop_9"）
+        char defaultKey[4];  // 默认键名缓冲（"1"~"9"，含结束符 1 字节）
+        SDL_snprintf(actionName, sizeof(actionName), "shop_%d", i);    // 拼动作名
+        SDL_snprintf(configKey, sizeof(configKey), "bind_shop_%d", i); // 拼配置键
+        SDL_snprintf(defaultKey, sizeof(defaultKey), "%d", i);         // 拼默认键名
+
+        // 默认键码：'1' 的扫描码起按序号偏移（'0' 在枚举里排在 '9' 之后，
+        // 不参与本连续段——商店快捷键只用 1~9）
+        bindAction(actionName, configKey, defaultKey,
+                   static_cast<SDL_Scancode>(SDL_SCANCODE_1 + (i - 1)));
+    }
+
     // 小键盘回车：确认动作的内置别名（历史行为两个 Enter 都接受；
     // 它不占配置键位——bind_* 配置保持最小集合，菜单查询时一并检查）
     m_input.bind("confirm_kp", SDL_SCANCODE_KP_ENTER);
