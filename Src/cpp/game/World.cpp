@@ -1,4 +1,5 @@
 #include "game/World.h"
+#include "game/Zone.h"            // ZoneDef / zoneDef：出生点（草地区中心）与分区数值来源（批六甲）
 #include "engine/Camera.h"        // Camera：激活窗口跟随相机视图中心（position/viewport 查询）
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载世界素材（地砖/墙/装饰）
 #include <algorithm>              // std::clamp / std::min / std::max：尺寸防御与窗口夹取
@@ -14,20 +15,25 @@ namespace
 constexpr uint64_t kSaltFloor = 0xA24BAED4963EE407ull;  // 地板变体用途
 constexpr uint64_t kSaltChunk = 0x9FB21C651E98DF25ull;  // 区块随机结构/装饰的序列种子
 
-// 每区块随机结构数量范围（含两端）：3~5 个——16x16 格里的墙密度约
-// 5%~10%，与「密度适中不堵死」对应（密度是结构数与结构长度的乘积效应）
-constexpr int kStructuresMin = 3; // 每区块最少结构数
-constexpr int kStructuresMax = 5; // 每区块最多结构数
+// 每区块随机结构数量范围（含两端）：6~10 个——批六甲区块 16x16 -> 32x32
+// （面积 x4），结构数与线段长度同步放大（见下），保持与旧密度相当的
+// 「间距感」：每区块约 6~10 组障碍，跑图节奏不因区块变大而真空旷。
+// 最终取值口径见批六甲报告「区块结构数量最终值」
+constexpr int kStructuresMin = 6;  // 每区块最少结构数（批六甲：3 -> 6）
+constexpr int kStructuresMax = 10; // 每区块最多结构数（批六甲：5 -> 10）
 
-// 结构尺寸范围：线段长 2~4 格；结构起点在区块内 2..13（天然避开边缘两圈）
-constexpr int kSegmentLenMin = 2; // 线段最短（格）
-constexpr int kSegmentLenMax = 4; // 线段最长（格）
+// 结构尺寸范围：线段长 3~7 格（批六甲：2~4 -> 3~7，随区块放大加长）；
+// 结构起点在区块内 2..29（天然避开边缘两圈）
+constexpr int kSegmentLenMin = 3; // 线段最短（格）
+constexpr int kSegmentLenMax = 7; // 线段最长（格）
 constexpr int kLocalMin = 2;      // 区块内坐标下界（含）
-constexpr int kLocalSpan = 12;    // 区块内坐标取值范围（2..13 共 12 个取值）
+// 区块内坐标取值范围（2..29 共 28 个取值）：32 - 两侧各 2 格边距
+constexpr int kLocalSpan = World::kChunkCells - 2 * kLocalMin;
 
-// 每区块装饰数量范围（含两端）：1~3 个纯视觉摆件
-constexpr int kDecorMin = 1; // 每区块最少装饰数
-constexpr int kDecorMax = 3; // 每区块最多装饰数
+// 每区块装饰数量范围（含两端）：2~5 个纯视觉摆件（批六甲：1~3 -> 2~5，
+// 与区块面积同步放大约一倍，避免 32 格区块显得空）
+constexpr int kDecorMin = 2; // 每区块最少装饰数
+constexpr int kDecorMax = 5; // 每区块最多装饰数
 
 // 滑坡（slideMove）的单子步位移上限：半格（24px）——单子步小于一格宽，
 // 保证任何速度下位移都不会「跳过」一整格墙（验收项：高速贴墙不穿透）
@@ -76,9 +82,12 @@ void World::generate(int chunksX, int chunksY, uint32_t seed)
     m_floor.assign(cellCount, 0); // 地板变体：逐格哈希填充
     m_decor.assign(cellCount, 0); // 装饰：区块生成阶段填充
 
-    // 出生保护区中心 = 世界中心格（玩家出生点所在的格；3072 世界即格 32）
-    m_spawnCellX = cellsX() / 2; // 中心格 x
-    m_spawnCellY = cellsY() / 2; // 中心格 y
+    // 出生保护区中心 = 草地区出生中心格（批六甲：出生点在草地区中心——
+    // zoneDef(Grass).respawn = (3072, 3072)；自定义小世界经 spawnCenter
+    // 夹取到世界内，格索引 = 世界坐标 / 48）。保护区围绕它 ±3 格
+    const SDL_FPoint spawnCenterPoint = spawnCenter(); // 出生中心（含小世界夹取）
+    m_spawnCellX = cellFloored(spawnCenterPoint.x); // 中心格 x（默认世界：3072 / 48 = 64）
+    m_spawnCellY = cellFloored(spawnCenterPoint.y); // 中心格 y（同上）
 
     // ---- 第 1 层：地板变体（逐格哈希，确定性）----
     // 每格独立哈希取 0..7 的变体索引——布局由 (格子坐标, 种子) 唯一决定，
@@ -155,7 +164,7 @@ void World::generateChunkStructures()
                 return z ^ (z >> 31);              // 输出 64 位随机数
             };
 
-            // 本区块的墙结构数量：3~5（kStructuresMax - kStructuresMin + 1 = 3 种取值）
+            // 本区块的墙结构数量：6~10（取值数 = kStructuresMax - kStructuresMin + 1）
             const int structureCount =
                 kStructuresMin + static_cast<int>(nextRandom() % (kStructuresMax - kStructuresMin + 1));
 
@@ -169,11 +178,11 @@ void World::generateChunkStructures()
                 const int localX = kLocalMin + static_cast<int>(nextRandom() % kLocalSpan);
                 const int localY = kLocalMin + static_cast<int>(nextRandom() % kLocalSpan);
 
-                // 线段长度：2~4 格（type 2 的 2x2 块不使用长度）
+                // 线段长度：3~7 格（type 2 的 2x2 块不使用长度）
                 const int length =
                     kSegmentLenMin + static_cast<int>(nextRandom() % (kSegmentLenMax - kSegmentLenMin + 1));
 
-                // 结构起点换算到全局格坐标（区块基址 = 区块索引 x 16 格）
+                // 结构起点换算到全局格坐标（区块基址 = 区块索引 x 32 格）
                 const int baseCellX = chunkX * kChunkCells + localX;
                 const int baseCellY = chunkY * kChunkCells + localY;
 
@@ -207,7 +216,7 @@ void World::generateChunkStructures()
             }
 
             // ---- 本区块的装饰（纯视觉；地板之上、墙之下的摆件）----
-            // 数量 1~3；位置与类型继续用同一随机序列（顺序固定 -> 确定）
+            // 数量 2~5；位置与类型继续用同一随机序列（顺序固定 -> 确定）
             const int decorCount = kDecorMin + static_cast<int>(nextRandom() % (kDecorMax - kDecorMin + 1));
             for (int decor = 0; decor < decorCount; ++decor)
             {
@@ -417,13 +426,13 @@ SDL_FPoint World::slideMoveEx(float x, float y, float w, float h, float dx, floa
 // ============================================================
 int World::chunkXFromWorldX(float x) const
 {
-    // 区块宽 = 768px：向下取整即区块索引（负值同样 floor 到更左的区块）
+    // 区块宽 = kChunkPixels（1536px）：向下取整即区块索引（负值同样 floor 到更左的区块）
     return static_cast<int>(std::floor(x / kChunkPixels));
 }
 
 int World::chunkYFromWorldY(float y) const
 {
-    // 与横向同式：floor(y / 768)
+    // 与横向同式：floor(y / kChunkPixels)
     return static_cast<int>(std::floor(y / kChunkPixels));
 }
 
@@ -456,12 +465,38 @@ bool World::isPointInActiveChunks(float x, float y) const
     return isChunkActive(chunkXFromWorldX(x), chunkYFromWorldY(y));
 }
 
-// 玩家出生点（让实体中心落在世界中心）
+// 出生中心点：草地区复活点，经世界范围夹取（契约见头文件声明处）
+SDL_FPoint World::spawnCenter() const
+{
+    const ZoneDef& grassZone = zoneDef(ZoneId::Grass); // 草地（出生）区定义
+    // 夹取边距 = （保护区半径 + 2）格：夹取后中心仍落在「可容纳完整
+    // 保护区、且距边界至少 2 格」的内部区域（自定义小世界防御）
+    const float margin = static_cast<float>(kSpawnSafeRadius + 2) * kCellSize;
+    const float worldW = pixelWidth();  // 世界总宽（像素）
+    const float worldH = pixelHeight(); // 世界总高（像素）
+
+    // 水平轴：能容纳两侧边距则夹取复活点 x，否则退回几何中心
+    float centerX = (worldW > margin * 2.0f)
+        ? std::clamp(grassZone.respawnX, margin, worldW - margin) // 常规：夹取到内部
+        : worldW * 0.5f;                                          // 世界过窄：几何中心
+    // 垂直轴：同一口径（独立判断，宽窄不互相牵连）
+    float centerY = (worldH > margin * 2.0f)
+        ? std::clamp(grassZone.respawnY, margin, worldH - margin) // 常规：夹取到内部
+        : worldH * 0.5f;                                          // 世界过矮：几何中心
+
+    return SDL_FPoint{ centerX, centerY }; // 出生中心（世界坐标）
+}
+
+// 玩家出生点（让实体中心落在草地区出生中心，批六甲；小世界夹取见上）
 SDL_FPoint World::spawnPointFor(float entityWidth, float entityHeight) const
 {
-    // 左上角 = 世界中心 - 实体半尺寸（实体中心对齐世界中心）
-    return SDL_FPoint{ pixelWidth() * 0.5f - entityWidth * 0.5f,
-                       pixelHeight() * 0.5f - entityHeight * 0.5f };
+    // 左上角 = 出生中心（草地区中心，经世界范围夹取） - 实体半尺寸
+    // （实体中心对齐出生点）。批六甲起出生点由 Zone 表提供
+    // （zoneDef(Grass).respawn）；世界几何中心不再使用（8x4 世界的几何
+    // 中心恰在草地/雪山分界线上，不应作为出生点）
+    const SDL_FPoint center = spawnCenter(); // 出生中心（含小世界夹取）
+    return SDL_FPoint{ center.x - entityWidth * 0.5f,
+                       center.y - entityHeight * 0.5f };
 }
 
 // ============================================================
@@ -619,12 +654,12 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
         return nullptr;
     }
 
-    // 创建 768x768 渲染目标纹理（一次创建、多次复用：区块不重烘焙）
+    // 创建 1536x1536 渲染目标纹理（一次创建、多次复用：区块不重烘焙）
     SDL_Texture* target = SDL_CreateTexture(renderer,
                                             SDL_PIXELFORMAT_RGBA8888,      // 通用 32 位 RGBA
                                             SDL_TEXTUREACCESS_TARGET,      // 可作渲染目标
-                                            static_cast<int>(kChunkPixels), // 宽 768
-                                            static_cast<int>(kChunkPixels)); // 高 768
+                                            static_cast<int>(kChunkPixels), // 宽 1536
+                                            static_cast<int>(kChunkPixels)); // 高 1536
     if (target == nullptr)
     {
         // 创建失败（显存不足等）：警告并放弃本次（下一帧重试）
@@ -643,11 +678,11 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
         return nullptr;
     }
 
-    // 区块的全局格基址（= 区块索引 x 16 格）
+    // 区块的全局格基址（= 区块索引 x 32 格）
     const int baseCellX = chunkX * kChunkCells; // 本区块左上角格 x
     const int baseCellY = chunkY * kChunkCells; // 本区块左上角格 y
 
-    // ---- 第 1 层：地板（铺满 16x16 格）----
+    // ---- 第 1 层：地板（铺满 32x32 格）----
     if (m_floorTiles == nullptr)
     {
         // 素材缺失兜底：深灰蓝色块（一次性设色，循环内只填充）
@@ -759,7 +794,7 @@ void World::render(SDL_Renderer* renderer, const Camera& camera) const
             // 区块左上角的世界坐标 -> 屏幕坐标（相机换算）
             const Vec2 screen = camera.worldToScreen(chunkX * kChunkPixels, chunkY * kChunkPixels);
 
-            // 目标矩形（1:1 尺寸：区块 768px 对应屏幕 768px）
+            // 目标矩形（1:1 尺寸：区块 1536px 对应屏幕 1536px）
             const SDL_FRect dst{ screen.x, screen.y, kChunkPixels, kChunkPixels };
 
             // 视口裁剪：完全在视口外的区块不提交绘制（每帧最多 4 块可见，

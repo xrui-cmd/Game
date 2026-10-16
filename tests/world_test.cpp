@@ -20,6 +20,7 @@
 // ============================================================================
 
 #include "game/World.h"     // World：生成 / 碰撞 / 激活窗口（被测）
+#include "game/Zone.h"      // 分区表/查询：出生点与分区规则断言（批六甲）
 #include "engine/Camera.h"  // Camera：坐标换算与平滑跟随（被测）
 
 #include <cmath>    // std::fabs：浮点近似断言
@@ -87,7 +88,7 @@ int main()
 
     std::printf("==============================================================\n");
     std::printf(" World / Camera 单元测试 —— 世界生成 / 碰撞 / 激活窗口 / 相机\n");
-    std::printf(" 世界默认 4x4 区块 x 768px = 3072x3072；每区块 16x16 格 x 48px\n");
+    std::printf(" 世界默认 8x4 区块 x 1536px = 12288x6144；每区块 32x32 格 x 48px（批六甲）\n");
     std::printf("==============================================================\n");
 
     // ------------------------------------------------------------------
@@ -97,26 +98,30 @@ int main()
     int p0 = gPass, f0 = gFail;
     {
         World w;                 // 空世界：索引换算不依赖生成数据
-        w.generate(4, 4, 12345); // 4x4 区块 = 3072x3072（与默认配置一致）
+        w.generate(8, 4, 12345); // 8x4 区块 = 12288x6144（与默认配置一致）
 
-        // 横向：每 768px 一个区块，边界值归入右侧区块（floor 语义）
+        // 横向：每 1536px 一个区块，边界值归入右侧区块（floor 语义）
         expectInt("chunkX(0) = 0", w.chunkXFromWorldX(0.0f), 0);
-        expectInt("chunkX(767.9) = 0", w.chunkXFromWorldX(767.9f), 0);
-        expectInt("chunkX(768) = 1（边界归右）", w.chunkXFromWorldX(768.0f), 1);
-        expectInt("chunkX(1536) = 2（世界中心线）", w.chunkXFromWorldX(1536.0f), 2);
-        expectInt("chunkX(3071.9) = 3（最右下沿）", w.chunkXFromWorldX(3071.9f), 3);
+        expectInt("chunkX(1535.9) = 0", w.chunkXFromWorldX(1535.9f), 0);
+        expectInt("chunkX(1536) = 1（边界归右）", w.chunkXFromWorldX(1536.0f), 1);
+        expectInt("chunkX(3072) = 2（草地区中心线）", w.chunkXFromWorldX(3072.0f), 2);
+        expectInt("chunkX(6144) = 4（草地/雪山分界线）", w.chunkXFromWorldX(6144.0f), 4);
+        expectInt("chunkX(12287.9) = 7（最右下沿）", w.chunkXFromWorldX(12287.9f), 7);
         expectInt("chunkX(-0.1) = -1（世界外左）", w.chunkXFromWorldX(-0.1f), -1);
-        expectInt("chunkX(3072) = 4（世界外右）", w.chunkXFromWorldX(3072.0f), 4);
+        expectInt("chunkX(12288) = 8（世界外右）", w.chunkXFromWorldX(12288.0f), 8);
 
         // 纵向：与横向同一公式（抽查边界）
         expectInt("chunkY(0) = 0", w.chunkYFromWorldY(0.0f), 0);
-        expectInt("chunkY(768) = 1", w.chunkYFromWorldY(768.0f), 1);
-        expectInt("chunkY(2999) = 3", w.chunkYFromWorldY(2999.0f), 3);
+        expectInt("chunkY(1536) = 1", w.chunkYFromWorldY(1536.0f), 1);
+        expectInt("chunkY(6143.9) = 3（最下沿）", w.chunkYFromWorldY(6143.9f), 3);
 
-        // 尺寸换算：区块数 / 格数 / 像素数三者自洽
-        expectInt("chunksX = 4", w.chunksX(), 4);
-        expectInt("cellsX = 4x16 = 64", w.cellsX(), 64);
-        expectNear("pixelWidth = 64x48 = 3072", w.pixelWidth(), 3072.0f);
+        // 尺寸换算：区块数 / 格数 / 像素数三者自洽（批六甲：32 格/区块）
+        expectInt("chunksX = 8", w.chunksX(), 8);
+        expectInt("chunksY = 4", w.chunksY(), 4);
+        expectInt("cellsX = 8x32 = 256", w.cellsX(), 256);
+        expectInt("cellsY = 4x32 = 128", w.cellsY(), 128);
+        expectNear("pixelWidth = 256x48 = 12288", w.pixelWidth(), 12288.0f);
+        expectNear("pixelHeight = 128x48 = 6144", w.pixelHeight(), 6144.0f);
     }
     endCase(1, p0, f0);
 
@@ -127,17 +132,22 @@ int main()
     p0 = gPass; f0 = gFail;
     {
         World w;
-        w.generate(4, 4, 12345);
+        w.generate(8, 4, 12345);
 
-        // 相机视图中心在世界中心 (1536,1536) -> 区块 (2,2) -> 窗口 (1,1)~(3,3)
-        w.updateActiveWindow(1536.0f, 1536.0f);
-        expectInt("中心窗口 minX = 1", w.activeMinChunkX(), 1);
-        expectInt("中心窗口 maxX = 3", w.activeMaxChunkX(), 3);
-        expectInt("中心窗口 minY = 1", w.activeMinChunkY(), 1);
-        expectInt("中心窗口 maxY = 3", w.activeMaxChunkY(), 3);
-        expectTrue("世界中心点在激活区", w.isPointInActiveChunks(1536.0f, 1536.0f));
+        // 相机视图中心在草地区中心 (3072,3072) -> 区块 (2,2) -> 窗口 (1,1)~(3,3)
+        w.updateActiveWindow(3072.0f, 3072.0f);
+        expectInt("草地中心窗口 minX = 1", w.activeMinChunkX(), 1);
+        expectInt("草地中心窗口 maxX = 3", w.activeMaxChunkX(), 3);
+        expectInt("草地中心窗口 minY = 1", w.activeMinChunkY(), 1);
+        expectInt("草地中心窗口 maxY = 3", w.activeMaxChunkY(), 3);
+        expectTrue("草地区中心点在激活区", w.isPointInActiveChunks(3072.0f, 3072.0f));
         expectTrue("区块 (0,0) 不在激活区", !w.isPointInActiveChunks(100.0f, 100.0f));
-        expectTrue("区块 (1,1) 在激活区", w.isPointInActiveChunks(800.0f, 800.0f));
+        expectTrue("区块 (1,1) 在激活区", w.isPointInActiveChunks(1600.0f, 1600.0f));
+
+        // 跨区边界（x=6144）：区块 (4,2) -> 窗口 (3,1)~(5,3)——分界两侧相邻
+        w.updateActiveWindow(6144.0f, 3072.0f);
+        expectInt("跨区窗口 minX = 3", w.activeMinChunkX(), 3);
+        expectInt("跨区窗口 maxX = 5", w.activeMaxChunkX(), 5);
 
         // 相机在左上角 (0,0) -> 区块 (0,0) -> 窗口 (0,0)~(1,1)（clamp 左/上）
         w.updateActiveWindow(0.0f, 0.0f);
@@ -145,16 +155,17 @@ int main()
         expectInt("角落窗口 maxX = 1", w.activeMaxChunkX(), 1);
         expectInt("角落窗口 maxY = 1", w.activeMaxChunkY(), 1);
 
-        // 相机在右下角 -> 区块 (3,3) -> 窗口 (2,2)~(3,3)（clamp 右/下）
-        w.updateActiveWindow(3071.0f, 3071.0f);
-        expectInt("右下窗口 minX = 2", w.activeMinChunkX(), 2);
-        expectInt("右下窗口 maxX = 3（clamp）", w.activeMaxChunkX(), 3);
+        // 相机在右下角 -> 区块 (7,3) -> 窗口 (6,2)~(7,3)（clamp 右/下）
+        w.updateActiveWindow(12287.0f, 6143.0f);
+        expectInt("右下窗口 minX = 6", w.activeMinChunkX(), 6);
+        expectInt("右下窗口 maxX = 7（clamp）", w.activeMaxChunkX(), 7);
         expectInt("右下窗口 minY = 2", w.activeMinChunkY(), 2);
+        expectInt("右下窗口 maxY = 3（clamp）", w.activeMaxChunkY(), 3);
 
         // 相机中心在世界外（异常输入）：clamp 到最近区块，窗口仍合法
         w.updateActiveWindow(99999.0f, -99999.0f);
-        expectInt("世界外输入 -> minX = 2", w.activeMinChunkX(), 2);
-        expectInt("世界外输入 -> maxX = 3", w.activeMaxChunkX(), 3);
+        expectInt("世界外输入 -> minX = 6", w.activeMinChunkX(), 6);
+        expectInt("世界外输入 -> maxX = 7", w.activeMaxChunkX(), 7);
         expectInt("世界外输入 -> minY = 0", w.activeMinChunkY(), 0);
         expectInt("世界外输入 -> maxY = 1", w.activeMaxChunkY(), 1);
     }
@@ -169,9 +180,9 @@ int main()
         World a;
         World b;
         World c;
-        a.generate(4, 4, 777); // 种子 777：左侧样本
-        b.generate(4, 4, 777); // 种子 777：右侧样本（应与左侧逐格相等）
-        c.generate(4, 4, 778); // 种子 778：对照样本（应与 777 存在差异）
+        a.generate(8, 4, 777); // 种子 777：左侧样本
+        b.generate(8, 4, 777); // 种子 777：右侧样本（应与左侧逐格相等）
+        c.generate(8, 4, 778); // 种子 778：对照样本（应与 777 存在差异）
 
         // 逐格比对三项数据：墙 / 地板变体 / 装饰
         int wallDiff = 0;  // 墙差异计数
@@ -208,7 +219,7 @@ int main()
 
         // 确定性再验：同一对象的重复生成（模拟「卸载再载入」的数据侧）
         World d;
-        d.generate(4, 4, 777); // 重新生成同一世界
+        d.generate(8, 4, 777); // 重新生成同一世界
         int regenDiff = 0;     // 重生成差异计数
         for (int cellY = 0; cellY < a.cellsY(); ++cellY)
         {
@@ -230,7 +241,7 @@ int main()
     p0 = gPass; f0 = gFail;
     {
         World w;
-        w.generate(4, 4, 2026); // 任意种子：规则必须恒成立（与种子无关）
+        w.generate(8, 4, 2026); // 任意种子：规则必须恒成立（与种子无关）
 
         // 规则一：世界最外圈格全部是墙（世界的物理边界）
         bool borderAllWall = true; // 边界圈是否全墙
@@ -253,7 +264,7 @@ int main()
         {
             for (int cellX = 1; cellX < w.cellsX() - 1; ++cellX)
             {
-                // 本格是否位于区块边缘一圈（局部坐标 0 或 15）
+                // 本格是否位于区块边缘一圈（局部坐标 0 或 31——批六甲 32 格区块）
                 const bool onEdge = (cellX % World::kChunkCells == 0) ||
                                     (cellX % World::kChunkCells == World::kChunkCells - 1) ||
                                     (cellY % World::kChunkCells == 0) ||
@@ -266,9 +277,12 @@ int main()
         }
         expectTrue("区块交界格无随机墙（可通行）", chunkEdgeClear);
 
-        // 规则三：出生保护区（世界中心格 ±3）无墙无装饰
-        const int spawnCellX = w.cellsX() / 2; // 中心格 x（32）
-        const int spawnCellY = w.cellsY() / 2; // 中心格 y（32）
+        // 规则三：出生保护区（草地区中心格 ±3）无墙无装饰。
+        // 批六甲：中心 = 草地区复活点 (3072,3072) -> 格 (64,64)——不是
+        // 几何世界中心（8x4 世界几何中心恰在草地/雪山分界线上）
+        const int spawnCellX = static_cast<int>(zoneDef(ZoneId::Grass).respawnX / World::kCellSize); // 64
+        const int spawnCellY = static_cast<int>(zoneDef(ZoneId::Grass).respawnY / World::kCellSize); // 64
+        expectInt("出生保护区中心格 x = 64", spawnCellX, 64);
         bool safeZoneClear = true; // 保护区是否干净
         for (int cellY = spawnCellY - World::kSpawnSafeRadius;
              cellY <= spawnCellY + World::kSpawnSafeRadius; ++cellY)
@@ -314,7 +328,7 @@ int main()
     p0 = gPass; f0 = gFail;
     {
         World w;
-        w.generate(4, 4, 555);
+        w.generate(8, 4, 555);
 
         // 出生点总是可走（保护区保证）——碰撞测试的出发位置
         const SDL_FPoint spawn = w.spawnPointFor(48.0f, 48.0f); // 测试矩形 48x48
@@ -328,7 +342,7 @@ int main()
         float x = spawn.x; // 测试矩形左上角 x
         float y = spawn.y; // 测试矩形左上角 y
         bool wallFound = false; // 是否在某步停住
-        for (int step = 0; step < 4000; ++step) // 3072 宽足够走到边界墙
+        for (int step = 0; step < 12000; ++step) // 12288 宽足够走到边界墙
         {
             // 单步向右滑动 1px；被挡时返回原位置
             const SDL_FPoint next = w.slideMove(x, y, 48.0f, 48.0f, 1.0f, 0.0f);
@@ -458,16 +472,16 @@ int main()
     // ------------------------------------------------------------------
     // CASE 8 出生点换算与可走断言
     // ------------------------------------------------------------------
-    beginCase(8, "出生点（世界中心）换算");
+    beginCase(8, "出生点（草地区中心）换算");
     p0 = gPass; f0 = gFail;
     {
         World w;
-        w.generate(4, 4, 999);
+        w.generate(8, 4, 999);
 
-        // spawnPointFor：实体中心落在世界中心 (1536,1536)
+        // spawnPointFor：实体中心落在草地区中心 (3072,3072)（批六甲）
         const SDL_FPoint sp = w.spawnPointFor(48.0f, 84.0f); // 玩家尺寸 48x84
-        expectNear("出生点 x = 1536 - 24 = 1512", sp.x, 1512.0f);
-        expectNear("出生点 y = 1536 - 42 = 1494", sp.y, 1494.0f);
+        expectNear("出生点 x = 3072 - 24 = 3048", sp.x, 3048.0f);
+        expectNear("出生点 y = 3072 - 42 = 3030", sp.y, 3030.0f);
         expectTrue("玩家出生矩形可走", w.isRectWalkable(SDL_FRect{ sp.x, sp.y, 48.0f, 84.0f }));
 
         // 世界外：点/矩形两条路径一致不可走

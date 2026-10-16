@@ -33,7 +33,8 @@
 //      Player 自持，世界纹理由 World 自持并在析构时释放；背景图自批二起
 //      不再用于对局——区块地板取代，MenuScene 仍继续使用 background.png）
 //   2. 世界与相机（批二核心）：
-//      - 世界 3072x3072（4x4 区块；区块 768px = 16 格 x 48px），确定性
+//      - 世界 12288x6144（8x4 区块；区块 1536px = 32 格 x 48px；批六甲），
+//        分两个风格区（西 4x4 草地 / 东 4x4 雪山——game/Zone.h 区表），确定性
 //        生成（坐标哈希 + 种子；seed=0 时每局随机）；世界边界一圈墙 +
 //        每区块随机墙簇（区块交界与出生保护区保证可通行）；
 //      - 玩家移动为「分轴位移 + 撞墙滑动」（World::slideMove，取代旧版
@@ -490,7 +491,8 @@ private:
     // 说明（M2；批五B 修订）：每级自动强化的 kDefaultLevelup* 常量已退役
     // 删除——升级成长由三选一法术提供（法术表与数值见 game/Spell.h），
     // 九项强化由商店金币购买（表与价格见 game/UpgradeCard.h / Shop.h）
-    static constexpr int kDefaultWorldChunks = 4;               // 世界区块数缺省值（world_chunks_x/y）：4x4 = 3072x3072
+    static constexpr int kDefaultWorldChunksX = 8;              // 世界横向区块数缺省（world_chunks_x）：8x4 = 12288x6144（批六甲）
+    static constexpr int kDefaultWorldChunksY = 4;              // 世界纵向区块数缺省（world_chunks_y）：西 4x4 草地 + 东 4x4 雪山
     static constexpr float kDefaultCameraSmoothTime = 0.12f;    // 相机平滑时间常数缺省值（camera_smooth_time，秒）
 
     // ---- 玩法常量（代码固定，不进配置；改动须连同注释一起审视）----

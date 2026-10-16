@@ -119,7 +119,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //（M2 起升级成长由三选一提供；批五B 起选项为法术——法术表/数值与
     //  商店价格均为代码常量，见 game/Spell.h / UpgradeCard.h / Shop.h；
     //  旧 levelup_* 自动强化键已退役删除）
-    //      world_chunks_x/y        世界区块数（横向/纵向；世界 = 区块 x 768px）
+    //      world_chunks_x/y        世界区块数（横向/纵向；世界 = 区块 x 1536px；
+    //                              默认 8x4 = 12288x6144：西 4x4 草地 + 东 4x4 雪山）
     //      world_seed              世界种子（0 = 每局随机；非 0 = 固定可复现）
     //      camera_smooth_time      相机平滑时间常数（秒）
     const float playerSpeed = config.getFloat("player_speed", Player::kDefaultSpeed);
@@ -166,8 +167,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 防御）；种子 0 = 「每局随机」哨兵：在 1..INT32_MAX 取一个非 0 随机值
     // （非 0 值都是固定种子——同一布局完全可复现，供调试与确定性冒烟）；
     // 相机平滑时间夹到非负（0 = 立即到位——显式配置的「无平滑」语义）
-    const int worldChunksX = std::max(1, config.getInt("world_chunks_x", kDefaultWorldChunks));
-    const int worldChunksY = std::max(1, config.getInt("world_chunks_y", kDefaultWorldChunks));
+    const int worldChunksX = std::max(1, config.getInt("world_chunks_x", kDefaultWorldChunksX));
+    const int worldChunksY = std::max(1, config.getInt("world_chunks_y", kDefaultWorldChunksY));
     const int worldSeedConfig = config.getInt("world_seed", 0);
     // 种子换算：非 0 原样使用；0 时取 [1, INT32_MAX] 的随机值（+1 避开 0）
     const uint32_t worldSeed = (worldSeedConfig != 0)
@@ -207,7 +208,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
 
-    // 5) 生成世界（批二核心）：默认 4x4 区块 x 768px = 3072x3072（config 可调）。
+    // 5) 生成世界（批二核心；批六甲：区块 32 格、8x4 = 12288x6144，config 可调）。
     //    确定性生成：同一 (种子, 区块) 永远得到同一布局；world_seed=0 时
     //    每局换新随机种子（R 重开不换——整个对局共享同一张图，「走远再
     //    回头内容一致」由此保证）。素材（地砖/墙/装饰）加载失败只降级为
@@ -217,9 +218,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_world.loadAssets(m_renderer);
     // 冒烟观测点：世界生成日志（尺寸与种子——确定性复现与断言依据）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "世界生成（%d x %d 区块，%u 像素见方，种子 %u）",
+                "世界生成（%d x %d 区块，%u x %u 像素，种子 %u）",
                 m_world.chunksX(), m_world.chunksY(),
-                static_cast<unsigned>(m_world.pixelWidth()), m_world.seed());
+                static_cast<unsigned>(m_world.pixelWidth()),
+                static_cast<unsigned>(m_world.pixelHeight()), m_world.seed());
 
     // 6) 加载 UI 字体（assets/fonts/SmileySans-Oblique.ttf，中文开源字体）。
     //    路径拼装以 exe 所在目录为基准（与其余素材一致）。
