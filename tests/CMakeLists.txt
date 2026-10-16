@@ -271,6 +271,41 @@ set_target_properties(world_test PROPERTIES
 )
 
 # ============================================================
+#  三选一升级卡单元测试（card_test，M2）
+#
+#  被测对象：Src/inc/game/UpgradeCard.h（game 层纯逻辑头文件，header-only）——
+#  九卡表 / 三抽不重复（排除满层、不足三张按实际）/ 种子化随机源 /
+#  叠加数学（冷却乘算、加成累加、上限封顶）/ 升级欠账队列。
+#
+#  与 xp_test / monster_ai_test 同模式：不依赖 SDL3、无 .cpp、无链接，
+#  随机源经注入固定序列/种子，任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\card_test.exe
+# ============================================================
+
+add_executable(card_test card_test.cpp)
+
+if (MSVC)
+    target_compile_options(card_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：UpgradeCard.h 位于游戏仓 Src/inc（按 "game/UpgradeCard.h" 引用）
+target_include_directories(card_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(card_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
+
+# ============================================================
 #  怪物 AI 状态决策单元测试（monster_ai_test，批三）
 #
 #  被测对象：Src/inc/game/MonsterAi.h（game 层纯逻辑头文件，header-only）——
