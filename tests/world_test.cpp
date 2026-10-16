@@ -6,9 +6,9 @@
 //  覆盖场景 : ① 坐标 <-> 区块索引换算（floor 语义、负值与世界外）
 //             ② 激活窗口计算（中心 ±1、边界 clamp、点是否在激活区）
 //             ③ 确定性生成（同种子逐格相等 / 不同种子存在差异 / 结构规则：
-//                边界一圈墙、区块交界无随机墙、出生保护区无墙、装饰不落墙）
+//                海洋水圈、区块交界无随机墙、出生保护区无墙、装饰不落墙/水）
 //             ④ 格级碰撞（isRectWalkable / isPointWalkable / slideMove：
-//                撞墙停轴、贴墙滑动、大位移不穿透）
+//                撞墙停轴、贴墙滑动、大位移不穿透、海洋截停）
 //             ⑤ 相机：worldToScreen/screenToWorld 往返、边界钳制、
 //                世界小于视口时居中、follow 指数平滑的步进与收敛
 //
@@ -237,32 +237,64 @@ int main()
     // ------------------------------------------------------------------
     // CASE 4 生成的结构规则（边界墙 / 区块交界 / 出生保护区 / 装饰合法性）
     // ------------------------------------------------------------------
-    beginCase(4, "结构规则（边界一圈墙、交界与保护区可通行）");
+    beginCase(4, "结构规则（海洋边界、交界与保护区可通行）");
     p0 = gPass; f0 = gFail;
     {
         World w;
         w.generate(8, 4, 2026); // 任意种子：规则必须恒成立（与种子无关）
 
-        // 规则一：世界最外圈格全部是墙（世界的物理边界）
-        bool borderAllWall = true; // 边界圈是否全墙
-        for (int x = 0; x < w.cellsX(); ++x)
+        // 规则一：世界最外 kWaterRingCells 圈格全部是水域且不是墙
+        //（批六甲·海洋边界取代原「最外一圈墙」）；内侧一侧不再有水
+        bool ringAllWater = true;     // 外圈是否全水域
+        bool innerNoWater = true;     // 非外圈是否无水
+        for (int cellY = 0; cellY < w.cellsY(); ++cellY)
         {
-            // 上下两行逐格检查
-            if (!w.wallAt(x, 0) || !w.wallAt(x, w.cellsY() - 1)) { borderAllWall = false; }
+            for (int cellX = 0; cellX < w.cellsX(); ++cellX)
+            {
+                // 本格是否处于最外 kWaterRingCells 圈（四边任一）
+                const bool onRing = cellX < World::kWaterRingCells ||
+                                    cellY < World::kWaterRingCells ||
+                                    cellX >= w.cellsX() - World::kWaterRingCells ||
+                                    cellY >= w.cellsY() - World::kWaterRingCells;
+                if (onRing)
+                {
+                    // 外圈：必须是水，且不是墙（边界墙已退役）
+                    if (!w.waterAt(cellX, cellY) || w.wallAt(cellX, cellY))
+                    {
+                        ringAllWater = false; // 外圈违例
+                    }
+                }
+                else if (w.waterAt(cellX, cellY))
+                {
+                    innerNoWater = false; // 内圈出现水：违例
+                }
+            }
         }
-        for (int y = 0; y < w.cellsY(); ++y)
+        expectTrue("世界最外 2 圈全部是水域（且非墙）", ringAllWater);
+        expectTrue("最外 2 圈以内不再有水域", innerNoWater);
+
+        // 规则一补：水域格无随机墙、无装饰（海洋只属于边界语义）
+        bool waterClean = true; // 水域格是否干净
+        for (int cellY = 0; cellY < w.cellsY(); ++cellY)
         {
-            // 左右两列逐格检查
-            if (!w.wallAt(0, y) || !w.wallAt(w.cellsX() - 1, y)) { borderAllWall = false; }
+            for (int cellX = 0; cellX < w.cellsX(); ++cellX)
+            {
+                // 水域格上不允许出现墙或装饰
+                if (w.waterAt(cellX, cellY) &&
+                    (w.wallAt(cellX, cellY) || w.decorAt(cellX, cellY) != 0))
+                {
+                    waterClean = false; // 违例
+                }
+            }
         }
-        expectTrue("世界最外圈全部是墙", borderAllWall);
+        expectTrue("水域格无随机墙、无装饰", waterClean);
 
         // 规则二：区块交界一圈格没有随机墙（交界永远可通行）
-        //（排除世界最外圈——那里本来就是边界墙）
+        //（排除世界水圈——那里的通行语义由水域承担）
         bool chunkEdgeClear = true; // 是否全部无随机墙
-        for (int cellY = 1; cellY < w.cellsY() - 1; ++cellY)
+        for (int cellY = World::kWaterRingCells; cellY < w.cellsY() - World::kWaterRingCells; ++cellY)
         {
-            for (int cellX = 1; cellX < w.cellsX() - 1; ++cellX)
+            for (int cellX = World::kWaterRingCells; cellX < w.cellsX() - World::kWaterRingCells; ++cellX)
             {
                 // 本格是否位于区块边缘一圈（局部坐标 0 或 31——批六甲 32 格区块）
                 const bool onEdge = (cellX % World::kChunkCells == 0) ||
@@ -299,14 +331,15 @@ int main()
         }
         expectTrue("出生保护区（中心 ±3 格）无墙无装饰", safeZoneClear);
 
-        // 规则四：装饰只出现在非墙格；地板变体全部落在 [0,7]
+        // 规则四：装饰只出现在非墙非水格；地板变体全部落在 [0,7]
         bool decorAndFloorLegal = true; // 合法性总旗标
         for (int cellY = 0; cellY < w.cellsY(); ++cellY)
         {
             for (int cellX = 0; cellX < w.cellsX(); ++cellX)
             {
-                // 装饰不在墙上（装饰是地板摆件）；地板变体在素材表范围内
-                if (w.decorAt(cellX, cellY) != 0 && w.wallAt(cellX, cellY))
+                // 装饰不在墙上、也不在水上（装饰是地板摆件）；地板变体在素材表范围内
+                if (w.decorAt(cellX, cellY) != 0 &&
+                    (w.wallAt(cellX, cellY) || w.waterAt(cellX, cellY)))
                 {
                     decorAndFloorLegal = false;
                 }
@@ -317,7 +350,7 @@ int main()
                 }
             }
         }
-        expectTrue("装饰不落墙格、地板变体在 [0,7]", decorAndFloorLegal);
+        expectTrue("装饰不落墙格/水格、地板变体在 [0,7]", decorAndFloorLegal);
     }
     endCase(4, p0, f0);
 
@@ -337,12 +370,38 @@ int main()
         // 世界外点位不可走（出界即墙）
         expectTrue("世界外 (-5,-5) 不可走", !w.isPointWalkable(-5.0f, -5.0f));
 
+        // 海洋边界（批六甲）：水圈内点位不可走（等同旧边界墙的通行语义）
+        expectTrue("海洋格 (1,1) 中心点不可走", !w.isPointWalkable(1.5f * World::kCellSize, 1.5f * World::kCellSize));
+        expectTrue("海洋格 (0,0) 起点矩形不可走", !w.isRectWalkable(SDL_FRect{ 0.0f, 0.0f, 48.0f, 48.0f }));
+
+        // 海洋截停：在水圈内侧找一格可走陆地，向左大位移滑动——必须停在水缘
+        //（x = 96 = 第 2 格左缘；不进入 x=0/1 的水圈格）
+        int shoreCellY = -1; // 水圈内侧（x=2 列）第一个可走格 y
+        for (int scanY = World::kWaterRingCells; scanY < w.cellsY() - World::kWaterRingCells; ++scanY)
+        {
+            // x=2 列、非墙非水的第一个格（水圈内侧的第一列陆地）
+            if (!w.wallAt(2, scanY) && !w.waterAt(2, scanY))
+            {
+                shoreCellY = scanY; // 找到
+                break;
+            }
+        }
+        expectTrue("环境构置：水圈内侧（x=2 列）存在可走陆地", shoreCellY >= 0);
+        if (shoreCellY >= 0)
+        {
+            const float shoreX = 2.0f * World::kCellSize;                 // 陆地格左缘 = 96
+            const float shoreY = static_cast<float>(shoreCellY) * World::kCellSize; // 陆地格上缘
+            const SDL_FPoint stopped = w.slideMove(shoreX, shoreY, 48.0f, 48.0f, -5000.0f, 0.0f); // 向海大位移
+            expectNear("向海滑动被截停：停在 x=96", stopped.x, shoreX);
+            expectTrue("截停位置仍可走（未入水）", w.isRectWalkable(SDL_FRect{ stopped.x, stopped.y, 48.0f, 48.0f }));
+        }
+
         // 用「小步探测」找到 +x 方向的第一面墙（与随机布局无关的稳健做法）：
         // 每次只滑 1px，直到位置不再变化 == 前方被墙挡住
         float x = spawn.x; // 测试矩形左上角 x
         float y = spawn.y; // 测试矩形左上角 y
         bool wallFound = false; // 是否在某步停住
-        for (int step = 0; step < 12000; ++step) // 12288 宽足够走到边界墙
+        for (int step = 0; step < 12000; ++step) // 12288 宽足够走到海洋边界
         {
             // 单步向右滑动 1px；被挡时返回原位置
             const SDL_FPoint next = w.slideMove(x, y, 48.0f, 48.0f, 1.0f, 0.0f);

@@ -14,6 +14,16 @@ namespace
 // 地板变体、区块序列、装饰各自带盐，避免相同坐标的不同用途产生关联
 constexpr uint64_t kSaltFloor = 0xA24BAED4963EE407ull;  // 地板变体用途
 constexpr uint64_t kSaltChunk = 0x9FB21C651E98DF25ull;  // 区块随机结构/装饰的序列种子
+constexpr uint64_t kSaltWater = 0xD1B54A32D192ED03ull;  // 水砖变体用途（批六甲·海洋边界）
+
+// 水砖变体数（与 assets/tiles_water.png 的帧数一致）：烘焙水格时按格哈希
+// 取 0..2 挑一帧——水面波纹相位不同，大面积平铺不死板
+constexpr int kWaterVariants = 3;
+
+// 岸边浪花过渡线（批六甲·海洋边界，程序化叠加不占素材）：
+// 水格四邻中每一侧与「陆地格」相接的边，贴边画一道浪花条——
+// 让海陆边界一眼可辨。厚度 6px、亮青白色（与深蓝水面强对比）
+constexpr float kFoamThickness = 6.0f; // 浪花条厚度（像素，贴水格内侧边）
 
 // 每区块随机结构数量范围（含两端）：6~10 个——批六甲区块 16x16 -> 32x32
 // （面积 x4），结构数与线段长度同步放大（见下），保持与旧密度相当的
@@ -79,6 +89,7 @@ void World::generate(int chunksX, int chunksY, uint32_t seed)
     // 格数据整体重算（一维行主序数组；尺寸 = cellsX x cellsY）
     const size_t cellCount = static_cast<size_t>(cellsX()) * static_cast<size_t>(cellsY());
     m_walls.assign(cellCount, 0); // 墙体位图：从全空开始，按规则逐层写入
+    m_water.assign(cellCount, 0); // 水域位图：海洋边界在「第 2 层」整圈写入（批六甲）
     m_floor.assign(cellCount, 0); // 地板变体：逐格哈希填充
     m_decor.assign(cellCount, 0); // 装饰：区块生成阶段填充
 
@@ -103,17 +114,21 @@ void World::generate(int chunksX, int chunksY, uint32_t seed)
         }
     }
 
-    // ---- 第 2 层：世界边界一圈墙 ----
-    // 最外圈格恒为墙：世界的物理边界由墙自然形成（实体活动范围 = 墙内），
-    // 相机钳制 + 边界墙双保险——玩家永远走不出世界，也看不到世界外的虚空
+    // ---- 第 2 层：海洋边界（最外 kWaterRingCells 圈格恒为水域）----
+    // 批六甲·海洋边界：取代原「最外一圈墙」——世界边界由 2 格厚水域
+    // 自然形成（实体活动范围 = 水域以内）。通行语义与旧边界墙等同：
+    // isRectWalkable 对水域恒 false（玩家/怪物本批都进不去；「玩家入水 +
+    // 落水动画 + 死亡复活」归批六乙）。相机钳制 + 水域 + 世界外兜底三保——
+    // 实体永远走不出世界，也看不到世界外的虚空
     for (int cellY = 0; cellY < cellsY(); ++cellY)
     {
         for (int cellX = 0; cellX < cellsX(); ++cellX)
         {
-            // 处于最外圈（四边任一）：置墙
-            if (cellX == 0 || cellY == 0 || cellX == cellsX() - 1 || cellY == cellsY() - 1)
+            // 处于最外 kWaterRingCells 圈（四边任一）：置水域
+            if (cellX < kWaterRingCells || cellY < kWaterRingCells ||
+                cellX >= cellsX() - kWaterRingCells || cellY >= cellsY() - kWaterRingCells)
             {
-                m_walls[static_cast<size_t>(cellY) * static_cast<size_t>(cellsX()) + static_cast<size_t>(cellX)] = 1;
+                m_water[static_cast<size_t>(cellY) * static_cast<size_t>(cellsX()) + static_cast<size_t>(cellX)] = 1;
             }
         }
     }
@@ -230,9 +245,9 @@ void World::generateChunkStructures()
                 // 跳过与否只影响本格，不影响后续随机序列的推进顺序）
                 const uint8_t decorType = static_cast<uint8_t>(1 + nextRandom() % 2);
 
-                // 出生保护区不放装饰（出生点近旁保持干净）、墙上不放
-                // （装饰只摆在地板上）；其余照摆
-                if (inSpawnSafeZone(cellX, cellY) || wallAt(cellX, cellY))
+                // 出生保护区不放装饰（出生点近旁保持干净）、墙上与水域
+                // 不放（装饰只摆在地板上）；其余照摆
+                if (inSpawnSafeZone(cellX, cellY) || wallAt(cellX, cellY) || waterAt(cellX, cellY))
                 {
                     continue; // 本装饰作废（随机序列已正常推进，确定性不受影响）
                 }
@@ -245,21 +260,30 @@ void World::generateChunkStructures()
 // 尝试把格 (cellX, cellY) 设为随机墙（带三重豁免）
 void World::setRandomWall(int cellX, int cellY)
 {
-    // 豁免一：世界最外圈（边界墙由独立步骤恒置，随机结构不触碰它的语义）
-    if (cellX <= 0 || cellY <= 0 || cellX >= cellsX() - 1 || cellY >= cellsY() - 1)
+    // 豁免一：世界最外 kWaterRingCells 圈（海洋边界由独立步骤恒置，
+    // 随机结构不触碰它的语义——批六甲：原「边界一圈墙」扩为 2 格水圈）
+    if (cellX < kWaterRingCells || cellY < kWaterRingCells ||
+        cellX >= cellsX() - kWaterRingCells || cellY >= cellsY() - kWaterRingCells)
     {
-        return; // 世界边界格：不参与随机结构
+        return; // 海洋水圈格：不参与随机结构
     }
 
-    // 豁免二：区块边缘一圈（local 0 与 15）——相邻区块的交界因此永远
-    // 不放随机墙，「区块交界保证可通行」的结构性保证
+    // 豁免一补（防御）：水域格一律不置墙（与上一条同义的第二道闸——
+    // 将来若水域不再只限边界，本判定仍然成立）
+    if (waterAt(cellX, cellY))
+    {
+        return; // 水域格：不参与随机结构
+    }
+
+    // 豁免二：区块边缘一圈（local 0 与 31——批六甲 32 格区块）——相邻
+    // 区块的交界因此永远不放随机墙，「区块交界保证可通行」的结构性保证
     if (cellX % kChunkCells == 0 || cellX % kChunkCells == kChunkCells - 1 ||
         cellY % kChunkCells == 0 || cellY % kChunkCells == kChunkCells - 1)
     {
         return; // 区块交界格：不参与随机结构
     }
 
-    // 豁免三：出生保护区（世界中心 ±kSpawnSafeRadius 格）——玩家出生
+    // 豁免三：出生保护区（出生中心 ±kSpawnSafeRadius 格）——玩家出生
     // 点与近旁绝不被墙封堵
     if (inSpawnSafeZone(cellX, cellY))
     {
@@ -270,7 +294,7 @@ void World::setRandomWall(int cellX, int cellY)
     m_walls[static_cast<size_t>(cellY) * static_cast<size_t>(cellsX()) + static_cast<size_t>(cellX)] = 1;
 }
 
-// 是否处于出生保护区（世界中心格 ±kSpawnSafeRadius 的方形区域）
+// 是否处于出生保护区（出生中心格 ±kSpawnSafeRadius 的方形区域）
 bool World::inSpawnSafeZone(int cellX, int cellY) const
 {
     // 两轴分别判断闭区间 [中心-半径, 中心+半径]：都命中才算保护区内
@@ -300,6 +324,27 @@ bool World::wallAt(int cellX, int cellY) const
 
     // 常规路径：行主序查位图（非 0 即墙）
     return m_walls[static_cast<size_t>(cellY) * static_cast<size_t>(cellsX()) + static_cast<size_t>(cellX)] != 0;
+}
+
+// 指定格是否海洋水域（批六甲·海洋边界）。越界/未生成恒 false——
+// 水域只在世界内部（世界外由 wallAt 的「世界外即墙」兜底）
+bool World::waterAt(int cellX, int cellY) const
+{
+    // 未生成：无水域世界（防御——与 wallAt 的「未生成无墙」同口径）
+    if (m_water.empty())
+    {
+        return false;
+    }
+
+    // 世界外（含负值）：不是「水域」但这个语义由 wallAt 负责——此处返回
+    // false（调用方对世界外的通行判定永远先看到 wallAt == true）
+    if (cellX < 0 || cellX >= cellsX() || cellY < 0 || cellY >= cellsY())
+    {
+        return false;
+    }
+
+    // 常规路径：行主序查位图（非 0 即水域）
+    return m_water[static_cast<size_t>(cellY) * static_cast<size_t>(cellsX()) + static_cast<size_t>(cellX)] != 0;
 }
 
 // 地板变体索引查询（0..7）；越界或未生成返回 0（防御——烘焙前会先判墙）
@@ -342,25 +387,30 @@ bool World::isRectWalkable(const SDL_FRect& rect) const
     const int maxCellX = cellFloored(rect.x + rect.w - kEdgeEpsilon); // 右边界格（含）
     const int maxCellY = cellFloored(rect.y + rect.h - kEdgeEpsilon); // 下边界格（含）
 
-    // 覆盖区域内任一格是墙 -> 不可走（全部无墙才可走）
+    // 覆盖区域内任一格是墙或是水域 -> 不可走（全部无墙且非水域才可走）。
+    // 批六甲：海洋边界与墙同为硬障碍（本批水域语义 = 旧边界墙——玩家与
+    // 怪物都进不去；「玩家入水」归批六乙）
     for (int cellY = minCellY; cellY <= maxCellY; ++cellY)
     {
         for (int cellX = minCellX; cellX <= maxCellX; ++cellX)
         {
-            if (wallAt(cellX, cellY))
+            if (wallAt(cellX, cellY) || waterAt(cellX, cellY))
             {
-                return false; // 命中墙体：矩形不可走
+                return false; // 命中墙体或水域：矩形不可走
             }
         }
     }
-    return true; // 覆盖范围全部无墙：可走
+    return true; // 覆盖范围全部无墙且非水域：可走
 }
 
 // 单点可走查询（出生/掉落落点的快速校验）
 bool World::isPointWalkable(float x, float y) const
 {
-    // 点所在格无墙即可走（点正好在格线上归入右侧/下侧格——floor 语义）
-    return !wallAt(cellFloored(x), cellFloored(y));
+    // 点所在格无墙且非水域即可走（点正好在格线上归入右侧/下侧格——
+    // floor 语义）；批六甲：水域同墙处理
+    const int cellX = cellFloored(x); // 点所在格 x
+    const int cellY = cellFloored(y); // 点所在格 y
+    return !wallAt(cellX, cellY) && !waterAt(cellX, cellY);
 }
 
 // 分轴位移 + 撞墙滑动（无额外实心体的便捷包装；行为与拆分前完全一致）
@@ -517,10 +567,11 @@ bool World::loadAssets(SDL_Renderer* renderer)
     }
     const std::string base(basePath); // 拷贝基路径（后续不再依赖 SDL 内部缓存）
 
-    // 逐张加载三份世界素材（失败非致命：对应层在烘焙时退化为色块）
+    // 逐张加载四份世界素材（失败非致命：对应层在烘焙时退化为色块）
     m_floorTiles = IMG_LoadTexture(renderer, (base + "assets/tiles_floor.png").c_str()); // 地板变体表
     m_wallTile = IMG_LoadTexture(renderer, (base + "assets/tiles_wall.png").c_str());   // 墙块单帧
     m_decorSheet = IMG_LoadTexture(renderer, (base + "assets/decor_sheet.png").c_str()); // 装饰表
+    m_waterTiles = IMG_LoadTexture(renderer, (base + "assets/tiles_water.png").c_str()); // 水砖变体表（批六甲）
 
     // 像素风必需：与实体素材同一采样口径——最近邻，放大保持像素锐利
     if (m_floorTiles != nullptr)
@@ -553,15 +604,26 @@ bool World::loadAssets(SDL_Renderer* renderer)
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "加载世界装饰 decor_sheet.png 失败（%s），装饰将跳过", SDL_GetError());
     }
+    if (m_waterTiles != nullptr)
+    {
+        SDL_SetTextureScaleMode(m_waterTiles, SDL_SCALEMODE_NEAREST); // 水砖：最近邻
+    }
+    else
+    {
+        // 水砖缺失：烘焙时水格画深蓝色块（边界仍然可辨、语义不变）
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "加载海洋水砖 tiles_water.png 失败（%s），水域将退化为纯色", SDL_GetError());
+    }
 
-    // 返回「三张全部就绪」与否（调用方可用于日志；游戏照常可玩）
-    return m_floorTiles != nullptr && m_wallTile != nullptr && m_decorSheet != nullptr;
+    // 返回「四张全部就绪」与否（调用方可用于日志；游戏照常可玩）
+    return m_floorTiles != nullptr && m_wallTile != nullptr &&
+           m_decorSheet != nullptr && m_waterTiles != nullptr;
 }
 
 // 释放素材纹理（loadAssets 重加载前与 release 内部调用；幂等）
 void World::releaseAssets()
 {
-    // 逐张判空销毁：三张素材彼此独立
+    // 逐张判空销毁：四张素材彼此独立
     if (m_floorTiles != nullptr)
     {
         SDL_DestroyTexture(m_floorTiles); // 释放地板变体表
@@ -576,6 +638,11 @@ void World::releaseAssets()
     {
         SDL_DestroyTexture(m_decorSheet); // 释放装饰表
         m_decorSheet = nullptr;           // 置空：幂等
+    }
+    if (m_waterTiles != nullptr)
+    {
+        SDL_DestroyTexture(m_waterTiles); // 释放水砖变体表（批六甲）
+        m_waterTiles = nullptr;           // 置空：幂等
     }
 }
 
@@ -645,7 +712,8 @@ void World::updateActiveChunks(SDL_Renderer* renderer, const Camera& camera)
     }
 }
 
-// 烘焙单个区块：地板 -> 装饰 -> 墙，逐格绘制一次（之后每帧只画 1 张纹理）
+// 烘焙单个区块：地板/水砖 + 岸边浪花 -> 装饰 -> 墙，逐格绘制一次
+//（之后每帧只画 1 张纹理）
 SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) const
 {
     // renderer 缺失：无从烘焙（调用方已防御，这里再保一道）
@@ -682,7 +750,9 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
     const int baseCellX = chunkX * kChunkCells; // 本区块左上角格 x
     const int baseCellY = chunkY * kChunkCells; // 本区块左上角格 y
 
-    // ---- 第 1 层：地板（铺满 32x32 格）----
+    // ---- 第 1 层：地板 / 水砖（铺满 32x32 格；批六甲起水域与地板同层）----
+    // 水域格：铺水砖（3 变体按格哈希挑选，波纹相位不同不死板）；地板格：
+    // 铺地板变体。两者都在本层，之后的装饰/墙层对水格天然无内容
     if (m_floorTiles == nullptr)
     {
         // 素材缺失兜底：深灰蓝色块（一次性设色，循环内只填充）
@@ -692,13 +762,67 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
     {
         for (int cellLX = 0; cellLX < kChunkCells; ++cellLX)
         {
+            // 本格的全局格坐标（水/陆判定与变体挑选共用）
+            const int cellX = baseCellX + cellLX; // 全局格 x
+            const int cellY = baseCellY + cellLY; // 全局格 y
+            const bool isWater = waterAt(cellX, cellY); // 本格是否水域
+
             // 本格在区块纹理内的目标矩形（局部格坐标 x 48px）
             const SDL_FRect dst{ cellLX * kCellSize, cellLY * kCellSize, kCellSize, kCellSize };
+
+            if (isWater)
+            {
+                // ---- 水域格：水砖（变体 = 格哈希 % 3；失败退化为深蓝色块）----
+                if (m_waterTiles != nullptr)
+                {
+                    // 变体帧的源矩形：第 variant 帧的横向起点 = variant x 48px
+                    const uint64_t hash = hashCell(m_seed, cellX, cellY, kSaltWater); // 本格哈希
+                    const int variant = static_cast<int>(hash % kWaterVariants);      // 变体 0..2
+                    const SDL_FRect src{ variant * kCellSize, 0.0f, kCellSize, kCellSize }; // 源帧矩形
+                    SDL_RenderTexture(renderer, m_waterTiles, &src, &dst); // 裁帧绘制（1:1 无缩放）
+                }
+                else
+                {
+                    // 水砖缺失兜底：深蓝水色块
+                    SDL_SetRenderDrawColor(renderer, 24, 46, 88, 255); // 水兜底色（深蓝）
+                    SDL_RenderFillRect(renderer, &dst);
+                }
+
+                // ---- 岸边浪花过渡线：四邻中「陆地格」方向的贴边浪花条 ----
+                // 判定 = 同在世界内且非水域（水域贴水域、世界外都不画）；
+                // 白青色 6px 条贴水格内侧边——海陆边界一眼可辨（程序化叠加）
+                SDL_SetRenderDrawColor(renderer, 190, 228, 246, 255); // 浪花色（亮青白）
+                // 上邻是陆地：贴水格上缘画横条
+                if (cellY - 1 >= 0 && !waterAt(cellX, cellY - 1))
+                {
+                    const SDL_FRect foam{ dst.x, dst.y, dst.w, kFoamThickness }; // 上缘条
+                    SDL_RenderFillRect(renderer, &foam);
+                }
+                // 下邻是陆地：贴水格下缘画横条
+                if (cellY + 1 < cellsY() && !waterAt(cellX, cellY + 1))
+                {
+                    const SDL_FRect foam{ dst.x, dst.y + dst.h - kFoamThickness, dst.w, kFoamThickness }; // 下缘条
+                    SDL_RenderFillRect(renderer, &foam);
+                }
+                // 左邻是陆地：贴水格左缘画竖条
+                if (cellX - 1 >= 0 && !waterAt(cellX - 1, cellY))
+                {
+                    const SDL_FRect foam{ dst.x, dst.y, kFoamThickness, dst.h }; // 左缘条
+                    SDL_RenderFillRect(renderer, &foam);
+                }
+                // 右邻是陆地：贴水格右缘画竖条
+                if (cellX + 1 < cellsX() && !waterAt(cellX + 1, cellY))
+                {
+                    const SDL_FRect foam{ dst.x + dst.w - kFoamThickness, dst.y, kFoamThickness, dst.h }; // 右缘条
+                    SDL_RenderFillRect(renderer, &foam);
+                }
+                continue; // 水域格：本层结束（无地板/装饰/墙）
+            }
 
             if (m_floorTiles != nullptr)
             {
                 // 变体帧的源矩形：第 variant 帧的横向起点 = variant x 48px
-                const int variant = floorVariantAt(baseCellX + cellLX, baseCellY + cellLY); // 本格变体
+                const int variant = floorVariantAt(cellX, cellY); // 本格变体
                 const SDL_FRect src{ variant * kCellSize, 0.0f, kCellSize, kCellSize };     // 源帧矩形
                 SDL_RenderTexture(renderer, m_floorTiles, &src, &dst); // 裁帧绘制（1:1 无缩放）
             }

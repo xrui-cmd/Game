@@ -22,6 +22,8 @@
 #                                  （批二世界系统逐格挑变体铺地板）
 #         tiles_wall.png           世界墙块单帧：wall_mid 3 倍 -> 48x48
 #         decor_sheet.png          世界装饰表：skull（48x48）+ crate（48x72）
+#         tiles_water.png          海洋水砖变体表：3 帧，每帧 48x48（批六甲·
+#                                  海洋边界——深蓝基色 + 波纹层次，程序化绘制）
 #
 # 设计原则：
 #   1. 幂等：可以重复运行，每次覆盖旧文件，输出结果一致（背景变体砖用固定
@@ -903,7 +905,72 @@ Save-Png -bitmap $iconShieldBmp -path (Join-Path $assetsDir "icon_shield.png")
 $iconShieldBmp.Dispose()
 
 # ============================================================
-# 9) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
+# 9) 海洋水砖（批六甲·海洋边界）
+# ============================================================
+# 说明（报告口径）：DungeonTileset II 素材包内没有「水面」帧——水砖由
+# 脚本程序化绘制（System.Drawing 正弦折线 + 矩形填充），输出仍是与其余
+# 素材一致的成品 PNG；脚本整体依旧「幂等」：重复运行覆盖同内容文件，
+# 结果一致。世界最外 2 圈格在烘焙时按坐标哈希挑 3 个变体之一铺放
+#（见 World::bakeChunk），配套「岸边浪花过渡线」在烘焙期按邻格判定
+# 程序化叠加（不占素材）。
+#   tiles_water.png  3 变体 x 48px = 144x48：深蓝基色 + 三道正弦波纹
+#                    （相位随变体偏移）+ 底部深水条 + 两处高光短划
+
+# ---- 9.1 tiles_water.png（3 变体，每变体 48x48）----
+$waterBmp = New-Canvas -width 144 -height 48
+# 获取水砖画布的 Graphics 绘图对象
+$waterG = [System.Drawing.Graphics]::FromImage($waterBmp)
+try {
+    # 基色（深蓝）/ 深水条（更暗，读作水域下沿层次）/ 波纹笔 / 高光笔
+    $waterBase = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 24, 46, 88))   # 深蓝基色
+    $waterDeep = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 18, 36, 72))   # 底部深水条
+    $wavePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 58, 108, 168), 2)       # 波纹（中蓝 2px）
+    $sparkPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 120, 180, 225), 2)     # 高光（亮蓝 2px）
+    try {
+        # 逐变体绘制：v = 0..2，横向起点 = v x 48（与引擎裁帧约定一致）
+        for ($v = 0; $v -lt 3; $v++) {
+            $ox = $v * 48 # 本变体在表中的横向起点（像素）
+            # 基色铺满本格（不透明——水域是实体地表，不需要透明背景）
+            $waterG.FillRectangle($waterBase, $ox, 0, 48, 48)
+            # 底部深水条：8px 高的更暗色带（水深的观感层次）
+            $waterG.FillRectangle($waterDeep, $ox, 40, 48, 8)
+            # 三道正弦波纹：横向每 4px 取一点（12 段折线），相位随变体错开
+            for ($row = 0; $row -lt 3; $row++) {
+                $baseY = 10 + $row * 12 # 本道波纹的中线高度（10 / 22 / 34）
+                $phase = ($v * 16) + ($row * 5) # 相位偏移：变体间波纹形态不同
+                $pts = New-Object 'System.Drawing.Point[]' 13 # 13 个点（x = 0..48 步进 4）
+                for ($i = 0; $i -lt 13; $i++) {
+                    $x = $i * 4 # 本点相对本变体左缘的 x
+                    # 正弦纵摆（振幅 1.5px，四舍五入到整像素——像素风不失真）
+                    $yp = [int]($baseY + [Math]::Round(1.5 * [Math]::Sin(($x + $phase) / 7.0)))
+                    $xp = $ox + $x # 本点全局 x（PS 5.1 的 New-Object 参数不能内联运算——先算好）
+                    $pts[$i] = New-Object System.Drawing.Point($xp, $yp) # 记录本点
+                }
+                $waterG.DrawLines($wavePen, $pts) # 画本道波纹
+            }
+            # 两处高光短划（亮蓝 8px 横线；位置随变体轻微偏移——阳光碎点）
+            $sx1 = $ox + 6 + (($v * 7) % 20) # 第一处起点 x（变体偏移）
+            $waterG.DrawLine($sparkPen, $sx1, 6, ($sx1 + 8), 6) # 上带高光
+            $sx2 = $ox + 30 - (($v * 5) % 16) # 第二处起点 x（变体偏移）
+            $waterG.DrawLine($sparkPen, $sx2, 34, ($sx2 + 8), 34) # 下带高光
+        }
+    } finally {
+        # 画刷/画笔用完释放（关闭 GDI 句柄）
+        $waterBase.Dispose()
+        $waterDeep.Dispose()
+        $wavePen.Dispose()
+        $sparkPen.Dispose()
+    }
+} finally {
+    # 释放水砖画布 Graphics
+    $waterG.Dispose()
+}
+# 保存水砖图（幂等覆盖）并释放画布
+Save-Png -bitmap $waterBmp -path (Join-Path $assetsDir "tiles_water.png")
+$waterBmp.Dispose()
+
+# ============================================================
+# 10) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
 # ============================================================
 # 与代码常量的对应关系（任一处改动必须两边同步）：
 #   player_sheet: 5 帧 x 48 宽 = 240，高 84（Player 的 m_w=48 / m_h=84）
@@ -941,6 +1008,9 @@ Assert-PngSize -path (Join-Path $assetsDir "background.png") -expectedWidth 1280
 Assert-PngSize -path (Join-Path $assetsDir "tiles_floor.png") -expectedWidth 384 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "tiles_wall.png") -expectedWidth 48 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "decor_sheet.png") -expectedWidth 96 -expectedHeight 72
+
+#   海洋水砖（批六甲）：3 变体 x 48 = 144 宽、48 高
+Assert-PngSize -path (Join-Path $assetsDir "tiles_water.png") -expectedWidth 144 -expectedHeight 48
 
 #   攻击反馈素材（批五A）：警示「!」24x36；爪痕爆点 48x48
 Assert-PngSize -path (Join-Path $assetsDir "alert.png") -expectedWidth 24 -expectedHeight 36

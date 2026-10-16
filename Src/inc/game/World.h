@@ -27,19 +27,21 @@ class Camera;
 //   2. 确定性生成：地板变体 / 墙体布局 / 装饰全部由「格坐标 + 世界种子」
 //      哈希产生——同样的种子逐格一致（同一局内卸载再载入内容不变），
 //      不同种子得到不同布局（0 种子 = 每局随机，由调用方换一个非 0 种子）；
-//   3. 墙体规则（批六甲·区块放大后按面积调整）：
-//      - 世界最外圈格恒为墙（世界边界由墙自然形成，实体活动范围 = 墙内；
-//        批六甲后续一笔将改为海洋水域——本笔先落区块放大与分区）；
+//   3. 墙体规则（批六甲·区块放大后按面积调整；海洋边界为批六甲第二笔）：
+//      - 世界最外 2 圈格恒为海洋水域（取代原一圈边界墙：外观与几何先落，
+//        通行语义等同旧墙——玩家与怪物都不可进入；「玩家可入水 + 落水
+//        动画 + 死亡复活」归批六乙）；
 //      - 每区块确定性随机生成 6~10 个「短墙段 / 直角块 / 2x2 块」结构
 //        （线段 3~7 格；32 格区块的密度观感与旧 16 格区块 3~5 个相当），
 //        密度适中不堵死；
 //      - 区块边缘一圈格不放随机墙（相邻区块交界因此永远可通行）；
 //      - 玩家出生点（草地区中心）周围 ±3 格为保护区（出生点绝不卡墙）；
+//      - 水域格不放随机墙与装饰（海洋只属于边界语义）；
 //   4. 激活窗口：以相机视图中心所在区块为基准 ±1（最多 3x3）。激活时把
 //      「地板 + 装饰 + 墙」烘焙成一张 1536x1536 区块纹理（构建一次）；
 //      滑出窗口的区块释放纹理。实体（怪物）是否更新/渲染由场景按
 //      isPointInActiveChunks 门控——非激活区暂停但不删除；
-//   5. 格级碰撞：isRectWalkable 查「矩形覆盖的全部格是否无墙」；
+//   5. 格级碰撞：isRectWalkable 查「矩形覆盖的全部格是否无墙且非水域」；
 //      slideMove 提供「分轴位移 + 撞墙滑动」的纯函数——玩家与怪物共用。
 //
 // 坐标约定（与 Camera 一致）：
@@ -47,12 +49,14 @@ class Camera;
 //   - 区块索引 = floor(像素 / kChunkPixels)；区块与格皆可为负（表示世界外）——
 //     wallAt 对世界外统一按「墙」处理（实体永远出不去）。
 //
-// 素材（由 tools/compose_sprites.ps1 从 0x72 素材包组装）：
+// 素材（由 tools/compose_sprites.ps1 组装；雪山区冰霜重染色版见批六甲
+// 第三笔，水砖为程序化绘制）：
 //   assets/tiles_floor.png  地板变体表（8 帧 x 48px，横向排列）
 //   assets/tiles_wall.png   墙块单帧（48x48）
 //   assets/decor_sheet.png  装饰表（skull 48x48 @x=0；crate 48x72 @x=48）
-//   任何素材缺失都不崩溃：烘焙退化为纯色色块（地板深灰、墙更深）——
-//   延续「资源问题不让游戏崩溃」的全局降级契约。
+//   assets/tiles_water.png  海洋水砖变体表（3 帧 x 48px，横向排列）
+//   任何素材缺失都不崩溃：烘焙退化为纯色色块（地板深灰、墙更深、水砖
+//   深蓝）——延续「资源问题不让游戏崩溃」的全局降级契约。
 // ============================================================
 
 class World
@@ -64,9 +68,13 @@ public:
     // 每区块边长（像素）：1536 = 32 格 x 48px。区块纹理尺寸、区块索引换算都用它
     static constexpr float kChunkPixels = kChunkCells * kCellSize;
 
-    // 出生保护区半径（格）：以世界中心格为中心、±kSpawnSafeRadius 的方形区域
+    // 出生保护区半径（格）：以出生中心格为中心、±kSpawnSafeRadius 的方形区域
     // 内不放随机墙与装饰——玩家出生点与近旁永远开阔（半径 3 -> 7x7 格）
     static constexpr int kSpawnSafeRadius = 3;
+
+    // 海洋边界厚度（格）：世界最外 kWaterRingCells 圈格恒为水域（批六甲·
+    // 海洋边界——取代原 1 圈边界墙；通行语义同旧墙：实体不可进入）
+    static constexpr int kWaterRingCells = 2;
 
     World() = default;
 
@@ -96,6 +104,11 @@ public:
     //     不会把实体卡死（调用方本就应在布置实体前完成生成）
     bool wallAt(int cellX, int cellY) const;
 
+    // 指定格是否海洋水域（批六甲·海洋边界：最外 kWaterRingCells 圈格）。
+    // 越界/未生成恒 false（水域只在世界内部；世界外由 wallAt 兜底）。
+    // 注意：水域对碰撞的语义见 isRectWalkable——墙与水域都不可走
+    bool waterAt(int cellX, int cellY) const;
+
     // 指定格的地板变体索引（0..7，对应 tiles_floor.png 的 8 帧）。
     // 越界返回 0（防御；渲染前会先做墙判断，不会真用到越界值）
     int floorVariantAt(int cellX, int cellY) const;
@@ -105,7 +118,7 @@ public:
 
     // ---- 碰撞查询（格级；玩家与怪物共用）----
 
-    // 矩形（世界坐标）是否可走：其覆盖的全部格都不是墙。
+    // 矩形（世界坐标）是否可走：其覆盖的全部格都不是墙、也不是水域。
     // 边界贴合不算碰撞（右/下边缘减 0.01px 的亚像素容差——与引擎
     // rectsOverlap 的「刚好贴合不算碰撞」同一约定）。世界外视为墙
     bool isRectWalkable(const SDL_FRect& rect) const;
@@ -197,7 +210,7 @@ private:
     // 「同一局内卸载再载入一致」由确定性直接保证）
     void generateChunkStructures();
 
-    // 尝试把格 (cellX, cellY) 设为随机墙：跳过世界边界/区块边缘一圈/
+    // 尝试把格 (cellX, cellY) 设为随机墙：跳过世界水圈/区块边缘一圈/
     // 出生保护区（这些区域的通行性是硬保证），其余情形置墙（已墙则无操作）
     void setRandomWall(int cellX, int cellY);
 
@@ -212,7 +225,8 @@ private:
     // generate（保护区中心）与 spawnPointFor 共用本函数——两处永远同源
     SDL_FPoint spawnCenter() const;
 
-    // 烘焙单个区块为 1536x1536 纹理（地板 -> 装饰 -> 墙，逐格绘制一次）。
+    // 烘焙单个区块为 1536x1536 纹理（地板/水砖 -> 装饰 -> 墙，逐格绘制一次；
+    // 水域带「邻岸浪花」过渡线——按邻格判定程序化叠加，不占素材）。
     // 失败返回 nullptr（调用方下帧重试）；素材缺失时对应层退化为纯色色块
     SDL_Texture* bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) const;
 
@@ -238,6 +252,11 @@ private:
     // 墙体位图：非 0 = 墙。碰撞查询的唯一数据源（装饰不参与碰撞）
     std::vector<uint8_t> m_walls;
 
+    // 水域位图：非 0 = 海洋格（批六甲·海洋边界——最外 kWaterRingCells 圈）。
+    // 与墙同为「不可走」硬障碍（isRectWalkable 同时查两者）；
+    // 烘焙时铺水砖（变体按格哈希）并叠邻岸浪花
+    std::vector<uint8_t> m_water;
+
     // 地板变体索引（0..7）：烘焙时从变体表裁对应帧——逐格确定性挑选，
     // 避免大面积平铺同一块砖的死板重复
     std::vector<uint8_t> m_floor;
@@ -260,6 +279,7 @@ private:
     SDL_Texture* m_floorTiles = nullptr; // 地板变体表（8 帧 x 48px 横向排列）
     SDL_Texture* m_wallTile = nullptr;   // 墙块单帧（48x48）
     SDL_Texture* m_decorSheet = nullptr; // 装饰表（skull 48x48 @0；crate 48x72 @48）
+    SDL_Texture* m_waterTiles = nullptr; // 水砖变体表（3 帧 x 48px 横向排列；批六甲）
 };
 
 #endif // !__WORLD_H__

@@ -195,16 +195,21 @@ int main()
     p0 = gPass; f0 = gFail;
     {
         World world;
-        world.generate(1, 1, 54321u); // 固定种子：墙布局确定
+        world.generate(1, 1, 54321u); // 固定种子：墙/水布局确定
 
-        // 找一面「左墙右空」的格（多行扫描：保护区内行 5~11 中挑第一个满足的）
-        int wallX = -999; // 墙格 x（配对格 wallX+1 无墙）
-        int wallY = -999; // 墙格 y（同一行）
-        for (int y = 5; y <= 11 && wallX < 0; ++y) // 逐行扫描
+        // 找一面「左阻挡（墙或海洋水格）右空」的格（多行扫描：挑第一个满足的）。
+        // 批六甲：世界最外 2 圈为海洋（同为不可走的硬阻挡）——左侧阻挡者
+        // 可能是墙，也可能是水；两者对碰撞滑动的语义一致（不可进入）
+        int wallX = -999; // 阻挡格 x（配对格 wallX+1 可走）
+        int wallY = -999; // 阻挡格 y（同一行）
+        for (int y = World::kWaterRingCells; y < world.cellsY() - World::kWaterRingCells && wallX < 0; ++y) // 逐行扫描（水圈内侧）
         {
-            for (int x = 4; x >= 0; --x) // 逐格向左扫描（世界左边界 x=0 必为墙）
+            for (int x = 4; x >= 0; --x) // 逐格向左扫描（世界左界 x=0/1 必为水）
             {
-                if (world.wallAt(x, y) && !world.wallAt(x + 1, y)) // 左墙右空
+                // 本格是硬阻挡（墙或水），且右侧相邻格可走？
+                const bool blockedHere = world.wallAt(x, y) || world.waterAt(x, y); // 本格阻挡
+                const bool blockedRight = world.wallAt(x + 1, y) || world.waterAt(x + 1, y); // 右邻阻挡
+                if (blockedHere && !blockedRight) // 左阻挡右空
                 {
                     wallX = x; // 命中：记录并结束
                     wallY = y;
@@ -212,7 +217,7 @@ int main()
                 }
             }
         }
-        expectTrue("环境构置：找到一面「左墙右空」的墙（可复现扫描）", wallX >= 0);
+        expectTrue("环境构置：找到一面「左阻挡（墙/水）右空」的格（可复现扫描）", wallX >= 0);
         if (wallX >= 0)
         {
             Player player;
