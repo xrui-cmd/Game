@@ -17,6 +17,7 @@
 #include "game/LevelupSfx.h"    // LevelupSfx：升级音效（游戏层直读；引擎加 SoundId::LevelUp 前的过渡）
 #include "game/UpgradeCard.h"   // UpgradeCard：九项强化表（批五B 起由商店购买；抽取/叠加数学/欠账队列）
 #include "game/Shop.h"          // Shop：商店价格公式与可购判定（纯逻辑，tests/shop_test.cpp 直测）
+#include "game/ShopDesc.h"      // ShopDesc：商店效果描述（静态效果 + 动态数值对比文案；批六甲）
 #include "game/ShopLayout.h"    // ShopLayout：商店九宫格布局（渲染与鼠标命中共享，防坐标漂移）
 #include "game/Spell.h"         // Spell：法术池（六法术表/逐层参数/三抽抽取；纯逻辑，tests/spell_test.cpp 直测）
 #include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
@@ -584,7 +585,8 @@ private:
 
     static constexpr float kHudPtSize = 32.0f;  // HUD/提示文字字号（像素高，小数需求清晰）
     static constexpr float kBigPtSize = 64.0f;  // 暂停/结束标题字号（大号观感）
-    static constexpr float kCardPtSize = 24.0f; // 面板小字字号（升级卡描述/层数、商店层数与价格；M2/批五B）
+    static constexpr float kCardPtSize = 24.0f; // 面板小字字号（升级卡描述/层数；M2/批五B）
+    static constexpr float kSmallPtSize = 16.0f; // 商店效果描述小字（静态效果/数值对比/层数/价格；批六甲）
 
     // ---- 法术运行时常量（批五B；代码固定，改动须连同注释一起审视）----
 
@@ -655,8 +657,9 @@ private:
 
     // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
     Font m_hudFont;  // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
-    Font m_bigFont;  // 大号标题（暂停 / 游戏结束）
+    Font m_bigFont;  // 大号标题（暂停 / 游戏结束 / 区名横幅）
     Font m_cardFont; // 升级三选一面板的小字号文字（卡描述/层数标注；M2）
+    Font m_smallFont; // 商店效果描述小字号（静态/对比/层数/价格；批六甲·第四笔）
 
     Player m_player;                 // 玩家实体
     std::vector<Monster> m_monsters; // 怪物对象池（预创建 kMonsterPoolSize 个槽位）

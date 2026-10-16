@@ -18,8 +18,12 @@
 //
 // 布局规则（9 项 = 强化表顺序，行优先：0/1/2 第一行、3/4/5 第二行、
 // 6/7/8 第三行；数值为像素）：
-//   - 卡片 320x130、间距 24；
+//   - 卡片 320x150、间距 22；
 //   - 整组水平居中、上边界 = 屏高 x 16%（标题之下）。
+//
+// 批六甲版式调整：卡片高度 130 -> 150、间距 24 -> 22——为「效果描述」
+// 两行（静态效果 + 动态数值对比）腾出空间；3 行 x 150 + 2 x 22 = 494，
+// 配合 16% 上边界在 720 高窗口内仍完整落在提示行之上（截图验证）。
 //
 // 越界/非法输入防御：index 不在 [0, kShopItemCount) 时返回空矩形
 //（w = h = 0，绘制与点测均可据 w > 0 判有效性），绝不返回未定义数据。
@@ -30,8 +34,8 @@ inline constexpr int kShopColumns = 3;     // 网格列数（行数 = 项数 / �
 
 // 面板几何常量（绘制与命中共用的唯一数值来源；改动只改这一处）
 inline constexpr float kShopCardW = 320.0f;    // 卡片宽（像素）
-inline constexpr float kShopCardH = 130.0f;    // 卡片高（像素）
-inline constexpr float kShopCardGap = 24.0f;   // 卡片间距（像素）
+inline constexpr float kShopCardH = 150.0f;    // 卡片高（像素；批六甲 130 -> 150）
+inline constexpr float kShopCardGap = 22.0f;   // 卡片间距（像素；批六甲 24 -> 22）
 inline constexpr float kShopPanelTopRatio = 0.16f; // 面板上边界位置（屏高比例）
 
 // 计算第 index 项的屏幕矩形（渲染与命中判定共用的同一份计算）。

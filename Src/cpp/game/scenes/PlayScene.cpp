@@ -231,10 +231,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     {
         // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
         const std::string fontPath = std::string(basePath) + "assets/fonts/SmileySans-Oblique.ttf";
-        // 三个字号彼此独立：一份加载失败不影响其余（面板文字安全跳过）
-        m_hudFont.load(fontPath, kHudPtSize);   // HUD/提示文字
-        m_bigFont.load(fontPath, kBigPtSize);   // 暂停/结束标题
-        m_cardFont.load(fontPath, kCardPtSize); // 升级三选一面板小字（描述/层数；M2）
+        // 四个字号彼此独立：一份加载失败不影响其余（面板文字安全跳过）
+        m_hudFont.load(fontPath, kHudPtSize);     // HUD/提示文字
+        m_bigFont.load(fontPath, kBigPtSize);     // 暂停/结束标题/区名横幅
+        m_cardFont.load(fontPath, kCardPtSize);   // 升级三选一面板小字（描述/层数；M2）
+        m_smallFont.load(fontPath, kSmallPtSize); // 商店效果描述小字（批六甲·第四笔）
     }
 
     // 7) 玩家纹理：三级回退（精灵表 -> 单帧图 -> 程序化纯色）在 Entity 内完成，
@@ -3444,11 +3445,13 @@ void PlayScene::renderHud()
     }
     else if (m_state == PlayState::Shop)
     {
-        // 商店面板（批五B）：标题（金币）+ 3x3 强化卡 + 提示消息 + 底部
-        // 操作提示。世界画面冻结在遮罩之下；卡片 = 色块底板 + 金色边框 +
-        // 名称/层数/价格（悬停高亮；金币不足灰显 + 价格红字；满层灰显
-        // 「已满级」）。卡片矩形来自 ShopLayout 的共享布局计算（渲染与
-        // 鼠标命中同一份——面板画在哪、就能在哪点，防坐标漂移）
+        // 商店面板（批五B；批六甲·第四笔加效果描述）：标题（金币）+ 3x3
+        // 强化卡 + 提示消息 + 底部操作提示。世界画面冻结在遮罩之下；
+        // 卡片 = 色块底板 + 金色边框 + 五行文本（名称/静态效果/动态数值
+        // 对比/层数/价格；悬停高亮；金币不足灰显 + 价格红字；满层灰显
+        // 「已满级」+ 对比行「已达上限」）。卡片矩形来自 ShopLayout 的
+        // 共享布局计算（渲染与鼠标命中同一份——面板画在哪、就能在哪点，
+        // 防坐标漂移）；数值对比经 ShopDesc 实算
         const float centerX = screenW / 2.0f; // 水平中心：标题对齐基准
 
         // 标题（金色，屏幕上缘 7.5% 处）：「商店（金币: N）」——金币余额
@@ -3457,6 +3460,18 @@ void PlayScene::renderHud()
         char shopTitle[64]; // 容纳「商店（金币: 99999）」，绰绰有余
         SDL_snprintf(shopTitle, sizeof(shopTitle), "商店（金币: %d）", m_coinCount);
         m_hudFont.drawCentered(m_renderer, shopTitle, centerX, screenH * 0.075f);
+
+        // 动态对比文案的「基准值」快照（批六甲·第四笔）：从本局配置基准
+        //（m_*Base）一次性构建——对比文案与生效路径同源（见 game/ShopDesc.h）
+        ShopPreviewBases previewBase;                          // 基准值快照
+        previewBase.attackDamage = m_attackDamageBase;         // 伤害基准
+        previewBase.attackCooldown = m_attackCooldownBase;     // 攻击冷却基准（秒）
+        previewBase.attackRange = m_attackRangeBase;           // 攻击范围基准
+        previewBase.attackArc = m_attackArcBase;               // 攻击张角基准
+        previewBase.playerSpeed = m_playerSpeedBase;           // 移速基准
+        previewBase.playerMaxHp = m_playerMaxHpBase;           // 生命上限基准
+        previewBase.attackKnockback = m_attackKnockbackBase;   // 击退基准
+        previewBase.coinMagnet = m_coinMagnetRadiusBase;       // 金币磁吸基准
 
         for (int i = 0; i < kShopItemCount; ++i) // 逐项绘制（0~8，行优先）
         {
@@ -3514,9 +3529,43 @@ void PlayScene::renderHud()
             {
                 SDL_SetRenderDrawColor(m_renderer, 130, 130, 130, 255); // 灰色：灰显
             }
-            m_hudFont.draw(m_renderer, def.name, cardRect.x + 18.0f, cardRect.y + 10.0f); // 名称
+            m_hudFont.draw(m_renderer, def.name, cardRect.x + 18.0f, cardRect.y + 8.0f); // 名称行
 
-            // 层数行（左对齐第二行，卡片字号）：「层数 x/上限」（无限卡写「无限」）
+            // 静态效果描述（第二行，小字号）：沿用卡表 desc（「伤害 +5」等）。
+            // 批六甲·第四笔版式：名称/描述/对比/层数/价格五行左对齐排布
+            if (affordable) // 可买：近白；不可买：暗灰
+            {
+                SDL_SetRenderDrawColor(m_renderer, 235, 235, 235, 255); // 近白
+            }
+            else
+            {
+                SDL_SetRenderDrawColor(m_renderer, 120, 120, 120, 255); // 暗灰
+            }
+            m_smallFont.draw(m_renderer, def.desc, cardRect.x + 18.0f, cardRect.y + 52.0f); // 静态效果行
+
+            // 动态数值对比（第三行，小字号）：「当前 X → 购买后 Y」——按当前
+            // 层数经 ShopDesc 实算（与生效路径同一叠加数学）；满层显示
+            //「已达上限」（价格行同时是「已满级」，两处信号一致）
+            char compareText[96]; // 容纳「当前 0.40s → 购买后 0.35s」，绰绰有余
+            if (full) // 满层：对比不再有意义
+            {
+                SDL_strlcpy(compareText, "已达上限", sizeof(compareText)); // 文案
+            }
+            else // 未满：实算对比文案（基准来自本局配置快照）
+            {
+                shopCompareDesc(id, level, previewBase, compareText, sizeof(compareText)); // 装配
+            }
+            if (affordable) // 可买：亮青（数值信息色）；不可买：暗灰
+            {
+                SDL_SetRenderDrawColor(m_renderer, 150, 215, 255, 255); // 亮青
+            }
+            else
+            {
+                SDL_SetRenderDrawColor(m_renderer, 110, 110, 110, 255); // 暗灰
+            }
+            m_smallFont.draw(m_renderer, compareText, cardRect.x + 18.0f, cardRect.y + 76.0f); // 数值对比行
+
+            // 层数行（第四行，小字号）：「层数 x/上限」（无限卡写「无限」）
             const int levelIndex = static_cast<int>(id); // 层数数组下标（与 id 一致）
             char levelText[64]; // 容纳「层数 99/无限」，绰绰有余
             if (def.maxLevel > 0) // 有限卡：上限写数字
@@ -3536,9 +3585,9 @@ void PlayScene::renderHud()
             {
                 SDL_SetRenderDrawColor(m_renderer, 120, 120, 120, 255); // 暗灰
             }
-            m_cardFont.draw(m_renderer, levelText, cardRect.x + 18.0f, cardRect.y + 56.0f); // 层数行
+            m_smallFont.draw(m_renderer, levelText, cardRect.x + 18.0f, cardRect.y + 100.0f); // 层数行
 
-            // 价格行（左对齐第三行，卡片字号）：满层「已满级」（灰）；
+            // 价格行（第五行，小字号）：满层「已满级」（灰）；
             // 金币不足「价格 N 金币」（红字——灰显之外的第二提示信号）；
             // 可买「价格 N 金币」（金色）
             char priceText[64]; // 容纳「价格 99999 金币」，绰绰有余
@@ -3557,7 +3606,7 @@ void PlayScene::renderHud()
                 SDL_snprintf(priceText, sizeof(priceText), "价格 %d 金币", price); // 价格文案
                 SDL_SetRenderDrawColor(m_renderer, 220, 90, 90, 255); // 红色：不可负担
             }
-            m_cardFont.draw(m_renderer, priceText, cardRect.x + 18.0f, cardRect.y + 90.0f); // 价格行
+            m_smallFont.draw(m_renderer, priceText, cardRect.x + 18.0f, cardRect.y + 124.0f); // 价格行
         }
 
         // 提示消息（上一操作的结果：已购买/金币不足/已达上限；常驻不淡出

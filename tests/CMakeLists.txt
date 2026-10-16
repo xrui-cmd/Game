@@ -561,10 +561,11 @@ set_target_properties(spell_test PROPERTIES
 )
 
 # ============================================================
-#  商店单元测试（shop_test，批五B）
+#  商店单元测试（shop_test，批五B；批六甲加效果描述）
 #
 #  被测对象：Src/inc/game/Shop.h（价格公式与可购判定）+
-#  Src/inc/game/ShopLayout.h（九宫格面板布局——渲染与鼠标命中同一份）。
+#  Src/inc/game/ShopLayout.h（九宫格面板布局——渲染与鼠标命中同一份）+
+#  Src/inc/game/ShopDesc.h（效果描述动态对比文案；批六甲）。
 #
 #  与 card_test 第 9 用例同模式：只依赖 SDL_rect.h 的类型与内联点测
 #  （SDL_PointInRectFloat），不链接 SDL3 运行时——任何环境都能确定性运行。

@@ -2,7 +2,8 @@
 //  shop_test.cpp — 商店（Shop）单元测试
 //
 //  被测对象 : Src/inc/game/Shop.h（价格公式与可购判定）+
-//             Src/inc/game/ShopLayout.h（九宫格面板布局，批五B）
+//             Src/inc/game/ShopLayout.h（九宫格面板布局，批五B；批六甲版式调整）+
+//             Src/inc/game/ShopDesc.h（效果描述动态对比，批六甲）
 //  覆盖场景 : ① 基础价表（9 项 / 强度定价 4~10 / 越界防御回退第一项）
 //             ② 价格公式（价格 = 基础价 x(层数 + 1)：逐层核对、无限卡高层、
 //                负层按 0、有限卡封顶——总表打印供报告参考）
@@ -11,20 +12,24 @@
 //             ④ 商店面板布局（3x3 网格：居中/行优先/命中/间隙与越界防御——
 //                渲染与鼠标命中同一份计算，防坐标漂移）
 //             ⑤ 边界契约（金币恰好等于价格、差 1 灰显的两条规格边界）
+//             ⑥ 效果描述动态对比（批六甲：按当前层数实算「当前 -> 购买后」、
+//                逐项文案格式、满层封顶、负层防御、自定义基准、越界 id）
 //
-//  依赖 : Shop.h 为纯逻辑头文件；ShopLayout.h 只依赖 SDL_rect.h 的类型与
-//  内联点测（不链接 SDL3 运行时）。任何机器上都能确定性运行
-//  （构建接线见 tests/CMakeLists.txt 的 shop_test 目标）
+//  依赖 : Shop.h / ShopDesc.h 为纯逻辑头文件；ShopLayout.h 只依赖
+//  SDL_rect.h 的类型与内联点测（不链接 SDL3 运行时）。任何机器上都能
+//  确定性运行（构建接线见 tests/CMakeLists.txt 的 shop_test 目标）
 //
 //  退出码 : main 返回"失败用例数"（全部通过 = 0）
 // ============================================================================
 
 #include "game/Shop.h"       // 被测类型/函数：shopBasePrice / shopPrice / shopCanBuy
-#include "game/ShopLayout.h" // 被测函数：shopPanelRectAt / shopPanelHitTest（批五B 布局）
+#include "game/ShopDesc.h"   // 被测函数：shopCompareDesc（批六甲·效果描述动态对比）
+#include "game/ShopLayout.h" // 被测函数：shopPanelRectAt / shopPanelHitTest（批五B 布局；批六甲版式调整）
 
-#include <cmath>   // std::fabs：浮点容差比较
-#include <cstdio>  // std::printf
-#include <cstdlib> // std::system（Windows 控制台切 UTF-8）
+#include <cmath>    // std::fabs：浮点容差比较
+#include <cstdio>   // std::printf / std::snprintf
+#include <cstdlib>  // std::system（Windows 控制台切 UTF-8）
+#include <cstring>  // std::strcmp：文案逐字核对（批六甲·ShopDesc）
 
 namespace
 {
@@ -50,6 +55,16 @@ void expectTrue(const char* label, bool value)
     if (ok) { ++gPass; } else { ++gFail; }
     // 输出一行结果：PASS/FAIL + 用例名
     std::printf("  [%s] %s\n", ok ? "PASS" : "FAIL", label);
+}
+
+// 断言：字符串相等（批六甲·ShopDesc 文案逐字核对）
+void expectStr(const char* label, const char* got, const char* expect)
+{
+    // 逐字节比较（文案为固定格式，无浮点误差）
+    const bool ok = (std::strcmp(got, expect) == 0);
+    if (ok) { ++gPass; } else { ++gFail; }
+    // 输出一行结果：PASS/FAIL + 用例名 + 期望与实际
+    std::printf("  [%s] %s | 期望=\"%s\" 实际=\"%s\"\n", ok ? "PASS" : "FAIL", label, expect, got);
 }
 
 // 断言：浮点近似相等（容差比较——布局计算的小数舍入不影响判定）
@@ -226,19 +241,19 @@ int main()
         expectInt("kShopItemCount = 9", kShopItemCount, 9);
         expectInt("kShopColumns = 3", kShopColumns, 3);
 
-        // 1280x720（默认窗口）：总宽 3x320 + 2x24 = 1008，居中后
-        // 首卡左边界 = 640 - 504 = 136；上边界 = 720 x 0.16 = 115.2
+        // 1280x720（默认窗口）：总宽 3x320 + 2x22 = 1004，居中后
+        // 首卡左边界 = 640 - 502 = 138；上边界 = 720 x 0.16 = 115.2
         const SDL_FRect r0 = shopPanelRectAt(0, 1280.0f, 720.0f); // 第 1 行第 1 列
         const SDL_FRect r1 = shopPanelRectAt(1, 1280.0f, 720.0f); // 第 1 行第 2 列
         const SDL_FRect r4 = shopPanelRectAt(4, 1280.0f, 720.0f); // 第 2 行第 2 列（中心）
         const SDL_FRect r8 = shopPanelRectAt(8, 1280.0f, 720.0f); // 第 3 行第 3 列
-        expectNear("项 0 左边界（居中起点）", r0.x, 136.0f, 0.001f);
-        expectNear("项 1 左边界（含列距 344）", r1.x, 480.0f, 0.001f);
+        expectNear("项 0 左边界（居中起点）", r0.x, 138.0f, 0.001f);
+        expectNear("项 1 左边界（含列距 342）", r1.x, 480.0f, 0.001f);
         expectNear("项 0 上边界（屏高 16%）", r0.y, 115.2f, 0.001f);
-        expectNear("项 4 上边界（第 2 行 = +154）", r4.y, 269.2f, 0.001f);
-        expectNear("项 8 上边界（第 3 行 = +308）", r8.y, 423.2f, 0.001f);
+        expectNear("项 4 上边界（第 2 行 = +172）", r4.y, 287.2f, 0.001f);
+        expectNear("项 8 上边界（第 3 行 = +344）", r8.y, 459.2f, 0.001f);
         expectNear("卡宽 = 320", r0.w, 320.0f, 0.001f);
-        expectNear("卡高 = 130", r0.h, 130.0f, 0.001f);
+        expectNear("卡高 = 150（批六甲 130 -> 150）", r0.h, 150.0f, 0.001f);
 
         // 居中对称性：末列右缘 = 屏宽 - 首列左边界
         expectNear("末列右缘与首列左边界对称", 1280.0f - (r8.x + r8.w), r0.x, 0.001f);
@@ -250,24 +265,93 @@ int main()
         expectTrue("越界防御：越上界返回空矩形", invalidOver.w == 0.0f && invalidOver.h == 0.0f);
 
         // 命中测试：与渲染同一份布局——各项中心必然命中对应下标
-        expectInt("命中：项 0 中心 -> 0", shopPanelHitTest(296.0f, 180.2f, 1280.0f, 720.0f), 0);
-        expectInt("命中：项 4 中心 -> 4", shopPanelHitTest(640.0f, 334.2f, 1280.0f, 720.0f), 4);
-        expectInt("命中：项 8 中心 -> 8", shopPanelHitTest(984.0f, 488.2f, 1280.0f, 720.0f), 8);
+        expectInt("命中：项 0 中心 -> 0", shopPanelHitTest(298.0f, 190.2f, 1280.0f, 720.0f), 0);
+        expectInt("命中：项 4 中心 -> 4", shopPanelHitTest(640.0f, 362.2f, 1280.0f, 720.0f), 4);
+        expectInt("命中：项 8 中心 -> 8", shopPanelHitTest(982.0f, 534.2f, 1280.0f, 720.0f), 8);
 
         // 贴边内侧 0.5px 命中（左上角附近）；右缘外 1px 属间隙不算
-        expectInt("命中：项 0 左上角内侧 0.5px", shopPanelHitTest(136.5f, 115.7f, 1280.0f, 720.0f), 0);
+        expectInt("命中：项 0 左上角内侧 0.5px", shopPanelHitTest(138.5f, 115.7f, 1280.0f, 720.0f), 0);
         expectInt("命中：项 0 右缘外 1px（间隙）-> -1",
-                  shopPanelHitTest(457.0f, 180.2f, 1280.0f, 720.0f), -1);
-        // 列间隙中点（卡 0 右缘 456 与卡 1 左缘 480 之间 -> 468）
-        expectInt("命中：列间隙中点 -> -1", shopPanelHitTest(468.0f, 180.2f, 1280.0f, 720.0f), -1);
-        // 行间隙中点（第 1 行下缘 245.2 与第 2 行上缘 269.2 之间 -> 257.2）
-        expectInt("命中：行间隙中点 -> -1", shopPanelHitTest(296.0f, 257.2f, 1280.0f, 720.0f), -1);
+                  shopPanelHitTest(459.0f, 190.2f, 1280.0f, 720.0f), -1);
+        // 列间隙中点（卡 0 右缘 458 与卡 1 左缘 480 之间 -> 469）
+        expectInt("命中：列间隙中点 -> -1", shopPanelHitTest(469.0f, 190.2f, 1280.0f, 720.0f), -1);
+        // 行间隙中点（第 1 行下缘 265.2 与第 2 行上缘 287.2 之间 -> 276.2）
+        expectInt("命中：行间隙中点 -> -1", shopPanelHitTest(298.0f, 276.2f, 1280.0f, 720.0f), -1);
         // 面板外：屏左上（标题区之上）与右侧空白
         expectInt("命中：面板外（屏左上）-> -1", shopPanelHitTest(10.0f, 10.0f, 1280.0f, 720.0f), -1);
         expectInt("命中：面板外（右侧空白）-> -1",
                   shopPanelHitTest(1240.0f, 360.0f, 1280.0f, 720.0f), -1);
     }
     endCase(4, p0, f0);
+
+    // ------------------------------------------------------------------
+    // CASE 5 效果描述动态对比（批六甲·ShopDesc：按当前层数实算 + 文案格式）
+    // ------------------------------------------------------------------
+    beginCase(5, "效果描述（静态效果 + 动态数值对比：当前 -> 购买后）");
+    p0 = gPass; f0 = gFail;
+    {
+        const ShopPreviewBases b{}; // 默认基准（与内置默认值一致：25/0.4/96/120/300/100/30/140）
+        char buf[96];               // 文案缓冲（最长一项也远小于 96 字节）
+
+        // 利刃（伤害点）：0 层与 3 层的对比
+        shopCompareDesc(CardId::Blade, 0, b, buf, sizeof(buf));
+        expectStr("利刃 lv0：当前 25 -> 购买后 30", buf, "当前 25 → 购买后 30");
+        shopCompareDesc(CardId::Blade, 3, b, buf, sizeof(buf));
+        expectStr("利刃 lv3：当前 40 -> 购买后 45", buf, "当前 40 → 购买后 45");
+
+        // 疾风（冷却秒，两位小数）：0 层 0.40 -> 0.35
+        shopCompareDesc(CardId::Swift, 0, b, buf, sizeof(buf));
+        expectStr("疾风 lv0：0.40s -> 0.35s", buf, "当前 0.40s → 购买后 0.35s");
+        // 4 层 -> 5 层的对比（未满：0.24 -> 0.21）
+        shopCompareDesc(CardId::Swift, 4, b, buf, sizeof(buf));
+        expectStr("疾风 lv4：0.24s -> 0.21s（第 5 层）", buf, "当前 0.24s → 购买后 0.21s");
+        // 满层（5 层）封顶：next 被公式夹回原值（面板侧改显示「已达上限」）
+        shopCompareDesc(CardId::Swift, 5, b, buf, sizeof(buf));
+        expectStr("疾风满层 lv5：0.21s -> 0.21s（封顶后不变）", buf, "当前 0.21s → 购买后 0.21s");
+
+        // 长臂（像素整数）
+        shopCompareDesc(CardId::Reach, 0, b, buf, sizeof(buf));
+        expectStr("长臂 lv0：96 -> 111", buf, "当前 96 → 购买后 111");
+
+        // 横扫（度整数）
+        shopCompareDesc(CardId::Sweep, 0, b, buf, sizeof(buf));
+        expectStr("横扫 lv0：120 度 -> 135 度", buf, "当前 120 度 → 购买后 135 度");
+
+        // 疾行（移速像素/秒整数）
+        shopCompareDesc(CardId::Dash, 0, b, buf, sizeof(buf));
+        expectStr("疾行 lv0：300 -> 320", buf, "当前 300 → 购买后 320");
+
+        // 体魄（生命上限点）：2 层已叠的实算
+        shopCompareDesc(CardId::Vitality, 2, b, buf, sizeof(buf));
+        expectStr("体魄 lv2：140 -> 160", buf, "当前 140 → 购买后 160");
+
+        // 重击（击退像素整数，百分比加法）
+        shopCompareDesc(CardId::Heavy, 0, b, buf, sizeof(buf));
+        expectStr("重击 lv0：30 -> 45", buf, "当前 30 → 购买后 45");
+
+        // 慧眼（经验乘数一位小数）
+        shopCompareDesc(CardId::Insight, 0, b, buf, sizeof(buf));
+        expectStr("慧眼 lv0：x1.0 -> x1.2", buf, "当前 ×1.0 → 购买后 ×1.2");
+
+        // 聚宝（磁吸像素整数）：1 层已叠的实算
+        shopCompareDesc(CardId::Treasure, 1, b, buf, sizeof(buf));
+        expectStr("聚宝 lv1：200 -> 260", buf, "当前 200 → 购买后 260");
+
+        // 负层防御：按 0 层实算（与价格公式同口径）
+        shopCompareDesc(CardId::Blade, -5, b, buf, sizeof(buf));
+        expectStr("利刃 lv-5：按 0 层实算（25 -> 30）", buf, "当前 25 → 购买后 30");
+
+        // 自定义基准（模拟配置改过的局）：文案随基准联动
+        ShopPreviewBases custom = b;   // 拷贝默认
+        custom.attackDamage = 40;      // 基准伤害 40
+        shopCompareDesc(CardId::Blade, 1, custom, buf, sizeof(buf));
+        expectStr("自定义基准（40）：45 -> 50", buf, "当前 45 → 购买后 50");
+
+        // 越界 id（防御）：写作「—」——不崩、面板仍完整
+        shopCompareDesc(static_cast<CardId>(99), 0, b, buf, sizeof(buf));
+        expectStr("越界 id：防御占位「—」", buf, "—");
+    }
+    endCase(5, p0, f0);
 
     // ------------------------------------------------------------------
     // 汇总
