@@ -107,8 +107,9 @@
 //      monster_leash_radius 栓绳/回巢回血 monster_return_heal_percent）、
 //      金币磁吸（coin_magnet_radius）、
 //      世界（world_chunks_x/y、world_seed）与相机（camera_smooth_time）、
-//      升级曲线（xp_level_base/xp_level_growth）与每级强化
-//      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
+//      升级曲线（xp_level_base/xp_level_growth）——M2 起升级成长由三选一
+//      卡牌提供（卡池/数值为代码常量，见 game/UpgradeCard.h；旧 levelup_*
+//      自动强化键已退役删除）；
 //      缺键/坏值自动回退内置默认值
 //   6. 渲染：世界区块（地板/墙/装饰，经相机）-> 玩家（含横扫表现）-> 怪物
 //      -> 经验宝石 -> 金币 -> 漂浮文字（全部世界坐标，绘制处经相机换算）
@@ -191,6 +192,12 @@ private:
     // 打「升级选择」日志 -> 消费一笔欠账 -> 未清再弹一组 / 清完回 Playing。
     // 按到空位（不足三张时按 3 等）时本步不做任何事，面板继续等待
     void handleCardChoice(const UpdateContext& ctx);
+
+    // 卡牌效果应用（M2；onEnter / 选择生效 / restart 三处调用的统一入口）：
+    // 从「基准值 + 当前层数」重算全部受卡牌影响的数值并注入（幂等——重复
+    // 调用结果一致；层数清零后调用即等价于「效果全部撤销」）。「即时回血」
+    // 等一次性效果不在此列（选择流程单独发放——重算路径绝不重复回血）
+    void applyCardEffects();
 
     // 主动攻击入口（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扫程推进」。
     // 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
@@ -290,9 +297,8 @@ private:
     static constexpr float kDefaultMonsterReturnHealPercent = 0.0f; // 回巢回血缺省（monster_return_heal_percent，0=关闭）
     static constexpr int kDefaultXpLevelBase = 30;              // 升级曲线基数（xp_level_base）
     static constexpr float kDefaultXpLevelGrowth = 1.35f;       // 升级曲线倍率（xp_level_growth）
-    static constexpr int kDefaultLevelupHpBonus = 10;           // 每级生命上限强化（levelup_max_hp_bonus）
-    static constexpr int kDefaultLevelupDamageBonus = 3;        // 每级攻击伤害强化（levelup_damage_bonus）
-    static constexpr float kDefaultLevelupSpeedBonus = 10.0f;   // 每级移速强化（levelup_speed_bonus，像素/秒）
+    // 说明（M2）：每级自动强化的 kDefaultLevelup* 常量已退役删除——
+    // 升级成长全部由三选一卡牌提供（卡表与数值常量见 game/UpgradeCard.h）
     static constexpr int kDefaultWorldChunks = 4;               // 世界区块数缺省值（world_chunks_x/y）：4x4 = 3072x3072
     static constexpr float kDefaultCameraSmoothTime = 0.12f;    // 相机平滑时间常数缺省值（camera_smooth_time，秒）
 
@@ -413,17 +419,22 @@ private:
     LevelupSfx m_levelupSfx;
 
     // ---- 战斗配置（onEnter 读取；R 重开不重读，整局沿用同一套调参）----
-    // 三项基准值：配置里的「初始值」，也是 restart 复位时的还原目标；
-    // 本局升级带来的成长只体现在下面的「当前值」，不污染基准
-    int m_playerMaxHpBase = kDefaultPlayerHp;      // 生命上限基准（player_hp）
-    int m_attackDamageBase = kDefaultAttackDamage; // 攻击伤害基准（attack_damage）
-    float m_playerSpeedBase = Player::kDefaultSpeed; // 移速基准（player_speed）
+    // 「基准值」= 配置里的初始值：卡牌效果从「基准 + 层数」重算（M2，
+    // applyCardEffects 唯一入口）；R 重开清层数即回到基准。基准整局只读、从不被写
+    int m_playerMaxHpBase = kDefaultPlayerHp;      // 生命上限基准（player_hp；体魄累加）
+    int m_attackDamageBase = kDefaultAttackDamage; // 攻击伤害基准（attack_damage；利刃累加）
+    float m_playerSpeedBase = Player::kDefaultSpeed; // 移速基准（player_speed；疾行累加）
+    float m_attackCooldownBase = Player::kDefaultAttackCooldown; // 攻击冷却基准（attack_cooldown；疾风乘算）
+    float m_attackRangeBase = kDefaultAttackRange; // 横扫半径基准（attack_range；长臂累加）
+    float m_attackArcBase = kDefaultAttackArc;     // 横扫张角基准（attack_arc；横扫累加）
+    float m_attackKnockbackBase = kDefaultAttackKnockback; // 击退基准（attack_knockback；重击比例）
+    float m_coinMagnetRadiusBase = kDefaultCoinMagnetRadius; // 金币磁吸基准（coin_magnet_radius；聚宝累加）
 
-    // 三项当前值：基准 + 本局升级累积（grantXp 每级追加；restart 从基准复位）；
-    // 均注入 Player/局面——它们才是实际参与战斗运算的数值
-    int m_playerMaxHp = kDefaultPlayerHp;            // 当前生命上限（受 levelup_max_hp_bonus 增长）
-    int m_attackDamage = kDefaultAttackDamage;       // 当前攻击伤害（受 levelup_damage_bonus 增长）
-    float m_playerSpeed = Player::kDefaultSpeed;     // 当前移速（受 levelup_speed_bonus 增长；经 setSpeed 注入）
+    // 当前值：基准 + 卡牌层数重算（M2 起——applyCardEffects 统一注入；
+    // restart 清层数后重算即复位）。它们才是实际参与战斗运算的数值
+    int m_playerMaxHp = kDefaultPlayerHp;            // 当前生命上限（基准 + 体魄卡）
+    int m_attackDamage = kDefaultAttackDamage;       // 当前攻击伤害（基准 + 利刃卡）
+    float m_playerSpeed = Player::kDefaultSpeed;     // 当前移速（基准 + 疾行卡；经 setSpeed 注入）
 
     float m_attackRange = kDefaultAttackRange;        // 横扫半径（attack_range，像素）
     float m_attackArc = kDefaultAttackArc;            // 横扫总张角（attack_arc，度）
@@ -447,10 +458,9 @@ private:
     float m_cameraSmoothTime = kDefaultCameraSmoothTime;
 
     // ---- 升级配置与曲线（onEnter 读取；R 重开不重读）----
-    LevelCurve m_levelCurve;                              // 经验曲线（base/growth 从 xp_* 键注入）
-    int m_levelupHpBonus = kDefaultLevelupHpBonus;        // 每级生命上限强化（levelup_max_hp_bonus）
-    int m_levelupDamageBonus = kDefaultLevelupDamageBonus; // 每级攻击伤害强化（levelup_damage_bonus）
-    float m_levelupSpeedBonus = kDefaultLevelupSpeedBonus; // 每级移速强化（levelup_speed_bonus）
+    // M2 起升级成长由三选一卡牌提供（卡池表与数值常量见 game/UpgradeCard.h），
+    // 本节只保留经验曲线（旧 levelup_* 自动强化成员已退役删除）
+    LevelCurve m_levelCurve; // 经验曲线（base/growth 从 xp_* 键注入）
 
     // ---- 战斗运行时状态（restart 复位）----
     int m_playerHp = kDefaultPlayerHp;   // 玩家当前生命（归零 -> GameOver）

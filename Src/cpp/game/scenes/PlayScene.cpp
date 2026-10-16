@@ -70,9 +70,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      monster_return_heal_percent 回巢回血百分比（0=关闭；预留键）
     //      xp_level_base           升级曲线基数（第 1 级升第 2 级的需求）
     //      xp_level_growth         升级曲线倍率（需求逐级倍率）
-    //      levelup_max_hp_bonus    每级生命上限强化（并即时回血等值）
-    //      levelup_damage_bonus    每级攻击伤害强化（点）
-    //      levelup_speed_bonus     每级移速强化（像素/秒）
+    //（M2 起升级成长由三选一卡牌提供——卡池/数值为代码常量，见
+    //  game/UpgradeCard.h 的卡表；旧 levelup_* 自动强化键已退役删除）
     //      world_chunks_x/y        世界区块数（横向/纵向；世界 = 区块 x 768px）
     //      world_seed              世界种子（0 = 每局随机；非 0 = 固定可复现）
     //      camera_smooth_time      相机平滑时间常数（秒）
@@ -85,11 +84,12 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         config.getFloat("attack_cooldown", Player::kDefaultAttackCooldown);
     const float attackSwingTime =
         config.getFloat("attack_swing_time", Player::kDefaultSwingTime);
-    m_attackRange = config.getFloat("attack_range", kDefaultAttackRange);
-    // 张角与击退距离做下限夹取（负张角/负距离没有玩法语义，同 levelup_* 的
-    // 防御写法）；张角上界交由 AttackArc 归一化（超整圆按整圆处理）
-    m_attackArc = std::max(0.0f, config.getFloat("attack_arc", kDefaultAttackArc));
-    m_attackKnockback = std::max(0.0f, config.getFloat("attack_knockback", kDefaultAttackKnockback));
+    // 横扫半径直接读进「基准」字段（M2：卡牌从基准重算当前值——长臂加范围）；
+    // 张角与击退距离做下限夹取（负张角/负距离没有玩法语义）；张角上界交由
+    // AttackArc 归一化（超整圆按整圆处理）
+    m_attackRangeBase = config.getFloat("attack_range", kDefaultAttackRange);
+    m_attackArcBase = std::max(0.0f, config.getFloat("attack_arc", kDefaultAttackArc));
+    m_attackKnockbackBase = std::max(0.0f, config.getFloat("attack_knockback", kDefaultAttackKnockback));
     m_monsterSpeedGrowth = config.getFloat("monster_speed_growth", kDefaultMonsterSpeedGrowth);
     m_monsterSpawnInterval =
         config.getFloat("monster_spawn_interval", kDefaultMonsterSpawnInterval);
@@ -99,9 +99,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_monsterAttackCooldown =
         std::max(0.0f, config.getFloat("monster_attack_cooldown", kDefaultMonsterAttackCooldown));
 
-    // 批四新增：金币磁吸半径（像素）——负值夹到 0（0 = 只在完全贴合时
-    // 吸附的显式语义；范围外金币静止不动，可走过去拾取）
-    m_coinMagnetRadius = std::max(0.0f, config.getFloat("coin_magnet_radius", kDefaultCoinMagnetRadius));
+    // 批四新增：金币磁吸半径（像素）读进「基准」字段（M2：聚宝从基准加半径）
+    // ——负值夹到 0（0 = 只在完全贴合时吸附的显式语义；范围外金币静止不动，
+    // 可走过去拾取）
+    m_coinMagnetRadiusBase = std::max(0.0f, config.getFloat("coin_magnet_radius", kDefaultCoinMagnetRadius));
 
     // 批三新增：怪物生态参数（AI 决策半径 + 回巢回血预留键）。
     // 半径做下界夹取（负半径没有玩法语义——宁可按 0 处理，也不让
@@ -128,34 +129,32 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_cameraSmoothTime =
         std::max(0.0f, config.getFloat("camera_smooth_time", kDefaultCameraSmoothTime));
 
-    // 三项「基准值」= 配置里的初始值（restart 复位目标）；三项「当前值」
-    // 从基准起步，局内升级由 grantXp 逐级追加，重开时再回到基准重新累积
+    // 「基准值」= 配置里的初始值（M2：卡牌效果从「基准 + 层数」重算——
+    // applyCardEffects 是唯一入口；restart 清层数后重算即复位）。
+    // 「当前值」先行置为基准：让随后「生命回满」等流程读到合法初值；
+    // 步骤 8 的 applyCardEffects 会再从基准/层数重算一遍（层数全 0 => 同值）
     m_playerSpeedBase = playerSpeed;                                         // 移速基准
     m_playerMaxHpBase = config.getInt("player_hp", kDefaultPlayerHp);        // 生命上限基准
     m_attackDamageBase = config.getInt("attack_damage", kDefaultAttackDamage); // 攻击伤害基准
+    m_attackCooldownBase = attackCooldown;                                   // 攻击冷却基准（疾风乘算）
     m_playerSpeed = m_playerSpeedBase;   // 当前移速 = 基准（本局成长尚未发生）
     m_playerMaxHp = m_playerMaxHpBase;   // 当前生命上限 = 基准
     m_attackDamage = m_attackDamageBase; // 当前攻击伤害 = 基准
 
-    // 升级曲线与每级强化：曲线参数直接注入 LevelCurve——它内部对
-    // 0/负基数、小于 1 或 NaN 的倍率有完整的边界夹取（见其头文件，有单测）；
-    // 强化值负数无玩法语义（升级反而倒扣属性），沿用 monster_max_count
-    // 同款的防御写法：夹到 0 起（静默，注释即约定）
+    // 升级曲线：参数直接注入 LevelCurve——它内部对 0/负基数、小于 1 或
+    // NaN 的倍率有完整的边界夹取（见其头文件，有单测）。
+    // M2：每级自动强化（旧 levelup_* 键）已退役——升级成长改由三选一
+    // 卡牌提供（卡表与常量见 game/UpgradeCard.h）
     m_levelCurve.base = config.getInt("xp_level_base", kDefaultXpLevelBase);
     m_levelCurve.growth = config.getFloat("xp_level_growth", kDefaultXpLevelGrowth);
-    m_levelupHpBonus = std::max(0, config.getInt("levelup_max_hp_bonus", kDefaultLevelupHpBonus));
-    m_levelupDamageBonus =
-        std::max(0, config.getInt("levelup_damage_bonus", kDefaultLevelupDamageBonus));
-    m_levelupSpeedBonus =
-        std::max(0.0f, config.getFloat("levelup_speed_bonus", kDefaultLevelupSpeedBonus));
 
     // 负数会经 static_cast 变成巨大的 size_t 引发异常（与金币池时代的防护同款），
     // 所以先用 std::max 夹到 0 以上；0 只怪物（无敌人模式）是允许的合法配置。
     // 上限封顶在 currentMonsterCap 中再统一处理（kMaxMonsterCap = 池大小）
     m_monsterMaxCount = std::max(0, config.getInt("monster_max_count", kDefaultMonsterMaxCount));
 
-    // 玩家生命从满值开始（restart 复用同一初值）；刷新时刻表从首刷延迟起算
-    m_playerHp = m_playerMaxHp;                  // 生命回满：全新一局
+    // 刷新时刻表从首刷延迟起算；玩家生命在步骤 8 的 applyCardEffects 之后
+    // 回满（先把上限按卡牌层数重算到位——层数全 0 时即配置初值）
     m_monsterNextSpawnTime = kFirstSpawnDelay;   // 首只怪物：局内 2 秒后出现
 
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
@@ -197,18 +196,18 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建玩家纹理失败：%s", SDL_GetError());
     }
 
-    // 8) 注入玩家配置：速度、加减速、行走动画节奏与攻击冷却/扫程。
-    //    必须在 load 之后设置——load 会把内置默认帧时长先写进动画数据，
-    //    配置值晚一步落定才能覆盖它（各 set 对非法值会忽略并警告）。
-    //    速度注入的是「当前值」字段（= 基准起步；升级成长改的也是它）。
-    //    扫角注入的是 attack_arc——与扇形判定张角同值，判定与渲染因此
-    //    同一条刀锋曲线（画到哪、打到哪）
-    m_player.setSpeed(m_playerSpeed);
+    // 8) 注入玩家配置：加减速/动画节奏/扫程时长（不受卡牌影响的四项），
+    //    受卡牌影响的数值（移速/攻击冷却/扫角）与其余卡效果走统一入口
+    //    applyCardEffects 重算注入。必须在 load 之后设置——load 会把内置
+    //    默认帧时长先写进动画数据，配置值晚一步落定才能覆盖它（各 set
+    //    对非法值会忽略并警告）。层数全 0 时 applyCardEffects 等价于写入
+    //    各基准；扫角注入与扇形判定张角同值——判定与渲染同一条刀锋曲线
+    //（画到哪、打到哪）
     m_player.setMotion(playerAccel, playerFriction);
     m_player.setFrameTime(playerAnimInterval);
-    m_player.setAttackCooldown(attackCooldown);
     m_player.setSwingTime(attackSwingTime);
-    m_player.setAttackArc(m_attackArc);
+    applyCardEffects();         // 卡效果统一入口（移速/冷却/张角 + 全部数值；层数全 0 = 基准注入）
+    m_playerHp = m_playerMaxHp; // 生命回满：全新一局（上限已按卡牌层数重算到位）
 
     // 9) 查询窗口实际尺寸并缓存：相机视口与后续换算都基于它
     SDL_GetWindowSize(m_window, &m_width, &m_height);
@@ -438,6 +437,18 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
     const int cardIndex = static_cast<int>(id);           // 层数数组下标（与 CardId 对应）
     m_cardLevels[cardIndex] = gainCardLevel(id, m_cardLevels[cardIndex]); // 层数 +1（有限卡封顶）
 
+    // 效果立即落地：从「基准 + 层数」重算全部受卡牌影响的数值并注入
+    //（幂等入口；例如伤害/移速/冷却/张角/击退/磁吸/生命上限一步到位）
+    applyCardEffects();
+
+    // 体魄的一次性效果：即时回血 20（上限刚在 applyCardEffects 里 +20）。
+    // 与重算路径分离的原因：applyCardEffects 幂等、不重复回血——「获得
+    // 该卡那一刻」的加血只在本次选择发放（restart 重算不会凭空加血）
+    if (id == CardId::Vitality) // 选中的是体魄？
+    {
+        m_playerHp = std::min(m_playerHp + kCardVitalityHealPerLevel, m_playerMaxHp); // 回血 20 并夹上限
+    }
+
     // ---- 冒烟观测点：升级选择日志（规格文案「升级选择：卡片名（层数 x/上限）」；
     //      无限卡上限写作「无限」）----
     const CardDef& def = cardDef(id); // 卡定义（名称与上限文本的来源）
@@ -465,6 +476,52 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
         m_state = PlayState::Playing; // 欠账清完：恢复对局（update 下一步起推进世界）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择完毕，恢复对局"); // 恢复日志
     }
+}
+
+// 卡牌效果应用（M2；onEnter / 选择生效 / restart 三处调用的统一入口）：
+// 从「基准值 x 当前层数」重算全部受卡牌影响的数值并注入（幂等——重复调用
+// 结果一致；层数清零后调用即等价于「效果全部撤销」）。
+// 「即时回血」等一次性效果不在此列（选择流程单独发放——重算路径绝不重复回血）
+void PlayScene::applyCardEffects()
+{
+    // 利刃：伤害 = 基准 + 5 x 层数（横扫结算与飘字读取同一个字段）
+    m_attackDamage = cardBladeDamage(
+        m_attackDamageBase, m_cardLevels[static_cast<int>(CardId::Blade)]);
+
+    // 疾风：冷却 = 基准 x 0.88^层数（乘算）——注入 Player（出手冷却的实际门控值）
+    m_player.setAttackCooldown(cardSwiftCooldown(
+        m_attackCooldownBase, m_cardLevels[static_cast<int>(CardId::Swift)]));
+
+    // 长臂：攻击范围 = 基准 + 15 x 层数（扇形判定的半径）
+    m_attackRange = cardReachRange(
+        m_attackRangeBase, m_cardLevels[static_cast<int>(CardId::Reach)]);
+
+    // 横扫：张角 = 基准 + 15 度 x 层数——同步注入 Player（画到哪、打到哪的同一数据源）
+    m_attackArc = cardSweepArc(
+        m_attackArcBase, m_cardLevels[static_cast<int>(CardId::Sweep)]);
+    m_player.setAttackArc(m_attackArc); // 武器扫角 = 判定张角（结构性共享）
+
+    // 疾行：移速 = 基准 + 20 x 层数——注入 Player（下一固定步的移动立即使用）
+    m_playerSpeed = cardDashSpeed(
+        m_playerSpeedBase, m_cardLevels[static_cast<int>(CardId::Dash)]);
+    m_player.setSpeed(m_playerSpeed); // 移速注入（负数防御在 Player::setSpeed 内部）
+
+    // 体魄：生命上限 = 基准 + 20 x 层数；当前生命夹到新上限（重算路径不回血——
+    // 即时 +20 只在「选择体魄那一刻」发放，见 handleCardChoice）
+    m_playerMaxHp = cardVitalityMaxHp(
+        m_playerMaxHpBase, m_cardLevels[static_cast<int>(CardId::Vitality)]);
+    m_playerHp = std::min(m_playerHp, m_playerMaxHp); // 上限下调时（重开/异常）夹住当前生命
+
+    // 重击：击退 = 基准 x (1 + 0.5 x 层数)（百分比加法叠加）
+    m_attackKnockback = cardHeavyKnockback(
+        m_attackKnockbackBase, m_cardLevels[static_cast<int>(CardId::Heavy)]);
+
+    // 聚宝：金币磁吸范围 = 基准 + 60 x 层数
+    m_coinMagnetRadius = cardTreasureMagnet(
+        m_coinMagnetRadiusBase, m_cardLevels[static_cast<int>(CardId::Treasure)]);
+
+    // 慧眼：没有常驻数值可注入——经验乘数在宝石吸收结算时按层数实时计算
+    //（见宝石吸收分支的 cardInsightXpValue 调用；此处无需处理）
 }
 
 // 每帧更新：先处理输入动作边缘（任何状态都响应），再按状态推进战斗。
@@ -751,9 +808,11 @@ void PlayScene::update(const UpdateContext& ctx)
         {
             gem.markPicked(); // 标记：本次遍历结束后统一清理
 
-            // 经验结算（批三新增沿用）：进度累计 + 按曲线循环结算 + 逐级
-            // 强化与反馈（可能连升多级——grantXp 内部循环，日志逐级记录）
-            grantXp(kGemXpValue);
+            // 经验结算：进度累计 + 按曲线循环结算 + 升级反馈与卡牌欠账
+            //（可能连升多级——grantXp 内部循环处理）。
+            // M2：经验值经「慧眼」卡乘算（1 + 20% x 层数，四舍五入；层数 0
+            // 时原值——纯函数见 UpgradeCard.h，选择面板里选到慧眼后立即生效）
+            grantXp(cardInsightXpValue(kGemXpValue, m_cardLevels[static_cast<int>(CardId::Insight)]));
 
             // 吸收音效沿用 coin.wav（与旧金币收集同一听觉反馈）
             m_audio->play(SoundId::Coin);
@@ -1096,39 +1155,30 @@ void PlayScene::dropCoinsAt(float x, float y, int count)
 }
 
 // 经验结算：把 amount 点经验并入当前进度，按升级曲线循环结算（一枚宝石
-// 可连升多级），并逐级发放强化与反馈。曲线计算走 LevelCurve 纯函数——
-// 本函数只负责「把结果落实到局面」：三项强化、升级飘字、HUD 瞬闪、音效
+// 可连升多级），并逐级发放升级反馈（飘字/瞬闪/音效）。曲线计算走
+// LevelCurve 纯函数——本函数只负责「把结果落实到局面」。
+// M2：每级自动强化（旧三项属性成长）已退役——升级成长改为登记欠账并弹出
+// 三选一卡牌（选择生效后经 applyCardEffects 统一落地；见本函数末尾）
 void PlayScene::grantXp(int amount)
 {
     // 曲线结算：返回新等级 / 当前级新进度 / 连升级数（纯函数，输入输出皆为数据）
     const LevelUpResult result = m_levelCurve.apply(m_level, m_xp, amount);
 
-    // 记录升级前的等级：下面按「旧+1 .. 新」逐级发强化与反馈
+    // 记录升级前的等级：下面按「旧+1 .. 新」逐级发反馈（飘字逐级错开）
     const int oldLevel = m_level;
 
-    // 先落定结算结果：强化循环与结束界面读取的都是新状态
+    // 先落定结算结果：反馈循环与结束界面读取的都是新状态
     m_xp = result.xp;       // 当前级进度（恒小于本级需求）
     m_level = result.level; // 新等级（等级只增不减）
 
-    // 逐级发放（一枚宝石连升多级时每级都发一份——强化是「每级」语义）
+    // 逐级发放升级反馈（一枚宝石连升多级时每级都发一份）。说明（M2）：
+    // 属性成长不在这里发生——只有反馈；成长全部来自卡牌选择
     for (int levelReached = oldLevel + 1; levelReached <= m_level; ++levelReached)
     {
-        // 1) 生命上限 +bonus 且即时回血等值（回血夹在上限内——从残血升级
-        //    能立刻多出这一截生命，构成「升级即续航」的即时正反馈）
-        m_playerMaxHp += m_levelupHpBonus; // 上限抬高
-        m_playerHp = std::min(m_playerHp + m_levelupHpBonus, m_playerMaxHp); // 即时回血并夹取
-
-        // 2) 攻击伤害 +bonus（此后横扫结算用新值，伤害飘字同步变大）
-        m_attackDamage += m_levelupDamageBonus;
-
-        // 3) 移速 +bonus 并注入玩家实体（下一固定步的移动立即使用新速度）
-        m_playerSpeed += m_levelupSpeedBonus;
-        m_player.setSpeed(m_playerSpeed);
-
-        // 4) 冒烟观测点：升级日志（规格文案「升级！等级 N」——自动化测试断言点）
+        // 1) 冒烟观测点：升级日志（规格文案「升级！等级 N」——自动化测试断言点）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级！等级 %d", levelReached);
 
-        // 5) 升级飘字（金色）挂在玩家上方；连升多级时逐条向上错开
+        // 2) 升级飘字（金色）挂在玩家上方；连升多级时逐条向上错开
         //    （每条偏移 26 像素，避免多级连升时文字完全重叠）
         const SDL_FRect playerRect = m_player.rect(); // 玩家当前位置（左上角）
         spawnFloatingText("升级！",
@@ -1136,19 +1186,18 @@ void PlayScene::grantXp(int amount)
                           playerRect.y - 24.0f - (levelReached - oldLevel - 1) * 26.0f, // 头顶上方
                           SDL_Color{ 255, 215, 0, 255 },                    // 金色：升级高光
                           kLevelupTextLifeSeconds);                         // 比伤害数字停留更久
-
-        // 6) 升级音效（游戏层直读 levelup.wav；音频不可用安全静默）
-        m_levelupSfx.play();
     }
 
     // 有升级才触发 HUD 瞬闪：短暂窗口内等级数字金白交替（渲染端消费本计时）。
     // 三选一升级卡（M2）同点接入：连升的每一级记一笔欠账（逐次弹选）、
-    // 立即打开第一组选择面板（抽卡 + 进入 LevelUp——世界从下一固定步冻结）
+    // 立即打开第一组选择面板（抽卡 + 进入 LevelUp——世界从下一固定步冻结）；
+    // 升级音效在此按「本次升级」播放一次（连升多级不叠放）
     if (result.levelsGained > 0)
     {
-        m_levelFlashLeft = kLevelFlashSeconds; // 重置为满值（连升多级只刷一次时长）
+        m_levelFlashLeft = kLevelFlashSeconds;  // 重置为满值（连升多级只刷一次时长）
+        m_levelupSfx.play();                    // 升级音效（游戏层直读 levelup.wav；不可用安全静默）
         m_choiceQueue.add(result.levelsGained); // 欠账登记：每升一级欠一次选择
-        openCardPanel(); // 打开选择面板（正常路径：抽到卡并进入 LevelUp）
+        openCardPanel();                        // 打开选择面板（正常路径：抽到卡并进入 LevelUp）
     }
 }
 
@@ -1375,25 +1424,9 @@ void PlayScene::separateOverlappingMonsters()
 // 重开一局：把整局相关的数据全部恢复到初始状态
 void PlayScene::restart()
 {
-    // 三项属性回基准：本局升级累积的成长全部撤销（基准值整局只读、从未被写）
-    m_playerMaxHp = m_playerMaxHpBase;   // 生命上限回到配置初值
-    m_attackDamage = m_attackDamageBase; // 攻击伤害回到配置初值
-    m_playerSpeed = m_playerSpeedBase;   // 移速回到配置初值
-    m_player.setSpeed(m_playerSpeed);    // 并重新注入玩家实体（立即生效）
-
-    // 战斗数值复位：生命回满、击杀/等级/经验清零、无敌清零
-    m_playerHp = m_playerMaxHp;    // 生命回满（上限已先回到基准）
-    m_killCount = 0;               // 击杀清零
-    m_level = 1;                   // 等级回到 1（新一局从第 1 级重新累积）
-    m_xp = 0;                      // 当前级进度清零
-    m_levelFlashLeft = 0.0f;       // 清掉上一局残留的等级瞬闪状态
-    m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
-    m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
-
     // 三选一升级卡清零（M2：「R 重开清零全部层数与效果」的层数侧）：
     // 层数与欠账全清、面板卡位清空、1/2/3 去重标记复位——新一局的卡池
-    // 从零层开始（效果侧随三项属性回基准一并清零）。
-    // 卡池随机源不重播种：层数清零后卡池全开，沿用同一序列即可
+    // 从零层开始。卡池随机源不重播种：层数清零后卡池全开，沿用同一序列即可
     for (int& level : m_cardLevels) // 逐卡遍历层数数组
     {
         level = 0; // 该卡层数归零
@@ -1403,6 +1436,20 @@ void PlayScene::restart()
     m_choiceHandled[0] = false;        // 1 号去重标记复位
     m_choiceHandled[1] = false;        // 2 号去重标记复位
     m_choiceHandled[2] = false;        // 3 号去重标记复位
+
+    // 卡牌效果撤销 + 全部数值复位（M2 统一入口）：层数已清零，重算即等价于
+    // 「移速/攻击冷却/伤害/范围/张角/击退/生命上限/磁吸」全部回到基准，
+    // 并重新注入 Player 实体（移速/冷却/扫角立即恢复配置初值）
+    applyCardEffects();
+
+    // 战斗数值复位：生命回满（上限已回基准）、击杀/等级/经验清零、无敌清零
+    m_playerHp = m_playerMaxHp;    // 生命回满（上限已在 applyCardEffects 中回到基准）
+    m_killCount = 0;               // 击杀清零
+    m_level = 1;                   // 等级回到 1（新一局从第 1 级重新累积）
+    m_xp = 0;                      // 当前级进度清零
+    m_levelFlashLeft = 0.0f;       // 清掉上一局残留的等级瞬闪状态
+    m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
+    m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
 
     // 「新纪录」标记复位：上一局的破纪录展示不带到新一局。
     //（m_best 快照保留不动——它是整局的比较基准，只在结算成功时更新）
