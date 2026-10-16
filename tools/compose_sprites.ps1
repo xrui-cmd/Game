@@ -556,7 +556,354 @@ Save-Png -bitmap $fxBmp -path (Join-Path $assetsDir "monster_hit_fx.png")
 $fxBmp.Dispose()
 
 # ============================================================
-# 8) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
+# 8) 法术素材（批五B：程序化绘制——特效贴图 + HUD 图标）
+# ============================================================
+# 说明（报告口径）：六种法术特效（火球/冰环/闪电/治疗光/光环/护盾罩）
+# 与六枚 HUD 图标同样无法从 DungeonTileset II 原帧组装——由脚本直接
+# 程序化绘制（System.Drawing 画圆/环/折线），输出仍是成品 PNG；
+# 脚本整体依旧「幂等」：重复运行覆盖同内容文件，结果一致。
+#
+# 尺寸约定（与 PlayScene.h 的绘制常量一一对应，改一处必须两边同步）：
+#   spell_fireball.png        32x32   火球弹体（飞旋绘制；兼作爆炸放大）
+#   spell_frost_nova.png     128x128  冰环（缩放展开 + 淡出）
+#   spell_chain_lightning.png 32x32   闪电端点电花（折线由代码绘制）
+#   spell_heal.png            64x64   治疗光（十字光，上浮 + 淡出）
+#   spell_burn_aura.png      160x160  灼烧光环（常驻旋转）
+#   spell_shield.png          96x96   护盾罩（呼吸缩放）
+#   icon_fireball / icon_frost_nova / icon_chain_lightning /
+#   icon_heal / icon_burn_aura / icon_shield  —— 40x40 六枚 HUD 图标
+
+# ---- 8.1 spell_fireball.png（32x32：外晕/主体/内核/白心 四层同心圆）----
+$fireballBmp = New-Canvas -width 32 -height 32
+# 获取火球画布的 Graphics 绘图对象
+$fireballG = [System.Drawing.Graphics]::FromImage($fireballBmp)
+try {
+    # 四层圆刷（外到内）：低透明外晕 -> 橙主体 -> 亮黄内核 -> 近白高光心
+    $fbGlow = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(90, 255, 120, 40))    # 外晕（半透明）
+    $fbBody = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 160, 40))   # 主体橙
+    $fbCore = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 220, 80))   # 内核亮黄
+    $fbHeart = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 250, 220)) # 白心
+    try {
+        $fireballG.FillEllipse($fbGlow, 0, 0, 32, 32)   # 外晕：整幅圆（软边观感）
+        $fireballG.FillEllipse($fbBody, 4, 4, 24, 24)   # 主体：r=12
+        $fireballG.FillEllipse($fbCore, 8, 8, 16, 16)   # 内核：r=8
+        $fireballG.FillEllipse($fbHeart, 12, 12, 8, 8)  # 白心：r=4
+    } finally {
+        # 四支画刷用完释放（关闭 GDI 句柄）
+        $fbGlow.Dispose()
+        $fbBody.Dispose()
+        $fbCore.Dispose()
+        $fbHeart.Dispose()
+    }
+} finally {
+    # 释放火球画布 Graphics
+    $fireballG.Dispose()
+}
+# 保存火球图（幂等覆盖）并释放画布
+Save-Png -bitmap $fireballBmp -path (Join-Path $assetsDir "spell_fireball.png")
+$fireballBmp.Dispose()
+
+# ---- 8.2 spell_frost_nova.png（128x128：双环 + 8 根冰刺，青蓝调）----
+$frostBmp = New-Canvas -width 128 -height 128
+# 获取冰环画布的 Graphics 绘图对象
+$frostG = [System.Drawing.Graphics]::FromImage($frostBmp)
+try {
+    # 外环（亮青粗线）/ 内环（深青细线）/ 冰刺（近白短线）
+    $fnOuter = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(220, 180, 235, 255), 6) # 外环笔
+    $fnInner = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, 90, 180, 240), 3)  # 内环笔
+    $fnSpike = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(235, 240, 250, 255), 3) # 冰刺笔
+    try {
+        $frostG.DrawEllipse($fnOuter, 8, 8, 112, 112) # 外环：圆心 (64,64) r=56
+        $frostG.DrawEllipse($fnInner, 30, 30, 68, 68) # 内环：r=34
+        # 8 根冰刺：从 r=44 到 r=60 的径向短线（45° 等分）
+        for ($k = 0; $k -lt 8; $k++) {
+            $angle = $k * [Math]::PI / 4.0 # 本根方位角（弧度）
+            $x1 = [float](64 + [Math]::Cos($angle) * 44) # 内端点 x
+            $y1 = [float](64 + [Math]::Sin($angle) * 44) # 内端点 y
+            $x2 = [float](64 + [Math]::Cos($angle) * 60) # 外端点 x
+            $y2 = [float](64 + [Math]::Sin($angle) * 60) # 外端点 y
+            $frostG.DrawLine($fnSpike, $x1, $y1, $x2, $y2) # 画本根冰刺
+        }
+    } finally {
+        # 三支画笔用完释放
+        $fnOuter.Dispose()
+        $fnInner.Dispose()
+        $fnSpike.Dispose()
+    }
+} finally {
+    # 释放冰环画布 Graphics
+    $frostG.Dispose()
+}
+# 保存冰环图（幂等覆盖）并释放画布
+Save-Png -bitmap $frostBmp -path (Join-Path $assetsDir "spell_frost_nova.png")
+$frostBmp.Dispose()
+
+# ---- 8.3 spell_chain_lightning.png（32x32：中心亮斑 + 6 向锯齿光线）----
+$boltBmp = New-Canvas -width 32 -height 32
+# 获取电花画布的 Graphics 绘图对象
+$boltG = [System.Drawing.Graphics]::FromImage($boltBmp)
+try {
+    # 中心光斑（黄底 + 白心）与锯齿光线笔（亮青）
+    $boltBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 230, 120)) # 光斑黄
+    $boltHeart = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 255, 245)) # 光斑白心
+    $boltPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(235, 200, 230, 255), 2)       # 光线笔
+    try {
+        # 6 向锯齿光线：每根两段折线（中点向旁偏 6px——固定形状，幂等）
+        for ($k = 0; $k -lt 6; $k++) {
+            $angle = $k * [Math]::PI / 3.0 # 本根方位角（60° 等分）
+            $midX = [float](16 + [Math]::Cos($angle) * 7 + [Math]::Cos($angle + 1.5708) * 5) # 折点 x（垂直偏移）
+            $midY = [float](16 + [Math]::Sin($angle) * 7 + [Math]::Sin($angle + 1.5708) * 5) # 折点 y
+            $endX = [float](16 + [Math]::Cos($angle) * 15) # 端点 x
+            $endY = [float](16 + [Math]::Sin($angle) * 15) # 端点 y
+            $boltG.DrawLine($boltPen, 16, 16, $midX, $midY) # 内段
+            $boltG.DrawLine($boltPen, $midX, $midY, $endX, $endY) # 外段
+        }
+        # 中心光斑画在光线之上（读作放电源点）
+        $boltG.FillEllipse($boltBrush, 10, 10, 12, 12) # 黄斑 r=6
+        $boltG.FillEllipse($boltHeart, 13, 13, 6, 6)   # 白心 r=3
+    } finally {
+        # 画刷/画笔用完释放
+        $boltBrush.Dispose()
+        $boltHeart.Dispose()
+        $boltPen.Dispose()
+    }
+} finally {
+    # 释放电花画布 Graphics
+    $boltG.Dispose()
+}
+# 保存电花图（幂等覆盖）并释放画布
+Save-Png -bitmap $boltBmp -path (Join-Path $assetsDir "spell_chain_lightning.png")
+$boltBmp.Dispose()
+
+# ---- 8.4 spell_heal.png（64x64：金色光晕圆 + 双层十字光）----
+$healBmp = New-Canvas -width 64 -height 64
+# 获取治疗光画布的 Graphics 绘图对象
+$healG = [System.Drawing.Graphics]::FromImage($healBmp)
+try {
+    # 光晕（半透明黄圆）与十字（金色主十字 + 近白内芯）
+    $healGlow = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(80, 255, 230, 140))  # 光晕
+    $healMain = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 215, 90))  # 主十字
+    $healCore = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 250, 230)) # 内芯
+    try {
+        $healG.FillEllipse($healGlow, 2, 2, 60, 60)   # 光晕：r=30（整幅柔光感）
+        $healG.FillRectangle($healMain, 26, 10, 12, 44) # 竖条：12x44 居中
+        $healG.FillRectangle($healMain, 10, 26, 44, 12) # 横条：44x12 居中
+        $healG.FillRectangle($healCore, 29, 16, 6, 32)  # 竖条内芯
+        $healG.FillRectangle($healCore, 16, 29, 32, 6)  # 横条内芯
+    } finally {
+        # 三支画刷用完释放
+        $healGlow.Dispose()
+        $healMain.Dispose()
+        $healCore.Dispose()
+    }
+} finally {
+    # 释放治疗光画布 Graphics
+    $healG.Dispose()
+}
+# 保存治疗光图（幂等覆盖）并释放画布
+Save-Png -bitmap $healBmp -path (Join-Path $assetsDir "spell_heal.png")
+$healBmp.Dispose()
+
+# ---- 8.5 spell_burn_aura.png（160x160：外环 + 内环 + 六点火斑）----
+$auraBmp = New-Canvas -width 160 -height 160
+# 获取光环画布的 Graphics 绘图对象
+$auraG = [System.Drawing.Graphics]::FromImage($auraBmp)
+try {
+    # 外环（橙粗线）/ 内环（亮黄细线）/ 火斑（小圆，散布环上）
+    $auOuter = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(210, 255, 140, 40), 10) # 外环笔
+    $auInner = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(190, 255, 200, 80), 4)  # 内环笔
+    $auFlame = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(200, 255, 170, 60)) # 火斑刷
+    try {
+        $auraG.DrawEllipse($auOuter, 10, 10, 140, 140) # 外环：r=70（判定半径满级 130 的贴图上缘）
+        $auraG.DrawEllipse($auInner, 26, 26, 108, 108) # 内环：r=54
+        # 六点火斑：分布在外环线上的小圆（旋转绘制时的「火星」细节）
+        for ($k = 0; $k -lt 6; $k++) {
+            $angle = $k * [Math]::PI / 3.0 # 本点方位角
+            $fx = [float](80 + [Math]::Cos($angle) * 70 - 6) # 火斑左上角 x（r=6 居中）
+            $fy = [float](80 + [Math]::Sin($angle) * 70 - 6) # 火斑左上角 y
+            $auraG.FillEllipse($auFlame, $fx, $fy, 12, 12)   # 画本点火斑
+        }
+    } finally {
+        # 画笔/画刷用完释放
+        $auOuter.Dispose()
+        $auInner.Dispose()
+        $auFlame.Dispose()
+    }
+} finally {
+    # 释放光环画布 Graphics
+    $auraG.Dispose()
+}
+# 保存光环图（幂等覆盖）并释放画布
+Save-Png -bitmap $auraBmp -path (Join-Path $assetsDir "spell_burn_aura.png")
+$auraBmp.Dispose()
+
+# ---- 8.6 spell_shield.png（96x96：半透明罩体 + 亮边 + 左上高光弧）----
+$shieldBmp = New-Canvas -width 96 -height 96
+# 获取护盾画布的 Graphics 绘图对象
+$shieldG = [System.Drawing.Graphics]::FromImage($shieldBmp)
+try {
+    # 罩体（半透明蓝圆）/ 亮边（青白粗环）/ 高光弧（左上 90 度）
+    $shFill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(60, 130, 190, 255)) # 罩体填充
+    $shRim = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(220, 170, 220, 255), 4)      # 罩体边
+    $shHi = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(235, 240, 250, 255), 3)       # 高光弧
+    try {
+        $shieldG.FillEllipse($shFill, 4, 4, 88, 88)  # 罩体：r=44 半透明填充
+        $shieldG.DrawEllipse($shRim, 4, 4, 88, 88)   # 罩体亮边
+        # 高光弧：左上 90 度（-180° 起扫 90°；GDI+ 角度顺时针、0° 在右）
+        $shieldG.DrawArc($shHi, 4, 4, 88, 88, 180, 90) # 左上弧段
+    } finally {
+        # 画刷/画笔用完释放
+        $shFill.Dispose()
+        $shRim.Dispose()
+        $shHi.Dispose()
+    }
+} finally {
+    # 释放护盾画布 Graphics
+    $shieldG.Dispose()
+}
+# 保存护盾图（幂等覆盖）并释放画布
+Save-Png -bitmap $shieldBmp -path (Join-Path $assetsDir "spell_shield.png")
+$shieldBmp.Dispose()
+
+# ---- 8.7 HUD 图标（六枚 40x40）：同款符号的简化版 ----
+
+# icon_fireball.png（40x40：火球三层圆）
+$iconFireballBmp = New-Canvas -width 40 -height 40
+$iconFireballG = [System.Drawing.Graphics]::FromImage($iconFireballBmp)
+try {
+    $icFbBody = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 160, 40))  # 主体
+    $icFbCore = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 220, 80))  # 内核
+    $icFbHeart = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 250, 220)) # 白心
+    try {
+        $iconFireballG.FillEllipse($icFbBody, 4, 4, 32, 32)   # 主体：r=16
+        $iconFireballG.FillEllipse($icFbCore, 10, 10, 20, 20) # 内核：r=10
+        $iconFireballG.FillEllipse($icFbHeart, 15, 15, 10, 10) # 白心：r=5
+    } finally {
+        $icFbBody.Dispose()
+        $icFbCore.Dispose()
+        $icFbHeart.Dispose()
+    }
+} finally {
+    $iconFireballG.Dispose()
+}
+Save-Png -bitmap $iconFireballBmp -path (Join-Path $assetsDir "icon_fireball.png")
+$iconFireballBmp.Dispose()
+
+# icon_frost_nova.png（40x40：冰环 + 六向雪花线）
+$iconFrostBmp = New-Canvas -width 40 -height 40
+$iconFrostG = [System.Drawing.Graphics]::FromImage($iconFrostBmp)
+try {
+    $icFnRim = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(225, 180, 235, 255), 4) # 环笔
+    $icFnSpike = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(235, 240, 250, 255), 2) # 雪花笔
+    try {
+        $iconFrostG.DrawEllipse($icFnRim, 6, 6, 28, 28) # 环：r=14
+        # 六向雪花线：r=6 到 r=14（60° 等分）
+        for ($k = 0; $k -lt 6; $k++) {
+            $angle = $k * [Math]::PI / 3.0 # 本线方位角
+            $x1 = [float](20 + [Math]::Cos($angle) * 6)  # 内端 x
+            $y1 = [float](20 + [Math]::Sin($angle) * 6)  # 内端 y
+            $x2 = [float](20 + [Math]::Cos($angle) * 14) # 外端 x
+            $y2 = [float](20 + [Math]::Sin($angle) * 14) # 外端 y
+            $iconFrostG.DrawLine($icFnSpike, $x1, $y1, $x2, $y2) # 画本线
+        }
+    } finally {
+        $icFnRim.Dispose()
+        $icFnSpike.Dispose()
+    }
+} finally {
+    $iconFrostG.Dispose()
+}
+Save-Png -bitmap $iconFrostBmp -path (Join-Path $assetsDir "icon_frost_nova.png")
+$iconFrostBmp.Dispose()
+
+# icon_chain_lightning.png（40x40：三段闪电折线）
+$iconBoltBmp = New-Canvas -width 40 -height 40
+$iconBoltG = [System.Drawing.Graphics]::FromImage($iconBoltBmp)
+try {
+    $icBoltPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 255, 230, 120), 4) # 闪电笔（金黄）
+    try {
+        # Z 字折线：上 -> 中 -> 下（固定形状）
+        $iconBoltG.DrawLine($icBoltPen, 24, 4, 14, 20) # 上段：右上 -> 中左
+        $iconBoltG.DrawLine($icBoltPen, 14, 20, 26, 20) # 横折：中左 -> 中右
+        $iconBoltG.DrawLine($icBoltPen, 26, 20, 16, 36) # 下段：中右 -> 下左
+    } finally {
+        $icBoltPen.Dispose()
+    }
+} finally {
+    $iconBoltG.Dispose()
+}
+Save-Png -bitmap $iconBoltBmp -path (Join-Path $assetsDir "icon_chain_lightning.png")
+$iconBoltBmp.Dispose()
+
+# icon_heal.png（40x40：金色十字）
+$iconHealBmp = New-Canvas -width 40 -height 40
+$iconHealG = [System.Drawing.Graphics]::FromImage($iconHealBmp)
+try {
+    $icHealBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 255, 215, 90)) # 十字刷
+    try {
+        $iconHealG.FillRectangle($icHealBrush, 16, 6, 8, 28) # 竖条
+        $iconHealG.FillRectangle($icHealBrush, 6, 16, 28, 8) # 横条
+    } finally {
+        $icHealBrush.Dispose()
+    }
+} finally {
+    $iconHealG.Dispose()
+}
+Save-Png -bitmap $iconHealBmp -path (Join-Path $assetsDir "icon_heal.png")
+$iconHealBmp.Dispose()
+
+# icon_burn_aura.png（40x40：圆环 + 中心小火点）
+$iconAuraBmp = New-Canvas -width 40 -height 40
+$iconAuraG = [System.Drawing.Graphics]::FromImage($iconAuraBmp)
+try {
+    $icAuRing = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(230, 255, 140, 40), 5) # 环笔
+    $icAuFlame = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(220, 255, 200, 80)) # 火点刷
+    try {
+        $iconAuraG.DrawEllipse($icAuRing, 6, 6, 28, 28)   # 外环：r=14
+        $iconAuraG.FillEllipse($icAuFlame, 15, 15, 10, 10) # 中心火点：r=5
+    } finally {
+        $icAuRing.Dispose()
+        $icAuFlame.Dispose()
+    }
+} finally {
+    $iconAuraG.Dispose()
+}
+Save-Png -bitmap $iconAuraBmp -path (Join-Path $assetsDir "icon_burn_aura.png")
+$iconAuraBmp.Dispose()
+
+# icon_shield.png（40x40：盾牌形 + 内十字）
+$iconShieldBmp = New-Canvas -width 40 -height 40
+$iconShieldG = [System.Drawing.Graphics]::FromImage($iconShieldBmp)
+try {
+    # 盾形多边形（上宽下尖的经典轮廓）与内十字
+    $icShBody = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(220, 110, 170, 240)) # 盾体
+    $icShEdge = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(235, 200, 235, 255), 2)      # 盾边
+    $icShCross = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 240, 250, 255)) # 内十字
+    try {
+        # 顶点数组：左上 -> 右上 -> 右中 -> 底尖 -> 左中（顺时针）
+        $pts = New-Object 'System.Drawing.Point[]' 5
+        $pts[0] = New-Object System.Drawing.Point(8, 6)   # 左上
+        $pts[1] = New-Object System.Drawing.Point(32, 6)  # 右上
+        $pts[2] = New-Object System.Drawing.Point(32, 20) # 右中
+        $pts[3] = New-Object System.Drawing.Point(20, 34) # 底尖
+        $pts[4] = New-Object System.Drawing.Point(8, 20)  # 左中
+        $iconShieldG.FillPolygon($icShBody, $pts)  # 填充盾体
+        $iconShieldG.DrawPolygon($icShEdge, $pts)  # 描边
+        $iconShieldG.FillRectangle($icShCross, 18, 10, 4, 16) # 内十字竖
+        $iconShieldG.FillRectangle($icShCross, 12, 16, 16, 4) # 内十字横
+    } finally {
+        $icShBody.Dispose()
+        $icShEdge.Dispose()
+        $icShCross.Dispose()
+    }
+} finally {
+    $iconShieldG.Dispose()
+}
+Save-Png -bitmap $iconShieldBmp -path (Join-Path $assetsDir "icon_shield.png")
+$iconShieldBmp.Dispose()
+
+# ============================================================
+# 9) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
 # ============================================================
 # 与代码常量的对应关系（任一处改动必须两边同步）：
 #   player_sheet: 5 帧 x 48 宽 = 240，高 84（Player 的 m_w=48 / m_h=84）
@@ -598,6 +945,23 @@ Assert-PngSize -path (Join-Path $assetsDir "decor_sheet.png") -expectedWidth 96 
 #   攻击反馈素材（批五A）：警示「!」24x36；爪痕爆点 48x48
 Assert-PngSize -path (Join-Path $assetsDir "alert.png") -expectedWidth 24 -expectedHeight 36
 Assert-PngSize -path (Join-Path $assetsDir "monster_hit_fx.png") -expectedWidth 48 -expectedHeight 48
+
+#   法术特效素材（批五B）：火球 32x32、冰环 128x128、电花 32x32、
+#   治疗光 64x64、光环 160x160、护盾罩 96x96（与 PlayScene.h 常量一一对应）
+Assert-PngSize -path (Join-Path $assetsDir "spell_fireball.png") -expectedWidth 32 -expectedHeight 32
+Assert-PngSize -path (Join-Path $assetsDir "spell_frost_nova.png") -expectedWidth 128 -expectedHeight 128
+Assert-PngSize -path (Join-Path $assetsDir "spell_chain_lightning.png") -expectedWidth 32 -expectedHeight 32
+Assert-PngSize -path (Join-Path $assetsDir "spell_heal.png") -expectedWidth 64 -expectedHeight 64
+Assert-PngSize -path (Join-Path $assetsDir "spell_burn_aura.png") -expectedWidth 160 -expectedHeight 160
+Assert-PngSize -path (Join-Path $assetsDir "spell_shield.png") -expectedWidth 96 -expectedHeight 96
+
+#   法术 HUD 图标（批五B）：六枚 40x40
+Assert-PngSize -path (Join-Path $assetsDir "icon_fireball.png") -expectedWidth 40 -expectedHeight 40
+Assert-PngSize -path (Join-Path $assetsDir "icon_frost_nova.png") -expectedWidth 40 -expectedHeight 40
+Assert-PngSize -path (Join-Path $assetsDir "icon_chain_lightning.png") -expectedWidth 40 -expectedHeight 40
+Assert-PngSize -path (Join-Path $assetsDir "icon_heal.png") -expectedWidth 40 -expectedHeight 40
+Assert-PngSize -path (Join-Path $assetsDir "icon_burn_aura.png") -expectedWidth 40 -expectedHeight 40
+Assert-PngSize -path (Join-Path $assetsDir "icon_shield.png") -expectedWidth 40 -expectedHeight 40
 
 # 全部完成提示
 Write-Host "全部成品素材组装并校验完成。"

@@ -27,14 +27,16 @@ void formatSurvivalText(char* buffer, size_t size, float seconds)
 
 } // 匿名命名空间结束
 
-// 析构（批五A 起恢复自定义实现）：除成员 RAII 的既有释放之外（世界区块/
-// 素材纹理由 World 兜底、玩家/怪物/宝石纹理由各 Entity 兜底、升级音效
-// 播放器随 LevelupSfx 收尾），新增的攻击反馈纹理（alert/hit_fx）由本类
-// 自持——在此显式释放。关键时机不变：SceneManager 先析构旧场景、后销毁
-// renderer，上述释放发生时 renderer 尚在，安全
+// 析构（批五A 起恢复自定义实现；批五B 追加法术素材释放）：除成员 RAII
+// 的既有释放之外（世界区块/素材纹理由 World 兜底、玩家/怪物/宝石纹理由
+// 各 Entity 兜底、升级音效播放器随 LevelupSfx 收尾），攻击反馈纹理
+// （alert/hit_fx）与法术素材（特效+图标）由本类自持——在此显式释放。
+// 关键时机不变：SceneManager 先析构旧场景、后销毁 renderer，上述释放
+// 发生时 renderer 尚在，安全
 PlayScene::~PlayScene()
 {
     releaseFeedbackTextures(); // 攻击反馈纹理释放（幂等；见实现）
+    releaseSpellTextures();    // 法术素材释放（批五B；幂等；见实现）
 }
 
 // 释放攻击反馈纹理（批五A）：先判空、再销毁、最后置空——幂等，
@@ -50,6 +52,28 @@ void PlayScene::releaseFeedbackTextures()
     {
         SDL_DestroyTexture(m_monsterHitFxTexture); // 释放命中爪痕纹理
         m_monsterHitFxTexture = nullptr;           // 置空：重复调用安全
+    }
+}
+
+// 释放法术素材（批五B）：六张特效贴图 + 六张图标逐张判空释放——幂等，
+// 供析构兜底调用（renderer 销毁前必然已执行）
+void PlayScene::releaseSpellTextures()
+{
+    for (SDL_Texture*& texture : m_spellTextures) // 特效贴图逐张
+    {
+        if (texture != nullptr) // 仅在持有纹理时销毁
+        {
+            SDL_DestroyTexture(texture); // 释放本张
+            texture = nullptr;           // 置空：重复调用安全
+        }
+    }
+    for (SDL_Texture*& icon : m_spellIconTextures) // HUD 图标逐张
+    {
+        if (icon != nullptr) // 仅在持有纹理时销毁
+        {
+            SDL_DestroyTexture(icon); // 释放本张
+            icon = nullptr;           // 置空：重复调用安全
+        }
     }
 }
 
@@ -248,6 +272,68 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
             // 素材缺失/解码失败：警告后继续（命中少了爪痕，游戏照常可玩）
             SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                         "加载命中特效素材 %s 失败（%s），命中特效将跳过", hitFxPath.c_str(), SDL_GetError());
+        }
+    }
+
+    // 7.6) 法术素材（批五B，可选增强）：六张特效贴图（火球/冰环/闪电/
+    //      治疗光/光环/护盾罩）+ 六张 HUD 图标——与 alert/hit_fx 同一
+    //      加载模式（IMG_LoadTexture + 最近邻采样），逐张失败只警告、
+    //      对应表现跳过（法术结算照常进行，只是没有画面）。下标与
+    //      SpellId 一一对应；文件名表的下标顺序必须与枚举一致
+    if (basePath != nullptr)
+    {
+        // 特效贴图文件名（不含扩展名；下标 = SpellId）
+        static constexpr const char* kSpellTextureNames[kSpellCount] = {
+            "spell_fireball",       // 火球术：火球弹体（也用其放大做爆炸）
+            "spell_frost_nova",     // 冰霜新星：冰环
+            "spell_chain_lightning",// 闪电链：端点电花（折线由代码绘制）
+            "spell_heal",           // 治疗之光：金色十字光
+            "spell_burn_aura",      // 灼烧光环：火色圆环
+            "spell_shield",         // 护盾术：蓝色圆罩
+        };
+        // HUD 图标文件名（不含扩展名；下标 = SpellId）
+        static constexpr const char* kSpellIconNames[kSpellCount] = {
+            "icon_fireball",        // 火球术图标
+            "icon_frost_nova",      // 冰霜新星图标
+            "icon_chain_lightning", // 闪电链图标
+            "icon_heal",            // 治疗之光图标
+            "icon_burn_aura",       // 灼烧光环图标
+            "icon_shield",          // 护盾术图标
+        };
+
+        for (int i = 0; i < kSpellCount; ++i) // 逐法术加载两张（特效 + 图标）
+        {
+            // 特效贴图：绝对路径 -> 解码 -> 纹理（并设最近邻采样）
+            const std::string texturePath =
+                std::string(basePath) + "assets/" + kSpellTextureNames[i] + ".png"; // 素材绝对路径
+            m_spellTextures[i] = IMG_LoadTexture(m_renderer, texturePath.c_str()); // 读文件 -> 纹理
+            if (m_spellTextures[i] != nullptr)
+            {
+                SDL_SetTextureScaleMode(m_spellTextures[i], SDL_SCALEMODE_NEAREST); // 像素风：最近邻
+            }
+            else
+            {
+                // 素材缺失/解码失败：警告后继续（该法术特效跳过，结算照常）
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "加载法术素材 %s 失败（%s），对应特效将跳过",
+                            texturePath.c_str(), SDL_GetError());
+            }
+
+            // HUD 图标：同一加载路径（小图；失败只影响图标行的这一枚）
+            const std::string iconPath =
+                std::string(basePath) + "assets/" + kSpellIconNames[i] + ".png"; // 图标绝对路径
+            m_spellIconTextures[i] = IMG_LoadTexture(m_renderer, iconPath.c_str()); // 读文件 -> 纹理
+            if (m_spellIconTextures[i] != nullptr)
+            {
+                SDL_SetTextureScaleMode(m_spellIconTextures[i], SDL_SCALEMODE_NEAREST); // 最近邻
+            }
+            else
+            {
+                // 图标缺失：警告后继续（该枚图标不绘制）
+                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                            "加载法术图标 %s 失败（%s），图标将跳过",
+                            iconPath.c_str(), SDL_GetError());
+            }
         }
     }
 
@@ -1112,46 +1198,72 @@ void PlayScene::update(const UpdateContext& ctx)
             // 进冷却）。批五A：静默保护——跳过即完全无反馈，不再有闪烁
             if (m_playerInvincibleLeft <= 0.0f)
             {
-                // 1) 扣生命（夹到 0：日志展示永远不为负）
-                m_playerHp = std::max(m_playerHp - m_monsterDamage, 0);
-                // 冒烟观测点：攻击命中（含变体名与扣血明细——断言点）
-                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                            "怪物攻击命中（%s，扣 %d 点生命，剩余 %d/%d）",
-                            monsterTypeName(monster.type()),
-                            m_monsterDamage, m_playerHp, m_playerMaxHp);
+                // 1) 先盾后血（批五B）：护盾点数先抵扣本次伤害，余量才进入
+                //    扣血；有吸收即打「护盾吸收」日志（冒烟断言点——先盾后血
+                //    的观测顺序：护盾吸收日志先于/取代 扣血日志）
+                int remainingDamage = m_monsterDamage; // 待结算伤害（先盾后血的中间量）
+                if (m_playerShield > 0 && remainingDamage > 0) // 有盾才走吸收
+                {
+                    const int absorbed = std::min(m_playerShield, remainingDamage); // 可吸收量（盾与伤害取小）
+                    m_playerShield -= absorbed;    // 护盾扣减
+                    remainingDamage -= absorbed;   // 伤害余量（余 0 = 全吸收）
+                    // 冒烟观测点：护盾吸收（吸收量/剩余护盾——先盾后血断言点）
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "护盾吸收（%d 点，剩余护盾 %d）", absorbed, m_playerShield);
+                }
 
-                // 2) 打击音效（低频闷响）：受击反馈的听觉层（视觉 = 击退 + 红染）
-                m_audio->play(SoundId::Hit);
+                if (remainingDamage > 0) // 尚有伤害余量：走原扣血反馈链
+                {
+                    // 2) 扣生命（夹到 0：日志展示永远不为负；扣除量 = 余量）
+                    m_playerHp = std::max(m_playerHp - remainingDamage, 0);
+                    // 冒烟观测点：攻击命中（含变体名与扣血明细——断言点）
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "怪物攻击命中（%s，扣 %d 点生命，剩余 %d/%d）",
+                                monsterTypeName(monster.type()),
+                                remainingDamage, m_playerHp, m_playerMaxHp);
 
-                // 3) 玩家无敌：从下一步起攻击结算跳过（批五A：静默——无任何闪烁）
-                m_playerInvincibleLeft = kPlayerInvincibleSeconds;
+                    // 3) 打击音效（低频闷响）：受击反馈的听觉层（视觉 = 击退 + 红染）
+                    m_audio->play(SoundId::Hit);
 
-                // 4) 玩家受击击退 + 红染（批五A）：沿「怪物中心 -> 玩家中心」
-                //    方向被推开（初速 480px/s 指数衰减、约 42px / 0.18s，
-                //    期间输入被抑制；位移走碰撞滑动不穿墙）。怪物中心取
-                //    「回弹之前」的本步位置——打击来源的真实落点
-                const SDL_FRect monsterCol = monster.collisionRect();              // 怪物脚盒（本步位置）
-                const float monsterCenterX = monsterCol.x + monsterCol.w * 0.5f;   // 怪物盒中心 x
-                const float monsterCenterY = monsterCol.y + monsterCol.h * 0.5f;   // 怪物盒中心 y
-                m_player.applyHitKnockback(monsterCenterX, monsterCenterY);        // 以怪物为来源推开玩家
+                    // 4) 玩家无敌：从下一步起攻击结算跳过（批五A：静默——无任何闪烁）
+                    m_playerInvincibleLeft = kPlayerInvincibleSeconds;
 
-                // 5) 玩家盒中心快照（以下两处消费：特效中点与回弹方向）——
-                //    都取「命中瞬间」的接触口径（回弹瞬移之后位置已变）
-                const float playerCenterX = playerBox.x + playerBox.w * 0.5f; // 玩家盒中心 x
-                const float playerCenterY = playerBox.y + playerBox.h * 0.5f; // 玩家盒中心 y
+                    // 5) 玩家受击击退 + 红染（批五A）：沿「怪物中心 -> 玩家中心」
+                    //    方向被推开（初速 480px/s 指数衰减、约 42px / 0.18s，
+                    //    期间输入被抑制；位移走碰撞滑动不穿墙）。怪物中心取
+                    //    「回弹之前」的本步位置——打击来源的真实落点
+                    const SDL_FRect monsterCol = monster.collisionRect();              // 怪物脚盒（本步位置）
+                    const float monsterCenterX = monsterCol.x + monsterCol.w * 0.5f;   // 怪物盒中心 x
+                    const float monsterCenterY = monsterCol.y + monsterCol.h * 0.5f;   // 怪物盒中心 y
+                    m_player.applyHitKnockback(monsterCenterX, monsterCenterY);        // 以怪物为来源推开玩家
 
-                // 6) 接触点命中特效（批五A）：爪痕/爆点在双方中心的中点浮现
-                //    （接触处的近似——贴身对碰时中点即接触带），0.15s 渐隐
-                spawnMonsterHitFx((playerCenterX + monsterCenterX) * 0.5f,
-                                  (playerCenterY + monsterCenterY) * 0.5f);
+                    // 6) 玩家盒中心快照（以下两处消费：特效中点与回弹方向）——
+                    //    都取「命中瞬间」的接触口径（回弹瞬移之后位置已变）
+                    const float playerCenterX = playerBox.x + playerBox.w * 0.5f; // 玩家盒中心 x
+                    const float playerCenterY = playerBox.y + playerBox.h * 0.5f; // 玩家盒中心 y
 
-                // 7) 怪物小幅回弹（约 40px；批四口径）：沿「玩家盒中心 ->
-                //    怪物中心」方向瞬移；knockback 内部做世界可走校验
-                //    （被墙挡逐级缩短）并快照防拉丝
-                monster.knockback(playerCenterX, playerCenterY,
-                                  Monster::kAttackRecoilDistance);
+                    // 7) 接触点命中特效（批五A）：爪痕/爆点在双方中心的中点浮现
+                    //    （接触处的近似——贴身对碰时中点即接触带），0.15s 渐隐
+                    spawnMonsterHitFx((playerCenterX + monsterCenterX) * 0.5f,
+                                      (playerCenterY + monsterCenterY) * 0.5f);
 
-                // 8) 生命归零：本步提前结束怪物遍历（GameOver 由循环后的
+                    // 8) 怪物小幅回弹（约 40px；批四口径）：沿「玩家盒中心 ->
+                    //    怪物中心」方向瞬移；knockback 内部做世界可走校验
+                    //    （被墙挡逐级缩短）并快照防拉丝
+                    monster.knockback(playerCenterX, playerCenterY,
+                                      Monster::kAttackRecoilDistance);
+                }
+                else
+                {
+                    // 全吸收（护盾挡下全部伤害）：无敌照常给（受击保护窗口
+                    // 与有伤一致），播打击音效；因为没有实际扣血，红染/击退/
+                    // 爪痕特效都不发生——「挡下了」的可读反馈由 HUD 护盾
+                    // 数字回退与「护盾吸收」日志承担（护盾罩视觉常驻）
+                    m_audio->play(SoundId::Hit); // 打击音效照旧（有打击感）
+                    m_playerInvincibleLeft = kPlayerInvincibleSeconds; // 保护窗口照旧
+                }
+
+                // 9) 生命归零：本步提前结束怪物遍历（GameOver 由循环后的
                 //    统一检查收口；后续怪物不再留下会结算的 Hit）
                 if (m_playerHp <= 0)
                 {
@@ -1160,6 +1272,11 @@ void PlayScene::update(const UpdateContext& ctx)
             }
         }
     }
+
+    // 法术自动施法（批五B）：仅 Playing 分支走到这里；各自冷却独立、
+    // 无需按键，与横扫互不打断（独立的索敌/结算/特效链）。时机选在
+    // 怪物更新之后：火球碰撞、光环/新星的范围判定都用本步怪物的最新位置
+    updateSpells(ctx, playerBox);
 
     // ---- 体积碰撞收尾（批四）----
     // 1) 兜底分离：任何来源产生的「怪物与玩家重叠」（正常热更顺序之外——
@@ -1437,18 +1554,10 @@ void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
 
         if (died)
         {
-            // 击杀结算：计数 +1、原地掉落经验宝石与金币（批三双掉落）。
-            // 金币数按变体查表（史莱姆 1 / 哥布林 2 / 骷髅 1）
-            ++m_killCount; // 本局击杀 +1（HUD/结算使用）
-            dropGemAt(monsterCenterX, monsterCenterY);           // 掉落宝石：坐标即怪物中心
-            const int coinCount = monster.coinDrop();            // 本变体的金币掉落数
-            dropCoinsAt(monsterCenterX, monsterCenterY, coinCount); // 掉落金币（散开可见）
-
-            // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
-            // 冒烟观测点：金币掉落日志（数量按变体——冒烟对照断言用）
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "金币掉落（%d 枚，%s）", coinCount, monsterTypeName(monster.type()));
+            // 击杀结算（批五B 起抽为公共函数 resolveMonsterDeath——法术
+            // 伤害致死走同一份：击杀计数 +1、原地掉落经验宝石与金币、
+            // 「击杀怪物」与「金币掉落」两条冒烟日志）
+            resolveMonsterDeath(monster, monsterCenterX, monsterCenterY);
         }
         else
         {
@@ -1550,6 +1659,861 @@ void PlayScene::spawnMonsterHitFx(float centerX, float centerY)
     // 「怪物攻击命中」日志同一步产生）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "命中特效（爪痕，位置 %.1f,%.1f）", centerX, centerY);
+}
+
+// ============================================================
+// 法术（批五B：六法术、自动施法、特效）
+// ============================================================
+
+namespace
+{
+// 法术冷却总时长（秒；HUD 冷却条归一化的分母——与施法重置同一公式）。
+// 按法术分发到 Spell.h 的各参数函数；未知 id 返回 1（防御，绝不让
+// 除零发生在渲染路径）
+float spellCooldownSeconds(SpellId id, int level)
+{
+    switch (id) // 按法术分发（每一项与 Spell.h 的参数函数一一对应）
+    {
+    case SpellId::Fireball:      return spellFireballCooldown(level); // 火球：2.0 -> 1.2
+    case SpellId::FrostNova:     return spellFrostNovaCooldown(level); // 冰环：5.0 -> 3.0
+    case SpellId::ChainLightning: return spellChainCooldown(level);   // 闪电：3.0 -> 2.0
+    case SpellId::HolyHeal:      return spellHealCooldown(level);     // 治疗：6.0 -> 4.0
+    case SpellId::BurnAura:      return kSpellAuraTickSeconds;        // 光环：tick 间隔 0.5s
+    case SpellId::Shield:        return spellShieldCooldown(level);   // 护盾：8.0 -> 6.0
+    default:                     return 1.0f;                         // 防御：异常 id 的分母
+    }
+}
+} // 匿名命名空间结束
+
+// 法术自动施法总入口（契约见头文件）：冷却递减 -> 特效计时 -> 火球推进
+// 与命中爆炸 -> 各法术独立尝试 -> 光环 tick
+void PlayScene::updateSpells(const UpdateContext& ctx, const SDL_FRect& playerBox)
+{
+    // 玩家中心（施法原点）：火球发射点、冰环圆心；与横扫的圆心同一快照口径
+    const float playerCenterX = playerBox.x + playerBox.w * 0.5f; // 玩家盒中心 x
+    const float playerCenterY = playerBox.y + playerBox.h * 0.5f; // 玩家盒中心 y
+
+    // ---- 1) 冷却统一递减（仅 Playing 走到这里；暂停/商店/升级时冻结）----
+    for (int i = 0; i < kSpellCount; ++i) // 逐法术递减
+    {
+        if (m_spellCooldownLeft[i] > 0.0f) // 有剩余冷却才动
+        {
+            m_spellCooldownLeft[i] = std::max(m_spellCooldownLeft[i] - ctx.deltaTime, 0.0f); // 递减并夹 0
+        }
+    }
+
+    // ---- 2) 特效计时递减与清理（与飘字/命中特效同款：寿命归零即移除）----
+    for (FireballBlastFx& fx : m_fireballBlasts) // 火球爆炸
+    {
+        fx.left = std::max(fx.left - ctx.deltaTime, 0.0f); // 递减并夹 0
+    }
+    std::erase_if(m_fireballBlasts, [](const FireballBlastFx& fx) { return fx.left <= 0.0f; }); // 移除到期
+    for (FrostNovaFx& fx : m_frostNovas) // 冰环
+    {
+        fx.left = std::max(fx.left - ctx.deltaTime, 0.0f); // 递减并夹 0
+    }
+    std::erase_if(m_frostNovas, [](const FrostNovaFx& fx) { return fx.left <= 0.0f; }); // 移除到期
+    for (ChainBoltFx& fx : m_chainBolts) // 闪电链
+    {
+        fx.left = std::max(fx.left - ctx.deltaTime, 0.0f); // 递减并夹 0
+    }
+    std::erase_if(m_chainBolts, [](const ChainBoltFx& fx) { return fx.left <= 0.0f; }); // 移除到期
+    for (HealFx& fx : m_healFxs) // 治疗光
+    {
+        fx.left = std::max(fx.left - ctx.deltaTime, 0.0f); // 递减并夹 0
+    }
+    std::erase_if(m_healFxs, [](const HealFx& fx) { return fx.left <= 0.0f; }); // 移除到期
+
+    // ---- 3) 火球推进与命中/到期爆炸（先推进已有火球——本步新发射的
+    //         从下一步起飞；步长 1/120s x 420px/s ≈ 3.5px 不会穿漏 24px 弹体盒）----
+    for (auto it = m_fireballs.begin(); it != m_fireballs.end(); ) // 手动迭代（命中即删）
+    {
+        Fireball& fireball = *it; // 本颗引用
+        fireball.x += fireball.dirX * fireball.speed * ctx.deltaTime; // 直线飞行 x
+        fireball.y += fireball.dirY * fireball.speed * ctx.deltaTime; // 直线飞行 y
+        fireball.rotation += kFireballSpinDegrees * ctx.deltaTime;    // 飞旋相位推进
+        fireball.lifeLeft -= ctx.deltaTime;                           // 寿命递减
+
+        // 命中判定：弹体盒 vs 每只「存活且激活」怪物的脚盒（激活过滤：
+        // 不打扰冻结区的怪物——与其它玩法门控一致）
+        const SDL_FRect fireballBox{ fireball.x - kFireballHitBoxSize * 0.5f, // 弹体盒左
+                                     fireball.y - kFireballHitBoxSize * 0.5f, // 弹体盒上
+                                     kFireballHitBoxSize,                     // 宽
+                                     kFireballHitBoxSize };                   // 高
+        bool hit = false; // 本步是否撞到怪物
+        for (const Monster& monster : m_monsters) // 逐只扫描
+        {
+            if (!monster.isAlive()) // 空槽位跳过
+            {
+                continue;
+            }
+            const SDL_FRect monsterCol = monster.collisionRect(); // 怪物脚盒（物理口径）
+            if (!m_world.isPointInActiveChunks(monsterCol.x + monsterCol.w * 0.5f, // 非激活区：
+                                               monsterCol.y + monsterCol.h * 0.5f)) // 不参与命中
+            {
+                continue; // 火球穿过冻结区的怪不会伤到它
+            }
+            if (rectsOverlap(fireballBox, monsterCol)) // 相交即命中
+            {
+                hit = true; // 标记命中
+                break;      // 本颗至多爆一次
+            }
+        }
+
+        if (hit || fireball.lifeLeft <= 0.0f) // 命中或到期：爆炸并移除
+        {
+            explodeFireball(fireball);     // 结算伤害 + 特效（内部实现）
+            it = m_fireballs.erase(it);    // 移除本颗（erase 返回下一位置）
+        }
+        else // 仍飞行中
+        {
+            ++it; // 推进迭代器
+        }
+    }
+
+    // ---- 4) 各法术按「层数 > 0 且冷却就绪」独立尝试（无需按键）----
+    // 条件不满足（无目标/满血/满盾/圈内无敌人）时静默等待且不重置冷却——
+    // 条件满足的下一步立即施放（「有敌人就射、满血不浪费」的自动语义）
+
+    // 火球术：向最近敌发射
+    if (m_spellLevels[static_cast<int>(SpellId::Fireball)] > 0 &&
+        m_spellCooldownLeft[static_cast<int>(SpellId::Fireball)] <= 0.0f)
+    {
+        castFireball(playerBox); // 无目标时内部静默返回
+    }
+
+    // 冰霜新星：范围伤害 + 减速
+    if (m_spellLevels[static_cast<int>(SpellId::FrostNova)] > 0 &&
+        m_spellCooldownLeft[static_cast<int>(SpellId::FrostNova)] <= 0.0f)
+    {
+        castFrostNova(playerBox); // 圈内无敌人时内部静默返回
+    }
+
+    // 闪电链：随机首击 + 跳跃
+    if (m_spellLevels[static_cast<int>(SpellId::ChainLightning)] > 0 &&
+        m_spellCooldownLeft[static_cast<int>(SpellId::ChainLightning)] <= 0.0f)
+    {
+        castChainLightning(playerBox); // 无目标时内部静默返回
+    }
+
+    // 治疗之光：周期回血（满血不施放）
+    if (m_spellLevels[static_cast<int>(SpellId::HolyHeal)] > 0 &&
+        m_spellCooldownLeft[static_cast<int>(SpellId::HolyHeal)] <= 0.0f)
+    {
+        castHolyHeal(); // 满血时内部静默返回
+    }
+
+    // 灼烧光环：每 0.5s 一跳（圈内无敌人不跳）
+    if (m_spellLevels[static_cast<int>(SpellId::BurnAura)] > 0 &&
+        m_spellCooldownLeft[static_cast<int>(SpellId::BurnAura)] <= 0.0f)
+    {
+        tickBurnAura(playerBox); // 无敌人时内部静默返回（冷却保持 0）
+    }
+
+    // 护盾术：周期获得护盾（满盾不施放）
+    if (m_spellLevels[static_cast<int>(SpellId::Shield)] > 0 &&
+        m_spellCooldownLeft[static_cast<int>(SpellId::Shield)] <= 0.0f)
+    {
+        castShield(); // 满盾时内部静默返回
+    }
+}
+
+// 最近敌人查询（契约见头文件）：火球发射与闪电链跳跃共用的索敌
+int PlayScene::findNearestMonster(float centerX, float centerY, float radius,
+                                  const bool* exclude) const
+{
+    int best = -1;                      // 最近怪下标（-1 = 无）
+    float bestDistSq = radius * radius; // 搜索半径的平方（含边界——`<=` 语义）
+    for (size_t i = 0; i < m_monsters.size(); ++i) // 全池扫描（<= 12 槽位）
+    {
+        if (exclude != nullptr && exclude[i]) // 排除项（闪电链防回跳）
+        {
+            continue; // 跳过本槽位
+        }
+        const Monster& monster = m_monsters[i]; // 本槽位引用
+        if (!monster.isAlive()) // 空槽位跳过
+        {
+            continue;
+        }
+        const SDL_FRect rect = monster.rect(); // 本步矩形（中心口径）
+        const float monsterCenterX = rect.x + rect.w * 0.5f; // 中心 x
+        const float monsterCenterY = rect.y + rect.h * 0.5f; // 中心 y
+        if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY)) // 非激活区：
+        {
+            continue; // 不打扰冻结区的怪（火球/闪电都不锁它）
+        }
+        const float dx = monsterCenterX - centerX; // 横差
+        const float dy = monsterCenterY - centerY; // 纵差
+        const float distSq = dx * dx + dy * dy;    // 距离平方（省开方）
+        if (distSq <= bestDistSq) // 更近或恰好相等（后者取后出现者——确定性）
+        {
+            best = static_cast<int>(i); // 记录更好候选
+            bestDistSq = distSq;        // 收紧上界
+        }
+    }
+    return best; // 最近怪下标或 -1
+}
+
+// 公共死亡结算（横扫与法术共用；契约见头文件）：文案与批三/批四完全一致
+void PlayScene::resolveMonsterDeath(Monster& monster, float centerX, float centerY)
+{
+    // 击杀结算：计数 +1、原地掉落经验宝石与金币（批三双掉落）。
+    // 金币数按变体查表（史莱姆 1 / 哥布林 2 / 骷髅 1）
+    ++m_killCount; // 本局击杀 +1（HUD/结算使用）
+    dropGemAt(centerX, centerY);              // 掉落宝石：坐标即怪物中心
+    const int coinCount = monster.coinDrop(); // 本变体的金币掉落数
+    dropCoinsAt(centerX, centerY, coinCount); // 掉落金币（散开可见）
+
+    // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
+    // 冒烟观测点：金币掉落日志（数量按变体——冒烟对照断言用）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "金币掉落（%d 枚，%s）", coinCount, monsterTypeName(monster.type()));
+}
+
+// 法术伤害结算（契约见头文件）：与横扫结算同款但飘字颜色区分、不带击退
+void PlayScene::damageMonsterBySpell(Monster& monster, int damage, float centerX, float centerY)
+{
+    const bool died = monster.takeDamage(damage); // 扣血 + 红染（takeDamage 内置）
+
+    // 伤害飘字：浅蓝色（与横扫的白色区分来源——一眼分辨「法术也在打」）
+    char damageText[32]; // 容纳 "-" + 最长伤害数字，绰绰有余
+    SDL_snprintf(damageText, sizeof(damageText), "-%d", damage); // 格式化伤害文本
+    spawnFloatingText(damageText, centerX, centerY - 20.0f,
+                      SDL_Color{ 180, 210, 255, 255 }); // 浅蓝：法术伤害
+
+    if (died) // 致死：走公共死亡结算（击杀/掉落/日志与横扫同款）
+    {
+        resolveMonsterDeath(monster, centerX, centerY);
+    }
+}
+
+// 火球术施放（契约见头文件）：找最近敌 -> 锁定方向发射 -> 重置冷却
+void PlayScene::castFireball(const SDL_FRect& playerBox)
+{
+    const int spellIndex = static_cast<int>(SpellId::Fireball); // 冷却数组下标
+    const int level = m_spellLevels[spellIndex];                // 当前层数（>=1，调用方保证）
+    const float centerX = playerBox.x + playerBox.w * 0.5f;     // 玩家盒中心 x（发射点）
+    const float centerY = playerBox.y + playerBox.h * 0.5f;     // 玩家盒中心 y
+
+    // 最近敌人（搜索半径、仅激活区）：无目标不施放（冷却不重置——
+    // 敌人出现的下一步立即发射）
+    const int target = findNearestMonster(centerX, centerY,
+                                          kSpellFireballSearchRadius, nullptr);
+    if (target < 0) // 半径内无敌人
+    {
+        return; // 静默等待（冷却保持 0）
+    }
+
+    // 发射方向 = 玩家中心 -> 目标中心（发射瞬间锁定——之后不追踪）
+    const SDL_FRect targetRect = m_monsters[static_cast<size_t>(target)].rect(); // 目标矩形
+    float dirX = targetRect.x + targetRect.w * 0.5f - centerX; // 方向分量 x
+    float dirY = targetRect.y + targetRect.h * 0.5f - centerY; // 方向分量 y
+    const float length = std::sqrt(dirX * dirX + dirY * dirY); // 方向长度
+    if (length > kAimEpsilonSquared) // 非零向量：归一化
+    {
+        dirX /= length; // 单位化 x
+        dirY /= length; // 单位化 y
+    }
+    else // 零向量（理论不可达——目标距离 > 0）：朝右的确定性方向
+    {
+        dirX = 1.0f; // 固定朝右
+        dirY = 0.0f; // 无纵向分量
+    }
+
+    // 火球入列：伤害/爆炸半径按层数快照（发射后层数变化不影响在飞的弹体）
+    Fireball fireball;                                       // 新火球（默认值 + 逐字段写）
+    fireball.x = centerX;                                    // 发射点 x
+    fireball.y = centerY;                                    // 发射点 y
+    fireball.dirX = dirX;                                    // 锁定方向 x
+    fireball.dirY = dirY;                                    // 锁定方向 y
+    fireball.speed = kSpellFireballSpeed;                    // 飞行速度（常量）
+    fireball.lifeLeft = kSpellFireballLifeSeconds;           // 寿命置满（到点自爆）
+    fireball.rotation = 0.0f;                                // 飞旋相位从 0 起
+    fireball.damage = spellFireballDamage(level);            // 伤害快照（层数公式）
+    fireball.blastRadius = spellFireballBlastRadius(level);  // 爆炸半径快照（同上）
+    m_fireballs.push_back(fireball);                         // 入列（下一步起飞行）
+
+    // 冷却重置（施放成功的唯一时刻——条件分支都在上面提前返回了）
+    m_spellCooldownLeft[spellIndex] = spellFireballCooldown(level);
+
+    // 冒烟观测点：施法日志（规格「施法：火球术」——自动化测试断言点）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "施法：火球术");
+}
+
+// 火球爆炸结算（契约见头文件）：半径内全额伤害 + 爆炸特效 + 日志
+void PlayScene::explodeFireball(const Fireball& fireball)
+{
+    // 爆炸伤害：半径内「存活且激活」的怪物全额结算（无距离衰减——
+    // 规格只要求「命中爆炸」；简单口径便于对表与断言）
+    int hitCount = 0; // 命中数（日志/断言用）
+    for (Monster& monster : m_monsters) // 逐只扫描（池 <= 12）
+    {
+        if (!monster.isAlive()) // 空槽位跳过
+        {
+            continue;
+        }
+        const SDL_FRect rect = monster.rect();                 // 本步矩形
+        const float monsterCenterX = rect.x + rect.w * 0.5f;   // 中心 x
+        const float monsterCenterY = rect.y + rect.h * 0.5f;   // 中心 y
+        if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY)) // 非激活区不结算
+        {
+            continue; // 与索敌同一门控
+        }
+        const float dx = monsterCenterX - fireball.x; // 与爆炸中心横差
+        const float dy = monsterCenterY - fireball.y; // 纵差
+        if (dx * dx + dy * dy > fireball.blastRadius * fireball.blastRadius) // 半径外
+        {
+            continue; // 不结算
+        }
+        damageMonsterBySpell(monster, fireball.damage, monsterCenterX, monsterCenterY); // 全额伤害
+        ++hitCount; // 命中计数 +1
+    }
+
+    // 爆炸特效入列（火球贴图放大 + 淡出）
+    m_fireballBlasts.emplace_back();            // 原位构造（vector 元素为纯数据，扩容搬移安全）
+    FireballBlastFx& fx = m_fireballBlasts.back(); // 引用新特效
+    fx.x = fireball.x;                          // 爆炸中心 x
+    fx.y = fireball.y;                          // 爆炸中心 y
+    fx.radius = fireball.blastRadius;           // 绘制半径（渲染时 x2 为直径）
+    fx.left = kFireballBlastFxSeconds;          // 寿命置满（0.3s 渐隐）
+
+    // 冒烟观测点：火球爆炸（命中数——冒烟断言「飞行 -> 爆炸」链路）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "火球爆炸（命中 %d）", hitCount);
+}
+
+// 冰霜新星施放（契约见头文件）：半径内伤害 + 减速 + 冰环特效
+void PlayScene::castFrostNova(const SDL_FRect& playerBox)
+{
+    const int spellIndex = static_cast<int>(SpellId::FrostNova); // 冷却数组下标
+    const int level = m_spellLevels[spellIndex];                 // 当前层数（>=1）
+    const float centerX = playerBox.x + playerBox.w * 0.5f;      // 冰环圆心 x（玩家）
+    const float centerY = playerBox.y + playerBox.h * 0.5f;      // 冰环圆心 y
+    const float radius = spellFrostNovaRadius(level);            // 判定半径（层数公式）
+    const int damage = spellFrostNovaDamage(level);              // 伤害（层数公式）
+    const float slowSeconds = spellFrostNovaSlowSeconds(level);  // 减速时长（层数公式）
+
+    // 范围伤害 + 减速：半径内「存活且激活」的怪物逐只结算
+    int hitCount = 0; // 命中数
+    for (Monster& monster : m_monsters) // 逐只扫描
+    {
+        if (!monster.isAlive()) // 空槽位跳过
+        {
+            continue;
+        }
+        const SDL_FRect rect = monster.rect();               // 本步矩形
+        const float monsterCenterX = rect.x + rect.w * 0.5f; // 中心 x
+        const float monsterCenterY = rect.y + rect.h * 0.5f; // 中心 y
+        if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY)) // 非激活区不结算
+        {
+            continue; // 与索敌同一门控
+        }
+        const float dx = monsterCenterX - centerX; // 与圆心的横差
+        const float dy = monsterCenterY - centerY; // 纵差
+        if (dx * dx + dy * dy > radius * radius) // 半径外
+        {
+            continue; // 不结算
+        }
+        damageMonsterBySpell(monster, damage, monsterCenterX, monsterCenterY); // 范围伤害（可能致死）
+        if (monster.isAlive()) // 未死才减速（已死的对象已退场，无需减速状态）
+        {
+            monster.applySlow(kSpellFrostSlowFactor, slowSeconds); // 速度乘区 x0.5 持续数秒
+        }
+        ++hitCount; // 命中计数 +1
+    }
+
+    if (hitCount == 0) // 圈内无敌人：不施放（冷却不重置——有敌立即爆）
+    {
+        return; // 静默等待
+    }
+
+    // 冰环特效入列（贴图展开 + 淡出）
+    m_frostNovas.emplace_back();        // 原位构造
+    FrostNovaFx& fx = m_frostNovas.back(); // 引用新特效
+    fx.x = centerX;                     // 圆心 x
+    fx.y = centerY;                     // 圆心 y
+    fx.radius = radius;                 // 判定半径（渲染按它算直径）
+    fx.left = kFrostNovaFxSeconds;      // 寿命置满（0.35s 展开淡出）
+
+    // 冷却重置 + 日志（命中数——冒烟断言点）
+    m_spellCooldownLeft[spellIndex] = spellFrostNovaCooldown(level);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "施法：冰霜新星（命中 %d 敌）", hitCount);
+}
+
+// 闪电链施放（契约见头文件）：随机首击 -> 最近跳 -> 路径特效
+void PlayScene::castChainLightning(const SDL_FRect& playerBox)
+{
+    const int spellIndex = static_cast<int>(SpellId::ChainLightning); // 冷却数组下标
+    const int level = m_spellLevels[spellIndex];                      // 当前层数（>=1）
+    const float centerX = playerBox.x + playerBox.w * 0.5f;           // 施法原点 x（玩家）
+    const float centerY = playerBox.y + playerBox.h * 0.5f;           // 施法原点 y
+    const int damage = spellChainDamage(level);                       // 每跳伤害（层数公式）
+    const int maxHits = spellChainHits(level);                        // 总命中次数（层数公式）
+
+    // 首目标池：首击半径内「存活且激活」的怪物下标集合（规格「随机敌」）
+    int candidates[kMonsterPoolSize] = {}; // 候选槽位下标（池上限 12——定长足够）
+    int candidateCount = 0;                // 候选数
+    for (size_t i = 0; i < m_monsters.size(); ++i) // 全池扫描
+    {
+        const Monster& monster = m_monsters[i]; // 本槽位引用
+        if (!monster.isAlive()) // 空槽位跳过
+        {
+            continue;
+        }
+        const SDL_FRect rect = monster.rect();               // 本步矩形
+        const float monsterCenterX = rect.x + rect.w * 0.5f; // 中心 x
+        const float monsterCenterY = rect.y + rect.h * 0.5f; // 中心 y
+        if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY)) // 非激活区跳过
+        {
+            continue; // 与索敌同一门控
+        }
+        const float dx = monsterCenterX - centerX; // 与原点横差
+        const float dy = monsterCenterY - centerY; // 纵差
+        if (dx * dx + dy * dy > kSpellChainSearchRadius * kSpellChainSearchRadius) // 首击半径外
+        {
+            continue; // 不入首目标池
+        }
+        candidates[candidateCount] = static_cast<int>(i); // 记录候选
+        ++candidateCount;                                 // 候选数 +1
+    }
+    if (candidateCount == 0) // 无目标：不施放（冷却不重置）
+    {
+        return; // 静默等待
+    }
+
+    // 首目标：候选池中等概率随机取一（SDL_rand 上界 = 候选数）
+    int current = candidates[SDL_rand(candidateCount)]; // 当前跳目标槽位
+
+    // 逐跳链式：每跳命中一只；下一跳 = 本跳落点跳跃半径内最近的未命中怪。
+    // 跳跃取「最近」而非随机：链的走向直观可预期（首击才是随机的）
+    bool visited[kMonsterPoolSize] = {}; // 已命中槽位表（防回跳/重复——与池同尺寸）
+    SDL_FPoint path[8] = {};             // 折线路径（1 起点 + 最多 6 跳 = 7 点；8 留余量）
+    int pathCount = 0;                   // 路径点数
+    path[pathCount].x = centerX;         // 起点 = 玩家中心 x
+    path[pathCount].y = centerY;         // 起点 = 玩家中心 y
+    ++pathCount;                         // 点数 +1
+    int hits = 0;                        // 已命中数（= 实际跳数）
+    while (hits < maxHits && current >= 0) // 跳数未满且链上还有目标
+    {
+        Monster& monster = m_monsters[static_cast<size_t>(current)]; // 本跳目标
+        if (!monster.isAlive()) // 防御：目标已退场（理论不可达——每目标只跳一次）
+        {
+            break; // 链终止
+        }
+        visited[current] = true; // 标记已命中（下一跳的排除项）
+
+        const SDL_FRect rect = monster.rect();               // 本步矩形
+        const float monsterCenterX = rect.x + rect.w * 0.5f; // 中心 x
+        const float monsterCenterY = rect.y + rect.h * 0.5f; // 中心 y
+        path[pathCount].x = monsterCenterX;                  // 落点入路径 x
+        path[pathCount].y = monsterCenterY;                  // 落点入路径 y
+        ++pathCount;                                         // 点数 +1（<= 7，数组 8 安全）
+
+        damageMonsterBySpell(monster, damage, monsterCenterX, monsterCenterY); // 本跳伤害
+        ++hits; // 命中数 +1
+        if (hits >= maxHits) // 跳数用完：链结束
+        {
+            break; // 退出循环
+        }
+
+        // 下一跳：以本跳落点为心、跳跃半径内最近的未命中怪（findNearest 的
+        // 排除表传 visited——不回跳已命中的目标）
+        current = findNearestMonster(monsterCenterX, monsterCenterY,
+                                     kSpellChainJumpRadius, visited);
+        // current = -1 时循环条件自然终止——按实际跳数结束
+    }
+
+    if (hits == 0) // 防御：理论不可达（首目标已确认存活）
+    {
+        return; // 不结算冷却
+    }
+
+    // 闪电特效入列（折线路径 + 端点电花；折线锯齿在渲染时确定性生成）
+    m_chainBolts.emplace_back();        // 原位构造
+    ChainBoltFx& fx = m_chainBolts.back(); // 引用新特效
+    for (int i = 0; i < pathCount; ++i) // 路径点逐点拷贝
+    {
+        fx.points[i] = path[i]; // 点拷贝（结构为纯数据）
+    }
+    fx.count = pathCount;           // 有效点数
+    fx.left = kChainBoltFxSeconds;  // 寿命置满（0.25s 渐隐）
+
+    // 冷却重置 + 日志（跳数——冒烟断言点）
+    m_spellCooldownLeft[spellIndex] = spellChainCooldown(level);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "施法：闪电链（%d 跳）", hits);
+}
+
+// 治疗之光施放（契约见头文件）：满血不施放；不溢出上限地回血 + 光效
+void PlayScene::castHolyHeal()
+{
+    const int spellIndex = static_cast<int>(SpellId::HolyHeal); // 冷却数组下标
+    const int level = m_spellLevels[spellIndex];                // 当前层数（>=1）
+
+    if (m_playerHp >= m_playerMaxHp) // 满血：不施放（冷却保持 0——掉血立即回）
+    {
+        return; // 静默等待
+    }
+
+    const int amount = spellHealAmount(level); // 本层回复量（层数公式）
+    const int actual = std::min(amount, m_playerMaxHp - m_playerHp); // 实际回复（不溢出上限）
+    m_playerHp += actual; // 回血
+
+    // 治疗光特效入列（玩家头顶上浮 + 淡出）
+    const SDL_FRect playerRect = m_player.rect(); // 玩家当前矩形（施放瞬间位置）
+    m_healFxs.emplace_back();           // 原位构造
+    HealFx& fx = m_healFxs.back();      // 引用新特效
+    fx.x = playerRect.x + playerRect.w * 0.5f; // 起点 x = 玩家水平中心
+    fx.y = playerRect.y;                // 起点 y = 玩家头顶（渲染时向上漂浮）
+    fx.left = kHealFxSeconds;           // 寿命置满（0.6s 上浮淡出）
+
+    // 冷却重置 + 日志（实际回复量——冒烟断言点）
+    m_spellCooldownLeft[spellIndex] = spellHealCooldown(level);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "施法：治疗之光（回复 %d）", actual);
+}
+
+// 护盾术施放（契约见头文件）：满盾不施放；补满到本层上限
+void PlayScene::castShield()
+{
+    const int spellIndex = static_cast<int>(SpellId::Shield); // 冷却数组下标
+    const int level = m_spellLevels[spellIndex];              // 当前层数（>=1）
+    const int cap = spellShieldPoints(level); // 本层护盾上限（= 单次点数——层数公式）
+
+    if (m_playerShield >= cap) // 满盾：不施放（冷却保持 0——缺盾立即补）
+    {
+        return; // 静默等待
+    }
+
+    m_playerShield = cap; // 补满（上限即本层点数；护盾罩视觉随之变亮）
+
+    // 冷却重置 + 日志（当前护盾——冒烟断言点）
+    m_spellCooldownLeft[spellIndex] = spellShieldCooldown(level);
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "施法：护盾术（护盾 %d）", m_playerShield);
+}
+
+// 灼烧光环 tick（契约见头文件）：半径内每 0.5s 一跳；无敌人不跳
+void PlayScene::tickBurnAura(const SDL_FRect& playerBox)
+{
+    const int spellIndex = static_cast<int>(SpellId::BurnAura); // 冷却数组下标
+    const int level = m_spellLevels[spellIndex];                // 当前层数（>=1）
+    const float centerX = playerBox.x + playerBox.w * 0.5f;     // 光环圆心 x（玩家）
+    const float centerY = playerBox.y + playerBox.h * 0.5f;     // 光环圆心 y
+    const float radius = spellAuraRadius(level);                // 光环半径（层数公式）
+    const int damage = spellAuraTickDamage(level);              // 每跳伤害（层数公式）
+
+    // 半径内「存活且激活」的怪物逐只结算本跳
+    int hitCount = 0; // 命中数
+    for (Monster& monster : m_monsters) // 逐只扫描
+    {
+        if (!monster.isAlive()) // 空槽位跳过
+        {
+            continue;
+        }
+        const SDL_FRect rect = monster.rect();               // 本步矩形
+        const float monsterCenterX = rect.x + rect.w * 0.5f; // 中心 x
+        const float monsterCenterY = rect.y + rect.h * 0.5f; // 中心 y
+        if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY)) // 非激活区不结算
+        {
+            continue; // 与索敌同一门控
+        }
+        const float dx = monsterCenterX - centerX; // 与圆心横差
+        const float dy = monsterCenterY - centerY; // 纵差
+        if (dx * dx + dy * dy > radius * radius) // 半径外
+        {
+            continue; // 不结算
+        }
+        damageMonsterBySpell(monster, damage, monsterCenterX, monsterCenterY); // 本跳伤害
+        ++hitCount; // 命中计数 +1
+    }
+
+    if (hitCount == 0) // 圈内无敌人：不跳（冷却保持 0——敌人进圈立即跳）
+    {
+        return; // 静默等待
+    }
+
+    // 冷却重置为 tick 间隔 + 日志（命中数——冒烟断言点；有命中才打，
+    // 避免空转刷屏）
+    m_spellCooldownLeft[spellIndex] = kSpellAuraTickSeconds;
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "施法：灼烧光环（命中 %d 敌）", hitCount);
+}
+
+// 灼烧光环渲染（玩家绘制之前调用——地面层；契约见头文件）
+void PlayScene::renderBurnAuraFx(float alpha) const
+{
+    const int spellIndex = static_cast<int>(SpellId::BurnAura); // 贴图/层数下标
+    if (m_spellLevels[spellIndex] <= 0) // 未学：不画
+    {
+        return; // 空转
+    }
+    if (m_spellTextures[spellIndex] == nullptr) // 素材缺失：跳过表现
+    {
+        return; // 玩法照常
+    }
+
+    const float radius = spellAuraRadius(m_spellLevels[spellIndex]); // 当前判定半径
+    const float diameter = radius * 2.0f; // 绘制直径 = 判定直径（画到哪、烧到哪）
+    const SDL_FPoint center = m_player.interpolatedCenter(alpha); // 玩家插值中心（与玩家绘制同源）
+    const Vec2 screen = m_camera.worldToScreen(center.x, center.y); // 换算到屏幕
+
+    // 旋转相位：存活秒 x 角速度（冻结时 m_survivalSeconds 不动——画面静止）
+    const double angle = -static_cast<double>(kBurnAuraSpinDegrees) *
+                         static_cast<double>(m_survivalSeconds); // 弧度制负角（逆时针观感）
+    const SDL_FRect dst{ screen.x - diameter * 0.5f, // 以玩家为中心的绘制矩形
+                         screen.y - diameter * 0.5f,
+                         diameter, // 宽 = 直径（贴图 160 基准被缩放）
+                         diameter }; // 高 = 直径
+    SDL_SetTextureAlphaMod(m_spellTextures[spellIndex], 150); // 半透明（不遮角色本体）
+    SDL_RenderTextureRotated(m_renderer, m_spellTextures[spellIndex], nullptr, &dst,
+                             angle, nullptr, SDL_FLIP_NONE); // 旋转绘制（贴图绕中心转）
+    SDL_SetTextureAlphaMod(m_spellTextures[spellIndex], 255); // 还原不透明（防污染后续绘制）
+}
+
+// 护盾罩渲染（玩家绘制之后调用——罩在身上；契约见头文件）
+void PlayScene::renderShieldFx(float alpha) const
+{
+    const int spellIndex = static_cast<int>(SpellId::Shield); // 贴图/层数下标
+    if (m_playerShield <= 0) // 无护盾：不画
+    {
+        return; // 空转
+    }
+    if (m_spellTextures[spellIndex] == nullptr) // 素材缺失：跳过表现
+    {
+        return; // 玩法照常
+    }
+
+    const SDL_FPoint center = m_player.interpolatedCenter(alpha); // 玩家插值中心
+    const Vec2 screen = m_camera.worldToScreen(center.x, center.y); // 换算到屏幕
+
+    // 呼吸缩放：±4% 正弦（相位 = 存活秒——冻结时静止；幅度为可调常量）
+    const float breath = 1.0f + kShieldBreathScale *
+        std::sin(m_survivalSeconds * 6.283185307179586f * kShieldBreathHz); // 当前缩放系数
+    const float size = kShieldDrawSize * breath; // 当前绘制边长
+    const SDL_FRect dst{ screen.x - size * 0.5f, // 以玩家为中心绘制
+                         screen.y - size * 0.5f,
+                         size, // 宽 = 呼吸后的边长
+                         size }; // 高 = 同上
+    // 透明度：护盾越少越淡（满盾更「实」——受击后的视觉回退）
+    const int cap = spellShieldPoints(m_spellLevels[spellIndex]); // 本层护盾上限
+    const float ratio = (cap > 0) ? static_cast<float>(m_playerShield) / static_cast<float>(cap) : 1.0f; // 满盾比
+    SDL_SetTextureAlphaMod(m_spellTextures[spellIndex],
+                           static_cast<Uint8>(90.0f + 100.0f * ratio)); // 90~190 的透明度区间
+    SDL_RenderTexture(m_renderer, m_spellTextures[spellIndex], nullptr, &dst); // 整张居中绘制
+    SDL_SetTextureAlphaMod(m_spellTextures[spellIndex], 255); // 还原不透明（防污染后续绘制）
+}
+
+// 法术世界层特效渲染（火球/爆炸/冰环/闪电/治疗；契约见头文件）
+void PlayScene::renderSpellFx() const
+{
+    // ---- 火球（飞旋绘制；同一贴图兼做爆炸）----
+    const int fireballTex = static_cast<int>(SpellId::Fireball); // 火球贴图下标
+    if (m_spellTextures[fireballTex] != nullptr) // 素材可用才画
+    {
+        for (const Fireball& fireball : m_fireballs) // 飞行中的火球逐颗
+        {
+            const Vec2 screen = m_camera.worldToScreen(fireball.x, fireball.y); // 换算到屏幕
+            const SDL_FRect dst{ screen.x - kFireballDrawSize * 0.5f, // 以中心定位
+                                 screen.y - kFireballDrawSize * 0.5f,
+                                 kFireballDrawSize, // 与素材同尺寸
+                                 kFireballDrawSize };
+            SDL_RenderTextureRotated(m_renderer, m_spellTextures[fireballTex], nullptr, &dst,
+                                     static_cast<double>(fireball.rotation), nullptr, SDL_FLIP_NONE); // 飞旋
+        }
+        for (const FireballBlastFx& fx : m_fireballBlasts) // 爆炸逐条（放大 + 淡出）
+        {
+            const Vec2 screen = m_camera.worldToScreen(fx.x, fx.y); // 换算到屏幕
+            const float progress = 1.0f - fx.left / kFireballBlastFxSeconds; // 0->1 播放进度
+            const float diameter = fx.radius * 2.0f * (0.6f + 0.4f * progress); // 0.6->1.0 倍目标直径
+            const float dstX = screen.x - diameter * 0.5f; // 绘制左边界
+            const float dstY = screen.y - diameter * 0.5f; // 绘制上边界
+            const SDL_FRect dst{ dstX, dstY, diameter, diameter }; // 绘制矩形
+            SDL_SetTextureAlphaMod(m_spellTextures[fireballTex],
+                                   static_cast<Uint8>(235.0f * (fx.left / kFireballBlastFxSeconds))); // 渐隐
+            SDL_RenderTexture(m_renderer, m_spellTextures[fireballTex], nullptr, &dst); // 整张绘制
+        }
+        SDL_SetTextureAlphaMod(m_spellTextures[fireballTex], 255); // 统一还原不透明
+    }
+
+    // ---- 冰环（从 0.5 倍展开到全径 + 淡出）----
+    const int frostTex = static_cast<int>(SpellId::FrostNova); // 冰环贴图下标
+    if (m_spellTextures[frostTex] != nullptr) // 素材可用才画
+    {
+        for (const FrostNovaFx& fx : m_frostNovas) // 冰环逐条
+        {
+            const Vec2 screen = m_camera.worldToScreen(fx.x, fx.y); // 换算到屏幕
+            const float progress = 1.0f - fx.left / kFrostNovaFxSeconds; // 0->1 展开进度
+            const float diameter = fx.radius * 2.0f * (0.5f + 0.5f * progress); // 0.5->1.0 倍目标直径
+            const float dstX = screen.x - diameter * 0.5f; // 绘制左边界
+            const float dstY = screen.y - diameter * 0.5f; // 绘制上边界
+            const SDL_FRect dst{ dstX, dstY, diameter, diameter }; // 绘制矩形
+            SDL_SetTextureAlphaMod(m_spellTextures[frostTex],
+                                   static_cast<Uint8>(210.0f * (fx.left / kFrostNovaFxSeconds))); // 渐隐
+            SDL_RenderTexture(m_renderer, m_spellTextures[frostTex], nullptr, &dst); // 整张绘制
+        }
+        SDL_SetTextureAlphaMod(m_spellTextures[frostTex], 255); // 统一还原不透明
+    }
+
+    // ---- 闪电链（折线 + 端点电花）----
+    if (!m_chainBolts.empty()) // 有特效才进入（含混合模式切换）
+    {
+        for (const ChainBoltFx& fx : m_chainBolts) // 逐条闪电
+        {
+            if (fx.count < 2) // 不足两点画不了线（防御）
+            {
+                continue; // 跳过
+            }
+            const float ratio = fx.left / kChainBoltFxSeconds; // 剩余比例（淡出系数）
+
+            // 折线：每段 4 等分画锯齿——偏移符号由「段号 + 中点号」确定性
+            // 决定（无随机：同一条闪电在每帧形状一致，只有透明度在变）
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND); // 打开混合
+            SDL_SetRenderDrawColor(m_renderer, 190, 230, 255,
+                                   static_cast<Uint8>(220.0f * ratio)); // 亮青主色
+            for (int i = 0; i + 1 < fx.count; ++i) // 逐段
+            {
+                const Vec2 a = m_camera.worldToScreen(fx.points[i].x, fx.points[i].y);     // 段起点
+                const Vec2 b = m_camera.worldToScreen(fx.points[i + 1].x, fx.points[i + 1].y); // 段终点
+                const float dx = b.x - a.x; // 段向量 x
+                const float dy = b.y - a.y; // 段向量 y
+                const float length = std::sqrt(dx * dx + dy * dy); // 段长
+                const float perpX = (length > 0.001f) ? -dy / length : 0.0f; // 垂直单位向量 x（退化防护）
+                const float perpY = (length > 0.001f) ? dx / length : 0.0f;  // 垂直单位向量 y
+                const float amplitude = std::min(kChainBoltJagPixels, length * 0.15f) * ratio; // 锯齿振幅（长段截断）
+                float prevX = a.x; // 本段上一折点 x
+                float prevY = a.y; // 本段上一折点 y
+                for (int s = 1; s <= kChainBoltMidpoints + 1; ++s) // 4 中点 + 终点
+                {
+                    const float t = static_cast<float>(s) / static_cast<float>(kChainBoltMidpoints + 1); // 等分参数
+                    float px = a.x + dx * t; // 折点 x（先取等分点）
+                    float py = a.y + dy * t; // 折点 y
+                    if (s <= kChainBoltMidpoints) // 中点加锯齿（终点不动）
+                    {
+                        const float sign = ((s + i) % 2 == 0) ? 1.0f : -1.0f; // 交替偏移符号（确定性）
+                        px += perpX * amplitude * sign; // 垂直偏移 x
+                        py += perpY * amplitude * sign; // 垂直偏移 y
+                    }
+                    SDL_RenderLine(m_renderer, prevX, prevY, px, py); // 画本段折线
+                    prevX = px; // 推进上一折点
+                    prevY = py; // 同上
+                }
+            }
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
+        }
+
+        // 端点电花（各命中点；贴图 32 基准，随淡出略缩）
+        const int boltTex = static_cast<int>(SpellId::ChainLightning); // 电花贴图下标
+        if (m_spellTextures[boltTex] != nullptr) // 素材可用才画
+        {
+            for (const ChainBoltFx& fx : m_chainBolts) // 逐条闪电的端点
+            {
+                const float ratio = fx.left / kChainBoltFxSeconds; // 剩余比例
+                const float size = 32.0f * (0.7f + 0.3f * ratio);  // 尺寸随淡出略缩（与素材 32 一致）
+                for (int i = 1; i < fx.count; ++i) // 除玩家起点外的命中点
+                {
+                    const Vec2 screen = m_camera.worldToScreen(fx.points[i].x, fx.points[i].y); // 换算到屏幕
+                    const SDL_FRect dst{ screen.x - size * 0.5f, // 以点为中心
+                                         screen.y - size * 0.5f,
+                                         size, // 绘制边长
+                                         size };
+                    SDL_SetTextureAlphaMod(m_spellTextures[boltTex],
+                                           static_cast<Uint8>(235.0f * ratio)); // 渐隐
+                    SDL_RenderTexture(m_renderer, m_spellTextures[boltTex], nullptr, &dst); // 整张绘制
+                }
+            }
+            SDL_SetTextureAlphaMod(m_spellTextures[boltTex], 255); // 统一还原不透明
+        }
+    }
+
+    // ---- 治疗光（头顶上浮 + 淡出）----
+    const int healTex = static_cast<int>(SpellId::HolyHeal); // 治疗贴图下标
+    if (m_spellTextures[healTex] != nullptr) // 素材可用才画
+    {
+        for (const HealFx& fx : m_healFxs) // 逐条治疗光
+        {
+            const float progress = 1.0f - fx.left / kHealFxSeconds; // 0->1 上浮进度
+            const float rise = kHealRisePixels * progress;          // 已上浮距离
+            const Vec2 screen = m_camera.worldToScreen(fx.x, fx.y - rise); // 换算到屏幕（含上浮）
+            const SDL_FRect dst{ screen.x - kHealDrawSize * 0.5f, // 以起点为中心
+                                 screen.y - kHealDrawSize * 0.5f,
+                                 kHealDrawSize, // 与素材同尺寸
+                                 kHealDrawSize };
+            SDL_SetTextureAlphaMod(m_spellTextures[healTex],
+                                   static_cast<Uint8>(235.0f * (fx.left / kHealFxSeconds))); // 渐隐
+            SDL_RenderTexture(m_renderer, m_spellTextures[healTex], nullptr, &dst); // 整张绘制
+        }
+        SDL_SetTextureAlphaMod(m_spellTextures[healTex], 255); // 统一还原不透明
+    }
+}
+
+// 法术 HUD：右下角已学法术图标行 + 层数 + 冷却条（契约见头文件）
+void PlayScene::renderSpellHud(float screenW, float screenH) const
+{
+    // 统计已学法术数（层数 > 0 的系）：一系未学则整行不出现
+    int learnedCount = 0; // 已学数量
+    for (const int level : m_spellLevels) // 逐系统计
+    {
+        if (level > 0) // 学过
+        {
+            ++learnedCount; // +1
+        }
+    }
+    if (learnedCount == 0) // 无已学法术：不画图标行
+    {
+        return; // 空转
+    }
+
+    // 行右缘与行顶：整行贴右下角（右缘留边距）；首枚左边界从右往左推
+    const float rowRight = screenW - kSpellIconMarginX;  // 行右缘
+    const float rowTop = screenH - kSpellIconY;          // 行顶（底边距换算）
+    const float rowW = static_cast<float>(learnedCount) * kSpellIconSize +
+                       static_cast<float>(learnedCount - 1) * kSpellIconGap; // 行总宽
+    float iconX = rowRight - rowW; // 首枚左边界（按已学数量紧凑排布）
+
+    for (int i = 0; i < kSpellCount; ++i) // 按 SpellId 顺序绘制已学的
+    {
+        const int level = m_spellLevels[i]; // 本系层数
+        if (level <= 0) // 未学：跳过（序号紧排）
+        {
+            continue; // 下一系
+        }
+
+        // 图标本体（素材可画才画；坐标即布局推进量）
+        const SDL_FRect iconRect{ iconX, rowTop, kSpellIconSize, kSpellIconSize }; // 本枚图标矩形
+        if (m_spellIconTextures[i] != nullptr) // 素材可用
+        {
+            SDL_RenderTexture(m_renderer, m_spellIconTextures[i], nullptr, &iconRect); // 图标
+        }
+
+        // 冷却压暗：冷却未满时图标叠半透明黑（一眼看到「还在转」）
+        const float cooldownLeft = m_spellCooldownLeft[i]; // 剩余冷却（秒）
+        if (cooldownLeft > 0.0f) // 冷却中
+        {
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND); // 打开混合
+            SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 120);            // 半透明黑
+            SDL_RenderFillRect(m_renderer, &iconRect);                   // 压暗罩
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE);  // 恢复默认
+        }
+
+        // 冷却条（图标下方 4px）：底槽全宽、亮青填充 = 已恢复比例
+        const float barY = rowTop + kSpellIconSize + 2.0f; // 条上边界
+        SDL_SetRenderDrawColor(m_renderer, 40, 40, 40, 255); // 深灰底槽
+        const SDL_FRect barBack{ iconX, barY, kSpellIconSize, 4.0f }; // 底槽矩形
+        SDL_RenderFillRect(m_renderer, &barBack); // 铺底槽
+        const float total = spellCooldownSeconds(static_cast<SpellId>(i), level); // 冷却总时长（分母）
+        const float readyRatio = (cooldownLeft > 0.0f && total > 0.0f) // 恢复比例：
+            ? std::min(1.0f - cooldownLeft / total, 1.0f)              // 冷却中按剩余回缩
+            : 1.0f;                                                    // 就绪：全满
+        SDL_SetRenderDrawColor(m_renderer, 120, 220, 255, 255); // 亮青：恢复进度
+        const SDL_FRect barFill{ iconX, barY, kSpellIconSize * readyRatio, 4.0f }; // 填充矩形
+        SDL_RenderFillRect(m_renderer, &barFill); // 铺填充
+
+        // 层数角标「xN」（图标右下角，金色小字）
+        char levelText[8]; // 容纳 "x5"，绰绰有余
+        SDL_snprintf(levelText, sizeof(levelText), "x%d", level); // 层数文本
+        SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);     // 金色：与升级高光同族
+        m_cardFont.draw(m_renderer, levelText, iconX + kSpellIconSize - 28.0f,
+                        rowTop + kSpellIconSize - 24.0f); // 右下角绘制
+
+        iconX += kSpellIconSize + kSpellIconGap; // 推进到下一枚
+    }
 }
 
 // 经验结算：把 amount 点经验并入当前进度，按升级曲线循环结算（一枚宝石
@@ -1855,6 +2819,23 @@ void PlayScene::restart()
     }
     m_shopHandled = false;          // B 动作去重标记复位
 
+    // 法术状态复位（批五B）：层数/冷却/护盾/飞行物/全部特效归零——
+    // 新一局从零法术、无护盾开始（升级流程重新抽取法术）
+    for (int& level : m_spellLevels) // 层数逐系清零
+    {
+        level = 0; // 本系归零（未学：不施法、无图标）
+    }
+    for (float& cooldown : m_spellCooldownLeft) // 冷却逐系清零
+    {
+        cooldown = 0.0f; // 本系冷却归零（新局待敌即施放）
+    }
+    m_playerShield = 0;          // 护盾清零（先盾后血的状态不跨局）
+    m_fireballs.clear();         // 飞行中的火球清空（纯数据元素，直接清）
+    m_fireballBlasts.clear();    // 火球爆炸特效清空
+    m_frostNovas.clear();        // 冰环特效清空
+    m_chainBolts.clear();        // 闪电链特效清空
+    m_healFxs.clear();           // 治疗光特效清空
+
     // 卡牌效果撤销 + 全部数值复位（M2 统一入口）：层数已清零，重算即等价于
     // 「移速/攻击冷却/伤害/范围/张角/击退/生命上限/磁吸」全部回到基准，
     // 并重新注入 Player 实体（移速/冷却/扫角立即恢复配置初值）
@@ -1961,10 +2942,18 @@ void PlayScene::render(float alpha)
     // 背景图自批二起退役（区块地板取代；MenuScene 仍继续使用 background.png）
     m_world.render(m_renderer, m_camera);
 
+    // 灼烧光环（批五B）：玩家脚下的常驻火环——画在玩家之前（地面层观感），
+    // 旋转相位 = 存活秒（暂停/商店冻结时画面完全静止）；未学则不画
+    renderBurnAuraFx(alpha);
+
     // 玩家按插值位置绘制（经相机换算）。批五A：无敌期间不再闪烁跳隐——
     // 受击反馈由玩家自身的击退位移与红染（Player::render 内叠加）承担，
     // 每帧连续绘制保证「逐帧无跳隐」的画面（冒烟连拍核验点）
     m_player.render(m_renderer, alpha, m_camera);
+
+    // 护盾罩（批五B）：有护盾时罩在玩家身上（呼吸缩放 + 按剩余量调透明度）
+    //——画在玩家之后（罩在外面）、怪物之前（不遮住逼近的敌人）
+    renderShieldFx(alpha);
 
     // 怪物：只绘制「存活 + 激活区」槽位（与 update 同一门控——空槽位与
     // 非激活区都不可见，渲染开销随活跃区域有界）
@@ -1983,6 +2972,10 @@ void PlayScene::render(float alpha)
         }
         monster.render(m_renderer, alpha, m_camera); // 存活且激活：绘制（含残影/警示/红染叠加）
     }
+
+    // 法术世界层特效（批五B）：火球/爆炸/冰环/闪电/治疗——画在怪物之后
+    //（爆炸/命中落在怪物身上要盖住它们）、命中特效与飘字之前
+    renderSpellFx();
 
     // 命中特效（批五A）：接触点的爪痕/爆点——世界层绘制（怪物之上、
     // 飘字之下），经相机换算；透明度随剩余寿命线性渐隐（画完还原）
@@ -2136,6 +3129,19 @@ void PlayScene::renderHud()
         SDL_snprintf(hpText, sizeof(hpText), "HP %d/%d", m_playerHp, m_playerMaxHp);
         m_hudFont.draw(m_renderer, hpText, kBarX + kBarW + 12.0f, 16.0f);
 
+        // 护盾显示（批五B·先盾后血）：有护盾时在 HP 文字右侧接青色
+        //「护盾 N」——吸收扣减在 HUD 上直接可见（无护盾不显示，面板干净）。
+        // 位置按 HP 文本实际宽度动态排布（字体缩放/数字位数变化都不重叠）
+        if (m_playerShield > 0) // 有盾才画
+        {
+            char shieldText[48]; // 容纳「护盾 9999」，绰绰有余
+            SDL_snprintf(shieldText, sizeof(shieldText), "护盾 %d", m_playerShield); // 护盾文本
+            const SDL_FPoint hpSize = m_hudFont.measure(hpText); // HP 文本宽度（动态首尾相接）
+            SDL_SetRenderDrawColor(m_renderer, 120, 220, 255, 255); // 亮青：与护盾罩同族
+            m_hudFont.draw(m_renderer, shieldText,
+                           kBarX + kBarW + 12.0f + hpSize.x + 24.0f, 16.0f); // HP 右侧 24px 处
+        }
+
         // 等级行（第 2 行）：升级瞬闪窗口内金/白交替闪烁（高光反馈），
         // 其余时刻白色。相位 = 剩余时长对闪烁周期取模，前 0.08s 一亮一暗
         const bool levelFlashOn = m_levelFlashLeft > 0.0f &&
@@ -2183,10 +3189,15 @@ void PlayScene::renderHud()
         m_hudFont.draw(m_renderer, survivalText, 20.0f, 190.0f);
 
         // 金币行（批三局内货币）：本局累计的拾取金币数——「击杀—掉落—
-        // 拾取—计数」闭环的可视终点（冒烟观测点）
+        // 拾取—计数」闭环的可视终点（冒烟观测点）；批五B 起也是商店的
+        // 唯一货币（价格随层递增，见 Shop.h）
         char coinText[48]; // 容纳 "金币: " + 最长数字，绰绰有余
         SDL_snprintf(coinText, sizeof(coinText), "金币: %d", m_coinCount);
         m_hudFont.draw(m_renderer, coinText, 20.0f, 234.0f);
+
+        // 法术 HUD（批五B）：右下角已学法术图标行 + 层数 + 冷却条——
+        // 与生存 HUD 同一显示条件（对局进行/冻结中都能看到当前法况）
+        renderSpellHud(screenW, screenH);
     }
 
     if (m_state == PlayState::Paused)

@@ -135,6 +135,35 @@ void Monster::setTarget(const SDL_FRect& targetRect)
     m_hasTarget = true;                             // 标记玩家可见：AI 开始做仇恨判定
 }
 
+// 施加减速（批五B：冰霜新星入口）：契约见头文件。乘区与时长都被本次
+// 施放覆盖（后施放为准——与「连续受击全部状态重新计时」同款口径）
+void Monster::applySlow(float factor, float seconds)
+{
+    // 非正时长（调用方错误/0 秒）：忽略并警告——不产生任何状态
+    if (seconds <= 0.0f)
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "减速时长必须为正（收到 %.2f），忽略本次减速", seconds);
+        return;
+    }
+
+    // 乘区夹到 [0,1]：0 = 完全冻结（显式语义）；>1 是「加速」误用（夹回 1）；
+    // 负值等价 0（防御——异常输入不能反过来加速怪物）
+    float clamped = (factor > 0.0f) ? factor : 0.0f; // 负值压到 0
+    if (clamped > 1.0f)
+    {
+        clamped = 1.0f; // 上界：减速不变成加速
+    }
+
+    m_slowFactor = clamped; // 乘区写入（覆盖前值）
+    m_slowLeft = seconds;   // 时长写入（覆盖前值）
+
+    // 冒烟观测点：减速施加（含变体名与时长——冒烟断言「冰霜新星命中即减速」）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "冰霜减速（%s：速度 x%.2f，持续 %.1f 秒）",
+                monsterTypeName(m_type), m_slowFactor, m_slowLeft);
+}
+
 // 受击：扣血 + 红染；返回是否死亡（生命归零）
 bool Monster::takeDamage(int amount)
 {
@@ -188,6 +217,7 @@ void Monster::spawnAt(float centerX, float centerY)
     m_ai.setRandom(&monsterAiRandom, nullptr); // 随机源：SDL 随机流适配
     m_ai.reset(centerX, centerY);              // 巢 = 本落点；状态清回巡逻
     clearMotionState();                        // 侧滑/卡死检测窗口清零（新怪的干净起点）
+    clearSlowState();                          // 减速乘区清零（批五B：池复用不带旧减速）
     clearAttackState();                        // 攻击状态清零（批四：池复用不带旧出招）
     clearPlayerBlocker();                      // 玩家盒实心清零（批四：等场景本步重新注入）
 
@@ -524,6 +554,13 @@ void Monster::update(const UpdateContext& ctx)
         m_hitTintLeft = std::max(m_hitTintLeft - ctx.deltaTime, 0.0f);
     }
 
+    // 减速剩余时长递减并夹到 0（批五B：冰霜新星）：与红染同款固定步
+    // 递减——暂停/非激活区冻结时一并冻结（乘区在移动速度计算处消费）
+    if (m_slowLeft > 0.0f)
+    {
+        m_slowLeft = std::max(m_slowLeft - ctx.deltaTime, 0.0f);
+    }
+
     // 前扑残影寿命递减并夹到 0（批五A）：残影在前扑后自然渐隐熄灭；
     // 非激活区怪物的 update 冻结时残影一并冻结（与其余计时同一门控）
     for (LungeGhost& ghost : m_lungeGhosts)
@@ -659,10 +696,12 @@ void Monster::update(const UpdateContext& ctx)
     }
 
     // 本步速度：巡逻用「变体基础速度 x 0.5」（不随难度成长——闲逛节奏
-    // 与追兵压迫感解耦）；追击/回巢用场景注入的难度速度
-    const float speed = (m_ai.state() == MonsterAiState::Patrol)
+    // 与追兵压迫感解耦）；追击/回巢用场景注入的难度速度；
+    // 批五B：统一乘以减速乘区（冰霜新星——状态期间巡逻/追击/回巢全减速）
+    const float speed = ((m_ai.state() == MonsterAiState::Patrol)
         ? baseSpeed() * kPatrolSpeedFactor // 巡逻速度（慢半拍，肉眼可辨状态）
-        : m_chaseSpeed;                    // 追击/回巢速度（难度曲线注入）
+        : m_chaseSpeed)                    // 追击/回巢速度（难度曲线注入）
+        * speedFactor();                   // 减速乘区（无减速恒 1——零行为变化）
 
     // 沿归一化方向 x 速度的「期望位移」（固定步长积分）。归一化保证
     // 任意方向合速度恒等于本轮速度值

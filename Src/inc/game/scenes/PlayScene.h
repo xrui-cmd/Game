@@ -17,6 +17,7 @@
 #include "game/UpgradeCard.h"   // UpgradeCard：九项强化表（批五B 起由商店购买；抽取/叠加数学/欠账队列）
 #include "game/Shop.h"          // Shop：商店价格公式与可购判定（纯逻辑，tests/shop_test.cpp 直测）
 #include "game/ShopLayout.h"    // ShopLayout：商店九宫格布局（渲染与鼠标命中共享，防坐标漂移）
+#include "game/Spell.h"         // Spell：法术池（六法术表/逐层参数/三抽抽取；纯逻辑，tests/spell_test.cpp 直测）
 #include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
 #include <array>                // std::array：本扫程命中记录（按怪物池槽位的定长布尔表）
 #include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
@@ -102,6 +103,23 @@
 //        升级飘字/等级瞬闪/音效保留；M2 前的「每级自动强化」
 //        （levelup_*）已退役——成长全部由卡牌提供；R 重开清零全部
 //        层数与效果（基准 + 层数重算）
+//      - 法术（批五B）：升级三选一改抽「法术池」（六种：火球术/冰霜新星/
+//        闪电链/治疗之光/灼烧光环/护盾术；未学可学、已学叠层上限 5），
+//        学会后自动施法（仅 Playing、各自冷却独立、无需按键、与横扫互不
+//        打断）：火球向最近敌飞行+命中爆炸（伤害/频率/爆炸半径随层）；
+//        冰霜新星以自身为心爆冰环（范围伤害 + 怪物速度乘区减速）；闪电链
+//        劈击范围内随机敌并跳跃传导（跳数随层）；治疗之光周期回血（满血
+//        不施放）；灼烧光环周身持续灼烧（每 0.5s 一跳，圈内无敌人不跳）；
+//        护盾术周期获得护盾点数（受击先盾后血，HUD 显示护盾）。法术特效
+//        （火球/冰环/闪电/治疗光/光环/护盾罩）为脚本生成贴图 + 代码动画
+//        （飞旋/缩放/淡出/旋转）；HUD 右下角显示已学法术图标行与冷却条。
+//        旧「升级发数值卡」退役——九项强化改在商店（B 键）用金币购买
+//      - 商店（批五B）：对局中随时按 B 打开（世界冻结、同暂停语义），
+//        九项强化（利刃/疾风/长臂/横扫/疾行/体魄/重击/慧眼/聚宝）只能用
+//        金币购买；价格 = 基础价 x（层数 + 1）；面板 3x3 九宫格显示
+//        「金币: N」与各项「层数/上限、价格」；悬停高亮、鼠标点击或
+//        数字键 1~9 购买；金币不足/满层灰显 + 提示；B 或 ESC 关闭；
+//        生效沿用 applyCardEffects 既有路径（与 M2 同一套加成代码）
 //      - 生命归零 -> GameOver；结算最佳战绩（最高击杀/最高等级/最长存活，
 //        仅完整对局比较更新并立即写盘；任一项被破播 record 音效 +「新纪录！」）；
 //      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键；
@@ -247,11 +265,118 @@ private:
     //     -> 打「商店购买」日志（规格文案）-> 面板提示与购买音效
     void tryPurchaseShopItem(int itemIndex);
 
-    // 卡牌效果应用（M2；onEnter / 选择生效 / restart 三处调用的统一入口）：
-    // 从「基准值 + 当前层数」重算全部受卡牌影响的数值并注入（幂等——重复
+    // 强化效果应用（M2 升级卡；批五B 起是商店购买的生效入口；onEnter /
+    // 升级选择生效 / 商店购买成交 / restart 四处调用的统一入口）：从
+    // 「基准值 + 当前层数」重算全部受强化影响的数值并注入（幂等——重复
     // 调用结果一致；层数清零后调用即等价于「效果全部撤销」）。「即时回血」
-    // 等一次性效果不在此列（选择流程单独发放——重算路径绝不重复回血）
+    // 等一次性效果不在此列（选择/购买流程单独发放——重算路径绝不重复回血）
     void applyCardEffects();
+
+    // ---- 法术（批五B：六法术、自动施法）----
+
+    // 火球飞行物：直线飞行（发射瞬间锁定方向——目标是移动的，不追踪），
+    // 命中任一怪物或寿命到期即爆炸；伤害/爆炸半径在发射时按层数快照
+    struct Fireball
+    {
+        float x = 0.0f;           // 中心 x（世界坐标）
+        float y = 0.0f;           // 中心 y（世界坐标）
+        float dirX = 1.0f;        // 飞行方向 x（单位向量）
+        float dirY = 0.0f;        // 飞行方向 y（单位向量）
+        float speed = 0.0f;       // 飞行速度（像素/秒；常量 kSpellFireballSpeed）
+        float lifeLeft = 0.0f;    // 剩余寿命（秒；到点自爆——不会无限飞行）
+        float rotation = 0.0f;    // 渲染旋转角（度；飞旋动画相位）
+        int damage = 0;           // 命中伤害（点；发射时按层数快照）
+        float blastRadius = 0.0f; // 爆炸半径（像素；发射时按层数快照）
+    };
+
+    // 火球爆炸特效：火球贴图从 0.6 倍放大到目标直径 + 淡出（缩放动画）
+    struct FireballBlastFx
+    {
+        float x = 0.0f;           // 爆炸中心 x（世界坐标）
+        float y = 0.0f;           // 爆炸中心 y
+        float radius = 0.0f;      // 爆炸半径（像素；绘制尺寸 = 2 x radius）
+        float left = 0.0f;        // 剩余寿命（秒；置满后递减，归零移除）
+    };
+
+    // 冰环特效：冰环贴图从 0.5 倍展开到目标直径 + 淡出（缩放+淡出动画）
+    struct FrostNovaFx
+    {
+        float x = 0.0f;           // 冰环中心 x（施放时的玩家中心）
+        float y = 0.0f;           // 冰环中心 y
+        float radius = 0.0f;      // 判定半径（像素；绘制尺寸 = 2 x radius x 进度缩放）
+        float left = 0.0f;        // 剩余寿命（秒；置满后递减，归零移除）
+    };
+
+    // 闪电链特效：折线路径（玩家中心 -> 各跳目标中心）+ 端点电花；
+    // 折线锯齿在渲染时按点序号确定性生成（不引随机——画面每帧一致）
+    struct ChainBoltFx
+    {
+        SDL_FPoint points[8] = {}; // 路径点（1 起点 + 最多 6 跳 = 7 点；8 留余量）
+        int count = 0;             // 有效点数（< 2 时不画线）
+        float left = 0.0f;         // 剩余寿命（秒；置满后递减，归零移除）
+    };
+
+    // 治疗光特效：玩家头顶光柱上浮 + 淡出
+    struct HealFx
+    {
+        float x = 0.0f;           // 起点 x（施放时的玩家中心）
+        float y = 0.0f;           // 起点 y（施放时的玩家头顶）
+        float left = 0.0f;        // 剩余寿命（秒；置满后递减，归零移除）
+    };
+
+    // 法术自动施法总入口（仅 Playing，每固定步一次，怪物更新之后调用——
+    // 碰撞/范围判定用本步怪物的最新位置）：冷却递减 -> 火球推进与命中
+    // 爆炸 -> 各法术按冷却独立尝试施放（无需按键；条件不满足时静默等待）
+    // -> 灼烧光环 tick -> 特效计时递减与清理。与横扫互不打断：独立的
+    // 索敌/结算/特效链，双方都不影响对方的节奏
+    void updateSpells(const UpdateContext& ctx, const SDL_FRect& playerBox);
+
+    // 最近敌人查询：返回怪物池下标（-1 = 半径内无「存活且激活」的敌人）。
+    // 火球（发射目标）与闪电链（跳跃）共用；距离按矩形中心计算。
+    // exclude 可空：非空时跳过 exclude[i] 为 true 的槽位（闪电链防回跳）
+    int findNearestMonster(float centerX, float centerY, float radius,
+                           const bool* exclude) const;
+
+    // 法术伤害结算（法术侧的统一伤害入口）：扣血（红染内置于 takeDamage）
+    // -> 伤害飘字（浅蓝——与横扫的白色飘字区分来源）-> 致死走
+    // resolveMonsterDeath（击杀/掉落/日志与横扫同款）。法术伤害不带击退
+    //（与横扫的微击退区分：法术是自动补充，控制权留给横扫）
+    void damageMonsterBySpell(Monster& monster, int damage, float centerX, float centerY);
+
+    // 公共死亡结算（横扫与法术共用）：击杀计数 + 经验宝石/金币掉落 +
+    // 「击杀怪物」「金币掉落」两条冒烟日志——文案与批三/批四完全一致
+    //（拆出的唯一动机是消除两处结算链的复制）
+    void resolveMonsterDeath(Monster& monster, float centerX, float centerY);
+
+    // 各法术施放（由 updateSpells 在「层数 > 0 且冷却就绪」时调用）：
+    // 条件不满足（无目标/满血/满盾/圈内无敌人）时静默返回且不重置冷却
+    //（条件满足后立即施放）；施放成功才重置冷却并打「施法：xxx」日志
+    void castFireball(const SDL_FRect& playerBox);      // 火球术：向最近敌发射
+    void castFrostNova(const SDL_FRect& playerBox);     // 冰霜新星：冰环伤害+减速
+    void castChainLightning(const SDL_FRect& playerBox); // 闪电链：随机首击+跳跃
+    void castHolyHeal();                                // 治疗之光：周期回血
+    void castShield();                                  // 护盾术：周期获得护盾
+    void tickBurnAura(const SDL_FRect& playerBox);      // 灼烧光环：每 0.5s 一跳
+
+    // 火球爆炸结算（命中怪物或寿命到期时调用）：爆炸半径内「存活且激活」
+    // 的怪物全额伤害 + 爆炸特效入列 + 「火球爆炸」日志
+    void explodeFireball(const Fireball& fireball);
+
+    // 法术世界层特效渲染（render 内调用；分三段以维持正确的图层顺序）：
+    //   - renderBurnAuraFx：灼烧光环（玩家脚下、玩家绘制之前——地面层）；
+    //   - renderShieldFx  ：护盾罩（玩家绘制之后——罩在身上）；
+    //   - renderSpellFx   ：火球/爆炸/冰环/闪电/治疗（怪物绘制之后、飘字之前）
+    // alpha 为渲染插值系数：光环/护盾的挂点用玩家插值中心（与玩家绘制同源）
+    void renderBurnAuraFx(float alpha) const;
+    void renderShieldFx(float alpha) const;
+    void renderSpellFx() const;
+
+    // 法术 HUD（renderHud 内调用）：右下角已学法术图标行 + 层数 + 冷却条
+    //（冷却未满时图标压暗、图标下方进度条按剩余比例回缩）
+    void renderSpellHud(float screenW, float screenH) const;
+
+    // 释放法术素材纹理（6 张特效 + 6 张图标；析构兜底；幂等）
+    void releaseSpellTextures();
 
     // 主动攻击入口（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扫程推进」。
     // 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
@@ -433,7 +558,49 @@ private:
 
     static constexpr float kHudPtSize = 32.0f;  // HUD/提示文字字号（像素高，小数需求清晰）
     static constexpr float kBigPtSize = 64.0f;  // 暂停/结束标题字号（大号观感）
-    static constexpr float kCardPtSize = 24.0f; // 升级三选一面板小字字号（卡描述/层数标注；M2）
+    static constexpr float kCardPtSize = 24.0f; // 面板小字字号（升级卡描述/层数、商店层数与价格；M2/批五B）
+
+    // ---- 法术运行时常量（批五B；代码固定，改动须连同注释一起审视）----
+
+    // 法术特效寿命（秒）：置满后固定步递减、归零移除；渲染按剩余比例渐隐
+    static constexpr float kFireballBlastFxSeconds = 0.30f; // 火球爆炸（缩放+淡出）
+    static constexpr float kFrostNovaFxSeconds = 0.35f;     // 冰环（展开+淡出）
+    static constexpr float kChainBoltFxSeconds = 0.25f;     // 闪电链折线（淡出）
+    static constexpr float kHealFxSeconds = 0.60f;          // 治疗光（上浮+淡出）
+
+    // 火球弹体命中盒（像素）：以火球中心为中心的 24x24 小盒——与怪物脚盒
+    // 做相交判定（稍微宽容的弹体体积，快速飞行不易穿漏）
+    static constexpr float kFireballHitBoxSize = 24.0f;
+
+    // 火球/冰环/治疗的绘制基准尺寸（像素；与脚本生成的素材尺寸一致）：
+    // 火球 32、冰环 128、治疗 64、光环 160、护盾 96
+    static constexpr float kFireballDrawSize = 32.0f;  // 火球贴图绘制边长（旋转绘制）
+    static constexpr float kFrostNovaDrawSize = 128.0f; // 冰环贴图基准边长（再按半径缩放）
+    static constexpr float kHealDrawSize = 64.0f;       // 治疗光绘制边长
+    static constexpr float kBurnAuraDrawSize = 160.0f;  // 灼烧光环贴图基准边长（再按半径缩放）
+    static constexpr float kShieldDrawSize = 96.0f;     // 护盾罩绘制边长（罩住 48x84 玩家）
+
+    // 火球旋翼旋转速度（度/秒）：飞旋动画的相位推进速率
+    static constexpr float kFireballSpinDegrees = 540.0f;
+
+    // 治疗光上浮距离（像素）：寿命内从玩家头顶向上飘的总位移（淡出配合）
+    static constexpr float kHealRisePixels = 30.0f;
+
+    // 灼烧光环旋转速度（度/秒）与护盾呼吸频率/幅度：常驻表现的动画相位
+    //（相位源 = 存活秒 m_survivalSeconds——暂停/商店冻结时画面完全静止）
+    static constexpr float kBurnAuraSpinDegrees = 36.0f; // 光环自转角速度（度/秒）
+    static constexpr float kShieldBreathHz = 1.0f;        // 护盾呼吸频率（次/秒）
+    static constexpr float kShieldBreathScale = 0.04f;    // 护盾呼吸缩放幅度（±4%）
+
+    // 闪电折线渲染参数：每段中点数与锯齿振幅（渲染时按点序号确定性生成）
+    static constexpr int kChainBoltMidpoints = 4;         // 每段插入的中间点数
+    static constexpr float kChainBoltJagPixels = 14.0f;   // 锯齿基础振幅（像素；按段长截断）
+
+    // 法术 HUD 图标（右下角一行）：图标边长、间距与行底边距（像素）
+    static constexpr float kSpellIconSize = 40.0f;        // 图标绘制边长（与素材一致）
+    static constexpr float kSpellIconGap = 12.0f;         // 图标间距
+    static constexpr float kSpellIconY = 64.0f;           // 图标行底边距（屏高 - 本值 = 行顶）
+    static constexpr float kSpellIconMarginX = 20.0f;     // 行右缘边距（屏宽 - 本值 = 行右）
 
     // FPS 调试行专用：仍走 SDL 内置调试字体（8x8 点阵，仅 ASCII），
     // 缩放 2 倍 => 16 屏幕像素高，与改造前的调试行观感完全一致
@@ -570,6 +737,20 @@ private:
     bool m_shopClickHandled = false;     // 左键按下边缘去重标记（同帧多固定步只响应一次）
     bool m_shopKeyHandled[kShopItemCount] = {}; // 1~9 按下边缘去重标记（下标 = 商品序号）
     bool m_shopHandled = false;          // shop 动作本帧是否已处理（B 开/关边缘去重）
+
+    // ---- 法术运行时（批五B；restart 复位）----
+    // 层数/冷却为「已学法术」的全部运行时状态；飞行物与特效是短命实体
+    //（逐帧清理，容量自然稳定）。素材纹理由本类自持（析构释放，幂等）
+    int m_spellLevels[kSpellCount] = {};         // 各法术层数（下标与 SpellId 一一对应；R 重开清零）
+    float m_spellCooldownLeft[kSpellCount] = {}; // 各法术剩余冷却（秒；独立计时、仅 Playing 递减）
+    int m_playerShield = 0;                      // 当前护盾点数（先盾后血；HUD 显示；R 重开清零）
+    std::vector<Fireball> m_fireballs;           // 飞行中的火球（命中/到点爆炸后移除）
+    std::vector<FireballBlastFx> m_fireballBlasts; // 火球爆炸特效（0.3s 渐隐）
+    std::vector<FrostNovaFx> m_frostNovas;       // 冰环特效（0.35s 展开淡出）
+    std::vector<ChainBoltFx> m_chainBolts;       // 闪电链特效（0.25s 渐隐）
+    std::vector<HealFx> m_healFxs;               // 治疗光特效（0.6s 上浮淡出）
+    SDL_Texture* m_spellTextures[kSpellCount] = {};     // 六法术特效贴图（失败为 nullptr——表现跳过）
+    SDL_Texture* m_spellIconTextures[kSpellCount] = {}; // HUD 图标（同上）
 
     // ---- 卡牌鼠标选择运行时（批五A）----
     int m_hoverCard = -1;                // 悬停卡位序（-1 = 无；LevelUp 每固定步刷新，渲染高亮消费）

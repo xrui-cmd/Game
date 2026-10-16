@@ -163,6 +163,22 @@ public:
     // 逻辑完整（MonsterAi::healedHpAfterReturn），本批默认不生效
     void setReturnHealPercent(float percent) { m_ai.setReturnHealPercent(percent); }
 
+    // ---- 减速乘区（批五B：冰霜新星）----
+
+    // 施加减速：factor 为速度乘区（如 0.5 = 半速）、seconds 为持续时长。
+    // 连续减速（同一法术反复命中）：以最后一次施放为准——乘区与时长都被
+    // 覆盖刷新（与「连续受击全部状态重新计时」同款口径）。
+    // 防御：seconds <= 0 忽略（不产生状态）；factor 夹到 [0,1]
+    //（0 = 完全冻结的显式语义；>1 属于「加速」误用，夹回 1）
+    void applySlow(float factor, float seconds);
+
+    // 当前速度乘区（>0 的系数；无减速恒 1.0）：移动速度计算消费它，
+    // 单测/冒烟用它断言「减速是否生效」而不必观测位移
+    float speedFactor() const { return (m_slowLeft > 0.0f) ? m_slowFactor : 1.0f; }
+
+    // 减速剩余时长（秒；冒烟/单测查询用）
+    float slowLeft() const { return m_slowLeft; }
+
     // 注入世界指针（场景在 onEnter 时对各槽位调用一次；只借用不持有）：
     // 移动碰撞（分轴滑动 + 侧滑）与击退落点校验都经它执行。
     // 传 nullptr 视为「无墙世界」（防御——未注入时位移不限制、不崩溃）
@@ -213,6 +229,7 @@ public:
         m_alive = false;     // 未激活：不再更新/渲染/碰撞
         m_hasTarget = false; // 清追踪目标：下次激活等场景重新注入
         m_hitTintLeft = 0.0f; // 清受击红染：新生成的怪物不带受击光效
+        clearSlowState();    // 清减速乘区（批五B：池复用不带旧减速）
         m_ai.clear();        // AI 状态回巡逻（巢保留——下次 spawnAt 会重写）
         clearMotionState();  // 清持久化侧滑与卡死检测窗口
         clearAttackState();  // 清攻击状态（批四：出招阶段/冷却/脉冲不跨生命周期）
@@ -362,6 +379,10 @@ private:
     int m_maxHp = 0;          // 当前生命上限（同上；血条比例与回血夹取读它）
     float m_hitTintLeft = 0.0f; // 受击红染剩余时长（秒；>0 时 render 叠加红光）
 
+    // ---- 减速乘区运行时（批五B：冰霜新星）----
+    float m_slowFactor = 1.0f; // 速度乘区（applySlow 写入；无减速 = 1）
+    float m_slowLeft = 0.0f;   // 减速剩余时长（秒；>0 时乘区生效）
+
     bool m_hasTarget = false;  // 玩家目标是否已注入（false 时 AI 视为玩家不可见）
     float m_targetX = 0.0f;    // 目标点 x（世界坐标，玩家碰撞盒中心）
     float m_targetY = 0.0f;    // 目标点 y（同上）
@@ -407,6 +428,14 @@ private:
     // ---- 玩家盒实心（批四·体积碰撞）：场景每步注入的玩家碰撞盒快照 ----
     SDL_FRect m_playerBox{};          // 玩家脚盒（世界坐标；setPlayerBlocker 写入）
     bool m_hasPlayerBlocker = false;  // 是否已注入（false = 移动只对墙实心）
+
+    // 清减速乘区（despawn 与 spawnAt 复用；批五B）：乘区回 1、时长归零——
+    // 池槽位复用时旧怪物的减速绝不带进新怪物
+    void clearSlowState()
+    {
+        m_slowFactor = 1.0f; // 乘区回 1（无减速）
+        m_slowLeft = 0.0f;   // 时长归零
+    }
 
     // 清侧滑/卡死检测运行时（despawn 与 spawnAt 复用；落点/状态突变后
     // 旧窗口数据不再有意义——清零避免把旧怪的卡死统计带进新怪）

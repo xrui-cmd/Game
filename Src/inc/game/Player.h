@@ -219,13 +219,15 @@ public:
     // 不在扫程中时按「已完成」返回 1
     float swingProgress01() const;
 
+    // 插值后的玩家中心点（渲染坐标）：横扫表现挂点用——与实体绘制使用
+    // 同一条「prev -> cur 按 alpha 线性插值」公式。
+    // 批五B 起公开：法术特效（灼烧光环/护盾罩的挂点）需要与玩家绘制
+    // 严格同源的插值中心——各算各的会随调参漂移（同 CardLayout 的纪律）
+    SDL_FPoint interpolatedCenter(float alpha) const;
+
 private:
     // 释放武器纹理并置空（析构兜底；幂等）
     void releaseWeapon();
-
-    // 插值后的玩家中心点（渲染坐标）：横扫表现挂点用——与实体绘制使用
-    // 同一条「prev -> cur 按 alpha 线性插值」公式
-    SDL_FPoint interpolatedCenter(float alpha) const;
 
     float m_speed = kDefaultSpeed;         // 移动速度（像素/秒）：稳态速度上限，onEnter 时由配置覆盖
     float m_accel = kDefaultAccel;         // 加速度（像素/秒²）：有输入时的速度逼近速率
