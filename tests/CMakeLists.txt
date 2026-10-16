@@ -561,6 +561,41 @@ set_target_properties(spell_test PROPERTIES
 )
 
 # ============================================================
+#  分区单元测试（zone_test，批六甲）
+#
+#  被测对象：Src/inc/game/Zone.h（区表 / zoneAt 查询 / 移速乘区）+ 
+#  Src/inc/game/World.h 的几何常量（32 格区块 / 1536 像素）。
+#  与 xp_test 同模式：纯头文件逻辑，只依赖 SDL 头（SDL.h 的 SDL_FRect），
+#  不链接 SDL3 运行时——任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\zone_test.exe
+# ============================================================
+
+add_executable(zone_test zone_test.cpp)
+
+if (MSVC)
+    target_compile_options(zone_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Zone.h / World.h 位于游戏仓 Src/inc；
+# SDL3 头目录供 World.h 的 SDL.h 依赖（仅类型与内联函数，不链接）
+target_include_directories(zone_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(zone_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
+
+# ============================================================
 #  商店单元测试（shop_test，批五B；批六甲加效果描述）
 #
 #  被测对象：Src/inc/game/Shop.h（价格公式与可购判定）+
