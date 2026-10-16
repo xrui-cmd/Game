@@ -487,7 +487,6 @@ add_executable(player_hit_test
     ../libs/GameEngine/src/Entity.cpp
     ../libs/GameEngine/src/Input.cpp
 )
-
 if (MSVC)
     target_compile_options(player_hit_test PRIVATE /utf-8)
 endif()
@@ -518,6 +517,78 @@ add_custom_command(TARGET player_hit_test POST_BUILD
 
 # 产物统一输出到 tests\bin\，与其余测试一致
 set_target_properties(player_hit_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
+
+# ============================================================
+#  法术池单元测试（spell_test，批五B）
+#
+#  被测对象：Src/inc/game/Spell.h（六法术表 / 逐层参数 / 层数工具 /
+#  三抽抽取）+ Src/inc/game/ChoiceDraw.h（通用不重复抽取核心）+
+#  Src/inc/game/UpgradeCard.h 的注入件（CardSeedRandom 种子流 /
+#  LevelUpQueue 欠账队列——测试注入使用，行为回归另有 card_test）。
+#
+#  与 xp_test / card_test 同模式：不依赖 SDL3、无 .cpp、无链接，
+#  随机源经注入固定序列/种子，任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\spell_test.exe
+# ============================================================
+
+add_executable(spell_test spell_test.cpp)
+
+if (MSVC)
+    target_compile_options(spell_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Spell.h / ChoiceDraw.h / UpgradeCard.h 位于游戏仓 Src/inc
+target_include_directories(spell_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(spell_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
+
+# ============================================================
+#  商店单元测试（shop_test，批五B）
+#
+#  被测对象：Src/inc/game/Shop.h（价格公式与可购判定）+
+#  Src/inc/game/ShopLayout.h（九宫格面板布局——渲染与鼠标命中同一份）。
+#
+#  与 card_test 第 9 用例同模式：只依赖 SDL_rect.h 的类型与内联点测
+#  （SDL_PointInRectFloat），不链接 SDL3 运行时——任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\shop_test.exe
+# ============================================================
+
+add_executable(shop_test shop_test.cpp)
+
+if (MSVC)
+    target_compile_options(shop_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Shop.h / ShopLayout.h 位于游戏仓 Src/inc；
+# SDL3 头目录供 ShopLayout.h 的 SDL_rect.h 依赖（仅类型与内联函数）
+target_include_directories(shop_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(shop_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
