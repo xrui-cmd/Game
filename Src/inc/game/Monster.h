@@ -67,7 +67,24 @@ class Camera;
 //      36x30、底部内收 6px（setCollisionBox）——移动滑动、击退落点、
 //      游荡点校验、玩家互碰全部改用碰撞盒；渲染/血条照旧用完整精灵
 //      （48x48）。俯视角下「身体可叠压墙脚、脚盒不穿透」
+//  10. 攻击（批四·蓄力前扑，替换旧「纯接触即伤」）：玩家进入接触范围
+//      （双方碰撞盒触接 + 小余量）且冷却就绪时出招——蓄力 0.3s
+//      （移速归零 + 沿出招反方向轻微后倾 4px，给玩家躲避窗口，方向在
+//      出招瞬间朝玩家一次性锁定）→ 前扑（朝锁定方向短促前冲 10px，
+//      视觉与逻辑同步——位移经碰撞滑动）→ 结算：玩家仍在接触范围 =
+//      Hit、否则 Miss（蓄力落空）。结果经 consumeAttackResult 交场景
+//      消费（扣血/无敌/回弹/音效是场景职责）；出招后进入冷却
+//      （monster_attack_cooldown 注入）。出招瞬间的红色脉冲（0.1s）
+//      由 render 叠加绘制——素材复用不加新图
 // ============================================================
+
+// 怪物攻击结算结果（批四）：Monster 每步至多发布一次，场景消费一次
+enum class MonsterAttackResult
+{
+    None, // 本步无结算（未构成一次完整出招）
+    Miss, // 前扑结束、玩家已不在接触范围（蓄力落空——躲开了）
+    Hit   // 前扑结束、玩家仍在接触范围（是否真扣血由场景按无敌状态裁决）
+};
 
 // 怪物变体枚举：等权随机刷新的取值范围（Count 恒为变体数量，用作随机上界）
 enum class MonsterType
@@ -116,10 +133,11 @@ public:
     // 查变体表（唯一数据源）；场景在击杀结算时按它掉落
     int coinDrop() const;
 
-    // 设置本步的追踪目标点（传玩家矩形，内部取中心存储）。
-    // PlayScene 每个固定步在 update 前调用——「场景注入、实体执行」的分工：
-    // 目标切换、难度曲线等玩法规则全部留在场景层。批三起它同时是
-    // AI「仇恨判定」的玩家位置来源（玩家可见 = hasTarget）
+    // 设置本步的追踪目标点（传玩家「碰撞盒」，内部取中心存储；批四起
+    // 同时留存完整盒——攻击接触范围判定用）。PlayScene 每个固定步在
+    // update 前调用——「场景注入、实体执行」的分工：目标切换、难度曲线
+    // 等玩法规则全部留在场景层。它同时是 AI「仇恨判定」的玩家位置来源
+    // （玩家可见 = hasTarget）
     void setTarget(const SDL_FRect& targetRect);
 
     // 清除追踪目标：之后 AI 视为「玩家不可见」（不仇恨；追击防御性
@@ -178,6 +196,7 @@ public:
         m_flashLeft = 0.0f;  // 清闪白：新生成的怪物不带受击光效
         m_ai.clear();        // AI 状态回巡逻（巢保留——下次 spawnAt 会重写）
         clearMotionState();  // 清持久化侧滑与卡死检测窗口
+        clearAttackState();  // 清攻击状态（批四：出招阶段/冷却/脉冲不跨生命周期）
     }
 
     // 被撞开/被击退：沿「(fromX, fromY) -> 怪物中心」的方向（即远离伤害
@@ -188,6 +207,26 @@ public:
     // 横扫命中用较短的微击退（保持追击压力、方便连扫补刀）。
     // 瞬移类操作：内部同步插值快照（防拉丝）
     void knockback(float fromX, float fromY, float distance);
+
+    // ---- 攻击（批四·蓄力前扑）----
+
+    // 命中回弹距离（像素）：攻击命中时怪物沿「玩家 -> 怪物」方向弹开的
+    // 距离（约 40，替换旧版接触 150px 弹开）。公开常量：由场景在命中
+    // 结算时经 knockback 调用——「回弹是攻击的一部分」，数值与攻击
+    // 其余常量（蓄力/前冲）集中在本类维护
+    static constexpr float kAttackRecoilDistance = 40.0f;
+
+    // 设置攻击冷却（秒）：PlayScene 在 onEnter 时用配置值注入
+    // （monster_attack_cooldown，默认 1.2 秒）——两次出招之间的最小间隔。
+    // 负数属于配置错误：忽略并警告，保留原冷却；0 允许（连续出招）
+    void setAttackCooldown(float seconds);
+
+    // 消费本步攻击结算结果（场景在每个 update 之后调用一次）：返回并
+    // 立即清除——Hit/Miss 各自只发布一次，绝不重复结算
+    MonsterAttackResult consumeAttackResult();
+
+    // 攻击是否进行中（蓄力或前扑）：冒烟与单测的查询点
+    bool attacking() const { return m_attackPhase != AttackPhase::None; }
 
     // 覆写更新：AI 状态决策（MonsterAi）+ 帧动画 + 闪白计时 + 朝目标移动
     //（移动经世界碰撞与绕墙轻量改进）；状态切换/回巢事件的日志也在此处
@@ -250,6 +289,22 @@ private:
     static constexpr float kHpBarHeight = 5.0f;  // 血条高（像素；规格 5）
     static constexpr float kHpBarGapY = 6.0f;    // 头顶与血条底边的间隙（像素）
 
+    // ---- 攻击（批四·蓄力前扑）：常量与内部状态机 ----
+    // 蓄力/前冲/回弹为「代码常量并注释」（规格口径）——回弹距离公开见
+    // 上方 kAttackRecoilDistance（场景命中结算消费），其余仅本类内部使用
+    static constexpr float kDefaultAttackCooldown = 1.2f;  // 缺省冷却（秒）：monster_attack_cooldown 缺键回退
+    static constexpr float kAttackWindupSeconds = 0.3f;    // 蓄力时长（秒；规格 0.2~0.4 取中值）——躲避窗口
+    static constexpr float kAttackLungeDistance = 10.0f;   // 前冲距离（像素；规格约 10）
+    static constexpr float kAttackLungeSeconds = 0.1f;     // 前冲时长（秒）：前冲速度 = 距离/时长 = 100px/s
+    static constexpr float kAttackLeanDistance = 4.0f;     // 蓄力后倾距离（像素）：沿反方向的「轻微后倾」总位移
+    static constexpr float kAttackPulseSeconds = 0.1f;     // 出招染色脉冲时长（秒；规格约 0.1）
+    static constexpr float kAttackContactMargin = 6.0f;    // 接触范围余量（像素）：碰撞盒触接之外再放宽 6px
+    static constexpr float kAttackDirEpsilon = 0.001f;     // 出招方向零向量阈值（长度小于它退回默认方向）
+
+    // 攻击阶段（内部状态机）：None 平时 / Windup 蓄力 / Lunge 前扑。
+    // 「结算」不单列阶段——前扑走完的那一步就地判定 Hit/Miss 并回 None
+    enum class AttackPhase { None, Windup, Lunge };
+
     static constexpr int kFrameCount = 4; // 每个变体精灵表的总帧数（4 帧 x 48px = 192px 宽）
 
     MonsterType m_type = MonsterType::Goblin; // 当前变体（默认哥布林；刷新时由场景指定）
@@ -260,9 +315,21 @@ private:
     float m_flashLeft = 0.0f; // 受击闪白剩余时长（秒；>0 时 render 叠加提亮）
 
     bool m_hasTarget = false;  // 玩家目标是否已注入（false 时 AI 视为玩家不可见）
-    float m_targetX = 0.0f;    // 目标点 x（世界坐标，通常为玩家矩形中心）
+    float m_targetX = 0.0f;    // 目标点 x（世界坐标，玩家碰撞盒中心）
     float m_targetY = 0.0f;    // 目标点 y（同上）
+    SDL_FRect m_targetBox{};   // 玩家碰撞盒快照（批四：接触范围判定用完整盒）
     float m_chaseSpeed = 0.0f; // 本步移动速度（像素/秒，由场景注入）
+
+    // ---- 攻击运行时（批四）：状态机与待消费结果 ----
+    AttackPhase m_attackPhase = AttackPhase::None; // 当前攻击阶段（平时/蓄力/前扑）
+    float m_attackCooldown = kDefaultAttackCooldown; // 冷却总时长（秒）：setAttackCooldown 注入
+    float m_attackCooldownLeft = 0.0f; // 冷却剩余（秒）：<=0 且接触才可出招
+    float m_attackPhaseLeft = 0.0f;    // 当前阶段剩余时长（秒）：蓄力倒计时 / 前冲窗口兜底
+    float m_lungeRemaining = 0.0f;     // 前冲剩余距离（像素）：按实际位移扣减，走完即结算
+    float m_attackDirX = 1.0f;         // 出招锁定方向 x（单位向量；蓄力开始时朝玩家一次性锁定）
+    float m_attackDirY = 0.0f;         // 出招锁定方向 y（同上）
+    float m_attackPulseLeft = 0.0f;    // 出招染色脉冲剩余时长（秒）：>0 时 render 叠加偏红
+    MonsterAttackResult m_attackResult = MonsterAttackResult::None; // 待消费结果（每步至多一条）
 
     // AI 状态机（决策核心；参数/巢/回血百分比都封装在内部，见 MonsterAi）
     MonsterAi m_ai;
@@ -287,6 +354,36 @@ private:
         m_stuckWindowExpected = 0.0f; // 期望累计清零
         m_stuckWindowActual = 0.0f;   // 实际累计清零
     }
+
+    // 清攻击运行时（despawn 与 spawnAt 复用）：池槽位复用时旧怪物的
+    // 出招阶段/冷却/脉冲/待消费结果绝不带进新怪物——「池复用后新怪
+    // 不带旧攻击状态」的判据（冒烟与单测覆盖）
+    void clearAttackState()
+    {
+        m_attackPhase = AttackPhase::None;          // 阶段回平时
+        m_attackCooldownLeft = 0.0f;                // 冷却清空：新怪接触即可出招
+        m_attackPhaseLeft = 0.0f;                   // 阶段计时清零
+        m_lungeRemaining = 0.0f;                    // 前冲预算清零
+        m_attackPulseLeft = 0.0f;                   // 染色脉冲熄灭
+        m_attackResult = MonsterAttackResult::None; // 待消费结果丢弃（不跨生命周期发布）
+    }
+
+    // 攻击状态机单步推进（蓄力后倾 -> 前扑前冲 -> 结算）：仅 update 内调用。
+    // 位移走 applyAttackMotion（墙 + 玩家盒的滑动），不参与卡死检测/侧滑
+    void advanceAttack(float dt);
+
+    // 出招开始：朝玩家一次性锁定方向（零向量退回向右）、启动蓄力计时与
+    // 染色脉冲、打出招日志（冒烟观测点「怪物出招（变体名）」）
+    void beginWindup();
+
+    // 玩家是否处于接触范围（双方碰撞盒触接 + kAttackContactMargin 余量）：
+    // 出招触发与命中结算共用的位置判据（玩家目标未注入时恒 false）
+    bool playerInContactRange() const;
+
+    // 攻击动作的短位移出口（蓄力后倾 / 前扑共用）：碰撞盒口径的分轴滑动
+    // + 位置落定。与 moveWithCollision 的差异：不做卡死检测/持久化侧滑——
+    // 攻击是短促的脚本化动作，不走绕行策略、不污染追击的卡死统计窗口
+    void applyAttackMotion(float dx, float dy);
 
     // 位移推进（含墙体碰撞 + 卡死检测 + 持久化侧滑）：本类移动的唯一出口，
     // 三种状态（巡逻/追击/回巢）共用。行为与参数说明见实现（Monster.cpp）

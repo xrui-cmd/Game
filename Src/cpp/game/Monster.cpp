@@ -1,6 +1,7 @@
 #include "game/Monster.h"
 #include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
 #include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
+#include "engine/Rect.h"    // rectsOverlap：攻击接触范围（碰撞盒 + 余量）的 AABB 判定
 #include <algorithm> // std::clamp / std::max：闪白计时、滑移权重与战斗数值的上下界
 #include <cmath>     // std::sqrt：归一化方向、距离与侧滑权重的计算
 
@@ -101,9 +102,11 @@ int Monster::coinDrop() const
     return kVariants[variantIndex(m_type)].coinDrop;
 }
 
-// 设置追踪目标：只存目标矩形的中心点——AI 的仇恨判定与追迹都以此为玩家位置
+// 设置追踪目标：存完整目标盒（接触范围判定用）与中心点（AI 追迹用）。
+// 批四起场景传入的是「玩家碰撞盒」——AI 距离、攻击距离与移动判定同一口径
 void Monster::setTarget(const SDL_FRect& targetRect)
 {
+    m_targetBox = targetRect;                       // 完整盒留存：接触范围判定的空间基准
     m_targetX = targetRect.x + targetRect.w * 0.5f; // 目标中心 x：矩形左上角 + 半宽
     m_targetY = targetRect.y + targetRect.h * 0.5f; // 目标中心 y：矩形左上角 + 半高
     m_hasTarget = true;                             // 标记玩家可见：AI 开始做仇恨判定
@@ -160,6 +163,7 @@ void Monster::spawnAt(float centerX, float centerY)
     m_ai.setRandom(&monsterAiRandom, nullptr); // 随机源：SDL 随机流适配
     m_ai.reset(centerX, centerY);              // 巢 = 本落点；状态清回巡逻
     clearMotionState();                        // 侧滑/卡死检测窗口清零（新怪的干净起点）
+    clearAttackState();                        // 攻击状态清零（批四：池复用不带旧出招）
 
     // 瞬移类操作的插值收尾（重点）：出生是「瞬间换位」，必须把插值快照
     // 对齐到新落点，否则渲染会从上一位置向新落点拉丝（延续既有纪律）
@@ -231,6 +235,155 @@ void Monster::knockback(float fromX, float fromY, float distance)
     // 比「卡进墙里出不来」好；位置未变，插值区间保持原样（无需快照）
 }
 
+// ============================================================
+// 攻击（批四·蓄力前扑）：状态机与结算
+// ============================================================
+
+// 设置攻击冷却：配置驱动的入口（对应 monster_attack_cooldown，默认 1.2s）
+void Monster::setAttackCooldown(float seconds)
+{
+    // 负冷却无意义（会让冷却剩余出现反向拉扯）：忽略并警告，保留原值；
+    // 0 允许（无冷却——连续出招的显式调试语义）
+    if (seconds < 0.0f)
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "怪物攻击冷却不能为负数（收到 %f），忽略该配置", seconds);
+        return;
+    }
+
+    m_attackCooldown = seconds; // 覆盖冷却总时长：其后的出招使用新值
+}
+
+// 消费攻击结算结果：返回并立即清除——每次 Hit/Miss 只发布一次
+MonsterAttackResult Monster::consumeAttackResult()
+{
+    const MonsterAttackResult result = m_attackResult; // 取走待消费结果
+    m_attackResult = MonsterAttackResult::None;        // 清除：杜绝重复结算
+    return result;                                     // 交场景做伤害/日志/回弹
+}
+
+// 出招开始：朝玩家一次性锁定方向、启动蓄力计时与染色脉冲、打出招日志
+void Monster::beginWindup()
+{
+    // 方向锁定在「出招瞬间」：蓄力期间玩家移动 = 躲避窗口——前扑朝旧
+    // 位置方向、躲开即落空（规格「给玩家躲避窗口」的实现口径，报告注明）
+    const float centerX = m_x + m_w * 0.5f; // 自身中心 x（世界坐标）
+    const float centerY = m_y + m_h * 0.5f; // 自身中心 y
+    const float dx = m_targetX - centerX;   // 指向玩家中心的向量 x
+    const float dy = m_targetY - centerY;   // 指向玩家中心的向量 y
+    const float length = std::sqrt(dx * dx + dy * dy); // 方向长度
+
+    // 归一化；长度过小（完全重合等退化情形）退回默认向右——确定性方向，
+    // 绝不产生 NaN（与击退/挥砍等既有方向零向量防御同一口径）
+    if (length > kAttackDirEpsilon)
+    {
+        m_attackDirX = dx / length; // 单位方向 x：占全长的比例
+        m_attackDirY = dy / length; // 单位方向 y
+    }
+    else
+    {
+        m_attackDirX = 1.0f; // 默认向右（确定性，便于观察与复现）
+        m_attackDirY = 0.0f; // 水平方向
+    }
+
+    m_attackPhase = AttackPhase::Windup;      // 进入蓄力（本步起常规移动被接管）
+    m_attackPhaseLeft = kAttackWindupSeconds; // 蓄力倒计时（0.3s）
+    m_lungeRemaining = kAttackLungeDistance;  // 前冲预算就位（前扑阶段消费）
+    m_attackPulseLeft = kAttackPulseSeconds;  // 出招瞬间染色脉冲（0.1s）
+
+    // 冒烟观测点：出招日志（含变体名——自动化测试断言「接触才出招」）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "怪物出招（%s）", monsterTypeName(m_type));
+}
+
+// 玩家是否处于接触范围（双方碰撞盒触接 + 小余量）：出招与命中共用判据
+bool Monster::playerInContactRange() const
+{
+    // 玩家目标未注入（防御路径）：视为不在范围（不可能出招）
+    if (!m_hasTarget)
+    {
+        return false;
+    }
+
+    // 判定 = 「玩家碰撞盒外扩余量」与「自身碰撞盒」的 AABB 相交：
+    // 外扩把「触接（恰好贴合，rectsOverlap 约定不算相交）」也纳入范围，
+    // 再放宽 kAttackContactMargin（6px）——「接触范围 = 触接 + 小余量」
+    const SDL_FRect expanded{ m_targetBox.x - kAttackContactMargin,        // 左边界外扩
+                              m_targetBox.y - kAttackContactMargin,        // 上边界外扩
+                              m_targetBox.w + kAttackContactMargin * 2.0f, // 宽：两侧各扩
+                              m_targetBox.h + kAttackContactMargin * 2.0f }; // 高：上下各扩
+    return rectsOverlap(expanded, collisionRect()); // 与自身脚盒相交 = 在范围内
+}
+
+// 攻击状态机单步推进：蓄力（后倾）-> 前扑（前冲）-> 结算 Hit/Miss
+void Monster::advanceAttack(float dt)
+{
+    if (m_attackPhase == AttackPhase::Windup)
+    {
+        // 蓄力：移速归零（常规移动已被本状态接管）+ 轻微后倾——沿出招
+        // 反方向以恒低速后退（总位移 ≈ kAttackLeanDistance 4px / 0.3s）。
+        // 后倾是真实位移（经碰撞滑动；贴墙时会被挡住——可接受的边界），
+        // 「视觉后倾与逻辑同一位置」由此保证
+        const float leanSpeed = kAttackLeanDistance / kAttackWindupSeconds; // 后倾速度（px/s）
+        applyAttackMotion(-m_attackDirX * leanSpeed * dt,  // 反向 x 位移
+                          -m_attackDirY * leanSpeed * dt); // 反向 y 位移
+
+        m_attackPhaseLeft -= dt; // 蓄力倒计时（固定步递减，暂停时冻结）
+        if (m_attackPhaseLeft <= 0.0f)
+        {
+            m_attackPhase = AttackPhase::Lunge;      // 蓄力结束 -> 前扑
+            m_attackPhaseLeft = kAttackLungeSeconds; // 前冲窗口（时长兜底：被挡也能收招）
+        }
+        return; // 本步只走蓄力阶段
+    }
+
+    // ---- Lunge（前扑）：朝锁定方向短促前冲（视觉与逻辑同步）----
+    const float lungeSpeed = kAttackLungeDistance / kAttackLungeSeconds; // 前冲速度（100px/s）
+    const float step = std::min(lungeSpeed * dt, m_lungeRemaining);       // 本步前冲量（不超预算）
+
+    const float beforeX = m_x; // 前冲前的精灵 x（统计实际位移用）
+    const float beforeY = m_y; // 前冲前的精灵 y
+    applyAttackMotion(m_attackDirX * step,  // 朝锁定方向前冲（经碰撞滑动）
+                      m_attackDirY * step);
+    const float movedX = m_x - beforeX; // 实际位移 x（被墙/玩家挡会变短）
+    const float movedY = m_y - beforeY; // 实际位移 y
+    const float moved = std::sqrt(movedX * movedX + movedY * movedY); // 实际前冲距离（像素）
+
+    // 预算按「实际走完的距离」扣减（被挡到挪不动时靠时长兜底收招——
+    // 两者取先到者，绝不会滞留在前扑阶段）
+    m_lungeRemaining -= moved;
+    m_attackPhaseLeft -= dt;
+
+    // 预算耗尽或窗口超时：一次出招结束 -> 就地结算命中
+    if (m_lungeRemaining <= 0.01f || m_attackPhaseLeft <= 0.0f)
+    {
+        // 结算：玩家是否仍在接触范围（碰撞盒触接 + 余量）——「蓄力落空
+        // （玩家已离开）」与命中由此区分；是否真扣血由场景按无敌状态裁决
+        m_attackResult = playerInContactRange() ? MonsterAttackResult::Hit
+                                                : MonsterAttackResult::Miss;
+        m_attackPhase = AttackPhase::None;       // 阶段复位：回归常规 AI 移动
+        m_attackCooldownLeft = m_attackCooldown; // 出招后进入冷却（monster_attack_cooldown）
+    }
+}
+
+// 攻击动作的短位移出口（蓄力后倾 / 前扑共用）
+void Monster::applyAttackMotion(float dx, float dy)
+{
+    // 世界未注入（防御）：退化为无碰撞位移（与 moveWithCollision 同款降级）
+    if (m_world == nullptr)
+    {
+        m_x += dx; // 直接推进 x
+        m_y += dy; // 直接推进 y
+        return;
+    }
+
+    // 碰撞盒口径的分轴滑动（墙；批四·体积碰撞并入「玩家盒实心」）：
+    // 短促动作不走卡死检测/侧滑——攻击有明确的时长与预算，被挡就等结算
+    const SDL_FRect col = collisionRect(); // 本步起点的碰撞盒（世界坐标）
+    const SDL_FPoint movedBox = m_world->slideMove(col.x, col.y, col.w, col.h, dx, dy);
+    m_x += movedBox.x - col.x; // 落点折算回精灵左上角（偏移恒定，位移量一致）
+    m_y += movedBox.y - col.y; // 同上（y 轴）
+}
+
 // 覆写更新：AI 状态决策 + 帧动画 + 闪白计时 + 朝目标点移动（移动经世界碰撞）。
 // 分工：AI（MonsterAi）只做状态/目标决策；本函数把决策执行成位移，
 // 并在状态切换/到巢事件上打日志、结回血——「场景注入、实体执行」的延续
@@ -248,6 +401,13 @@ void Monster::update(const UpdateContext& ctx)
     if (m_flashLeft > 0.0f)
     {
         m_flashLeft = std::max(m_flashLeft - ctx.deltaTime, 0.0f);
+    }
+
+    // 出招染色脉冲计时递减（批四）：与闪白同款固定步递减——脉冲只亮
+    // 出招瞬间的 0.1s，之后自然熄灭（render 据此决定是否叠加偏红）
+    if (m_attackPulseLeft > 0.0f)
+    {
+        m_attackPulseLeft = std::max(m_attackPulseLeft - ctx.deltaTime, 0.0f);
     }
 
     // 怪物中心（世界坐标）：AI 判定的自身位置基准
@@ -325,6 +485,28 @@ void Monster::update(const UpdateContext& ctx)
             // 巢必可走（出生落点校验保证），不会死循环也不会卡进墙
             m_ai.setPatrolTarget(nestX, nestY);
         }
+    }
+
+    // ---- 攻击状态机（批四·蓄力前扑，替换旧「纯接触即伤」）----
+    // 冷却推进（仅 Playing 分支能走到这里，暂停随世界冻结）
+    if (m_attackCooldownLeft > 0.0f)
+    {
+        m_attackCooldownLeft = std::max(m_attackCooldownLeft - ctx.deltaTime, 0.0f);
+    }
+
+    // 平时（非攻击中）：接触范围 + 冷却就绪 -> 出招（锁定方向、进入蓄力）
+    if (m_attackPhase == AttackPhase::None &&
+        m_attackCooldownLeft <= 0.0f && playerInContactRange())
+    {
+        beginWindup(); // 出招：日志 + 染色脉冲 + 朝玩家锁定方向
+    }
+
+    // 攻击进行中：推进蓄力/前扑并跳过常规移动——「蓄力移速归零」由
+    // 「常规移动被本分支接管」实现（AI 决策已在上方完成，状态日志不缺失）
+    if (m_attackPhase != AttackPhase::None)
+    {
+        advanceAttack(ctx.deltaTime); // 蓄力后倾 -> 前扑前冲 -> Hit/Miss 结算
+        return;                       // 本步不再执行常规移动
     }
 
     // 无移动目标（巡逻停顿/等供水）：原地只播动画（防御性分支）
@@ -584,6 +766,19 @@ void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) 
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
     //（基类内部完成世界坐标 -> 屏幕坐标的相机换算）
     Entity::render(renderer, alpha, camera);
+
+    // 出招染色脉冲（批四）：出招瞬间 0.1s 内把同一帧以「偏红加色」再画
+    // 一遍——出招信号的视觉电报（素材复用，不加新图）。同受击闪白的
+    // 「叠加混合」技巧：ADD 混合 + 颜色调制压掉大部分绿蓝通道 = 红光脉冲
+    if (m_attackPulseLeft > 0.0f && m_texture != nullptr)
+    {
+        SDL_SetTextureColorMod(m_texture, 255, 60, 60);        // 偏红：只留少量绿蓝参与加色
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD); // 叠加混合：在底色上「加光」
+        Entity::render(renderer, alpha, camera);               // 第二次绘制：红光脉冲
+        // 还原纹理状态（颜色调制回全白、混合回默认）——防污染后续绘制
+        SDL_SetTextureColorMod(m_texture, 255, 255, 255);
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
+    }
 
     // 闪白叠加：只有「正在闪白」且纹理已加载时执行
     if (m_flashLeft > 0.0f && m_texture != nullptr)

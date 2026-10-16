@@ -60,7 +60,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      monster_speed_growth    怪物速度成长（像素/秒²，按局内秒数叠加）
     //      monster_spawn_interval  刷新间隔初始值（秒，随局内时间收紧）
     //      monster_max_count       数量上限初始值（只，随局内时间 +2）
-    //      monster_damage          怪物接触伤害
+    //      monster_damage          怪物攻击伤害（攻击命中时扣除的生命值）
+    //      monster_attack_cooldown 怪物攻击冷却（秒；两次出招的最小间隔）
     //      monster_patrol_radius   巡逻半径（像素；绕巢游荡范围）
     //      monster_aggro_radius    仇恨半径（像素；玩家进入即追击）
     //      monster_leash_radius    栓绳半径（像素；离巢超过即回巢）
@@ -91,6 +92,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_monsterSpawnInterval =
         config.getFloat("monster_spawn_interval", kDefaultMonsterSpawnInterval);
     m_monsterDamage = config.getInt("monster_damage", kDefaultMonsterDamage);
+    // 批四新增：怪物攻击冷却（秒）——负值夹到 0（0 = 连续出招的显式语义，
+    // 与 attack_cooldown 的防御口径一致）；注入时机见下方怪物池装配
+    m_monsterAttackCooldown =
+        std::max(0.0f, config.getFloat("monster_attack_cooldown", kDefaultMonsterAttackCooldown));
 
     // 批三新增：怪物生态参数（AI 决策半径 + 回巢回血预留键）。
     // 半径做下界夹取（负半径没有玩法语义——宁可按 0 处理，也不让
@@ -238,6 +243,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         monster.setWorld(&m_world);                          // 世界（碰撞）注入
         monster.setAiConfig(aiConfig);                       // AI 决策参数注入
         monster.setReturnHealPercent(m_monsterReturnHealPercent); // 回巢回血（0=关闭）
+        monster.setAttackCooldown(m_monsterAttackCooldown);  // 攻击冷却（批四；出招间隔）
     }
 
     // 13) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
@@ -464,6 +470,11 @@ void PlayScene::update(const UpdateContext& ctx)
     // （史莱姆 90 / 哥布林 110 / 骷髅 140） + 每秒成长 x 局内已过秒数，
     // 并统一封顶 kMonsterMaxSpeed（260——低于玩家速度，保证跑得掉）
 
+    // 玩家碰撞盒（脚部小盒，批四）：玩家已 update 完、本步位置不再变化——
+    // 怪物追踪/攻击接触判定与体积碰撞共用这一份快照（与渲染用的
+    // playerRect 分开：这里是物理口径）
+    const SDL_FRect playerBox = m_player.collisionRect();
+
     // 怪物追踪：每个存活怪物注入「本步目标 + 本步速度」后更新。
     // 「场景注入、实体执行」的分工让难度规则完全留在本层。
     // 批二门控：非激活区块内的怪物「暂停更新」（不删除、位置冻结——
@@ -492,9 +503,55 @@ void PlayScene::update(const UpdateContext& ctx)
             monster.baseSpeed() + m_monsterSpeedGrowth * m_monsterElapsed,
             kMonsterMaxSpeed);
 
-        monster.setTarget(playerRect); // 注入追踪目标（玩家矩形 → 中心点）
-        monster.setChaseSpeed(speed);  // 注入本步速度（难度曲线：随时间爬升）
-        monster.update(ctx);           // 执行：移动（碰撞滑动）+ 动画 + 闪白计时
+        monster.setTarget(playerBox); // 注入追踪目标（批四：玩家碰撞盒 → 中心点 + 完整盒）
+        monster.setChaseSpeed(speed); // 注入本步速度（难度曲线：随时间爬升）
+        monster.update(ctx);          // 执行：移动（碰撞滑动）+ 动画 + 闪白 + 攻击状态机
+
+        // ---- 攻击结算消费（批四·蓄力前扑，替换旧「纯接触即伤」）----
+        // 每只怪物每步至多发布一条结果（consumeAttackResult 返回并清除）
+        const MonsterAttackResult attack = monster.consumeAttackResult();
+        if (attack == MonsterAttackResult::Miss)
+        {
+            // 冒烟观测点：蓄力落空（玩家在躲避窗口内离开了接触范围）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "怪物攻击落空（%s）", monsterTypeName(monster.type()));
+        }
+        else if (attack == MonsterAttackResult::Hit)
+        {
+            // 玩家无敌期内：本次打击无效（无伤害/无日志/无回弹）——
+            // 「受击保护窗口」的语义由「跳过结算」表达（怪物照常进冷却）
+            if (m_playerInvincibleLeft <= 0.0f)
+            {
+                // 1) 扣生命（夹到 0：日志展示永远不为负）
+                m_playerHp = std::max(m_playerHp - m_monsterDamage, 0);
+                // 冒烟观测点：攻击命中（含变体名与扣血明细——断言点）
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "怪物攻击命中（%s，扣 %d 点生命，剩余 %d/%d）",
+                            monsterTypeName(monster.type()),
+                            m_monsterDamage, m_playerHp, m_playerMaxHp);
+
+                // 2) 打击音效（低频闷响）：与渲染闪烁共同构成「被打」反馈
+                m_audio->play(SoundId::Hit);
+
+                // 3) 玩家无敌：从下一步起攻击结算跳过；渲染每 0.1s 显隐闪烁
+                m_playerInvincibleLeft = kPlayerInvincibleSeconds;
+
+                // 4) 怪物小幅回弹（约 40px，替换旧版 150px 弹开）：沿
+                //    「玩家盒中心 -> 怪物中心」方向瞬移；knockback 内部
+                //    做世界可走校验（被墙挡逐级缩短）并快照防拉丝
+                const float playerCenterX = playerBox.x + playerBox.w * 0.5f; // 玩家盒中心 x
+                const float playerCenterY = playerBox.y + playerBox.h * 0.5f; // 玩家盒中心 y
+                monster.knockback(playerCenterX, playerCenterY,
+                                  Monster::kAttackRecoilDistance);
+
+                // 5) 生命归零：本步提前结束怪物遍历（GameOver 由循环后的
+                //    统一检查收口；后续怪物不再留下会结算的 Hit）
+                if (m_playerHp <= 0)
+                {
+                    break;
+                }
+            }
+        }
     }
 
     // 经验宝石：推进旋转动画 -> 拾取判定 -> 统一清理
@@ -553,47 +610,9 @@ void PlayScene::update(const UpdateContext& ctx)
     // 统一清理已被拾取的金币（保持其余元素的地址不变）
     std::erase_if(m_coins, [](const Coin& coin) { return coin.isPicked(); });
 
-    // 接触伤害：仅玩家非无敌时整段检测（无敌期 = 保护窗口，跳过判定）。
-    // 命中结算：扣生命、播 hit 音效、玩家进入无敌、怪物弹开；
-    // 同一步至多结算一次（结算后玩家立即无敌，其余怪物不再判定）。
-    // 批四：触碰判定改用双方「脚部碰撞盒」——全身像可视觉交叠、脚盒
-    // 触碰才结算（与移动/出生同一口径；怪物攻击替换本机制于后续提交）
-    if (m_playerInvincibleLeft <= 0.0f)
-    {
-        const SDL_FRect playerBox = m_player.collisionRect(); // 玩家脚盒（本步快照）
-        for (Monster& monster : m_monsters)
-        {
-            // 空槽位或与本步玩家脚盒不相交：检查下一只（逐只独立判定）
-            if (!monster.isAlive() || !rectsOverlap(playerBox, monster.collisionRect()))
-            {
-                continue;
-            }
-
-            // 1) 扣生命（夹到 0：日志展示永远不为负）
-            m_playerHp = std::max(m_playerHp - m_monsterDamage, 0);
-            // 冒烟观测点：受击日志（自动化测试据此断言扣血链路）
-            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "被怪物击中，扣 %d 点生命（剩余 %d/%d）",
-                        m_monsterDamage, m_playerHp, m_playerMaxHp);
-
-            // 2) 打击音效（低频「闷响」）：与渲染闪烁共同构成「被撞」反馈
-            m_audio->play(SoundId::Hit);
-
-            // 3) 玩家无敌：碰撞检测从下一步起跳过；渲染上每 0.1s 显/隐交替
-            m_playerInvincibleLeft = kPlayerInvincibleSeconds;
-
-            // 4) 怪物弹开：沿「玩家盒中心 -> 怪物中心」方向瞬移 150px（沿用机制）。
-            //    knockback 是瞬移类操作：内部对落点做世界可走校验（被墙挡
-            //    逐级缩短）并快照 prev=cur 防止插值拉丝；批四起弹开方向
-            //    取自玩家脚盒中心（与触碰判定同一口径）
-            const float playerCenterX = playerBox.x + playerBox.w * 0.5f;
-            const float playerCenterY = playerBox.y + playerBox.h * 0.5f;
-            monster.knockback(playerCenterX, playerCenterY,
-                              kContactKnockbackDistance);
-
-            break; // 玩家已进入无敌：本步的其余怪物不再判定
-        }
-    }
+    // 说明（批四）：旧「纯接触即伤」的接触伤害块已删除——怪物攻击改为
+    // 「蓄力前扑」状态机（见上方怪物循环内的结果消费）：接触范围的伤害
+    // 不再由「一步一碰」直接结算，而是怪物出招命中才扣血
 
     // 生命归零：进入 GameOver（唯一入口——GameOver 仅因生命归零触发）
     if (m_playerHp <= 0)

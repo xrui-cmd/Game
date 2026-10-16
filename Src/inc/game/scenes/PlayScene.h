@@ -67,12 +67,17 @@
 //        _percent 为预留键、默认关闭）；
 //        刷新节奏与难度曲线沿用（数量上限初始 4、每 20s +2、封顶 12；
 //        刷新间隔初始 2.5s、随局内时间收紧、下限 1s；首刷延迟 2s）；
-//        接触伤害 10；
 //      - 怪物受击扣血 + 闪白 + 击退；死亡 +1 击杀并原地掉落经验宝石
 //        与金币（批三：金币数按变体——史莱姆 1 / 哥布林 2 / 骷髅 1）；
 //        金币为「局内货币」：拾取计数（音效沿用 coin.wav）、本局累计、
 //        R 重开清零；本批只储备不消费（为将来商店/强化体系铺路）；
-//      - 玩家 100 点生命：被撞扣血 + 0.8s 无敌闪烁 + 怪物弹开（150px）；
+//      - 怪物攻击（批四·蓄力前扑，替换旧「纯接触即伤」）：处于接触范围
+//        （双方碰撞盒触接 + 6px 余量）且冷却就绪 -> 蓄力 0.3s（移速归零 +
+//        轻微后倾，方向出招瞬间锁定——躲避窗口）-> 前扑前冲 10px ->
+//        若玩家仍在范围：扣 monster_damage（默认 10）、玩家 0.8s 无敌、
+//        怪物回弹 40px（替换旧 150px 弹开）+ hit 音效；冷却新键
+//        monster_attack_cooldown（默认 1.2s）；命中/落空/出招均有日志；
+//      - 玩家 100 点生命：被攻击命中扣血 + 0.8s 无敌闪烁 + 怪物回弹 40px；
 //      - 成长闭环：拾取宝石 +10 经验 -> 按 LevelCurve 曲线循环结算
 //        （溢出一枚可连升多级）-> 每级自动强化：生命上限 +10（并即时
 //        回血 10）、攻击伤害 +3、移速 +10；升级时「升级！」飘字（玩家
@@ -86,7 +91,8 @@
 //      降级环境安全空操作）、升级播 levelup（LevelupSfx 游戏层直读，
 //      见该类头文件说明——引擎 SoundId 扩展前的过渡实现）
 //   5. 配置：onEnter 时读取玩家速度/生命/攻击参数（冷却/伤害/半径/张角/
-//      击退/扫程时长 attack_swing_time）、怪物速度成长/刷新参数/接触伤害、
+//      击退/扫程时长 attack_swing_time）、怪物速度成长/刷新参数/攻击伤害
+//      （monster_damage）与攻击冷却（monster_attack_cooldown）、
 //      怪物生态（monster_patrol_radius 巡逻/monster_aggro_radius 仇恨/
 //      monster_leash_radius 栓绳/回巢回血 monster_return_heal_percent）、
 //      世界（world_chunks_x/y、world_seed）与相机（camera_smooth_time）、
@@ -236,7 +242,8 @@ private:
     static constexpr float kDefaultMonsterSpeedGrowth = 2.5f;   // 怪物速度成长（像素/秒²，按局内秒数叠加）
     static constexpr float kDefaultMonsterSpawnInterval = 2.5f; // 刷新间隔初始值（秒）
     static constexpr int kDefaultMonsterMaxCount = 4;           // 数量上限初始值（只）
-    static constexpr int kDefaultMonsterDamage = 10;            // 怪物接触伤害
+    static constexpr int kDefaultMonsterDamage = 10;            // 怪物攻击伤害（monster_damage，点；攻击命中时扣）
+    static constexpr float kDefaultMonsterAttackCooldown = 1.2f; // 怪物攻击冷却缺省（monster_attack_cooldown，秒）
     static constexpr float kDefaultMonsterPatrolRadius = 96.0f; // 巡逻半径缺省（monster_patrol_radius，像素）
     static constexpr float kDefaultMonsterAggroRadius = 320.0f; // 仇恨半径缺省（monster_aggro_radius，像素）
     static constexpr float kDefaultMonsterLeashRadius = 500.0f; // 栓绳半径缺省（monster_leash_radius，像素）
@@ -265,16 +272,13 @@ private:
     // （哥布林默认参数下约 60 秒到顶；骷髅更早、史莱姆稍晚）
     static constexpr float kMonsterMaxSpeed = 260.0f;
 
-    // 玩家被撞中后的无敌时长（秒）：期间跳过怪物碰撞检测、渲染每 0.1 秒闪烁。
-    // 固定玩法规则（不进配置文件）：0.8 秒足够拉开与击退后怪物的距离
+    // 玩家被攻击命中后的无敌时长（秒）：期间跳过怪物攻击的伤害结算、
+    // 渲染每 0.1 秒闪烁。固定玩法规则（不进配置文件）：0.8 秒配合
+    // 怪物命中回弹（40px）构成「受击保护窗口」
     static constexpr float kPlayerInvincibleSeconds = 0.8f;
 
     // 无敌闪烁的「半周期」（秒）：显 / 隐各占 0.1 秒，即每 0.1 秒切换一次
     static constexpr float kPlayerBlinkHalfPeriod = 0.1f;
-
-    // 接触伤害的怪物弹开距离（像素）：沿用既有机制 150——把怪物弹远，
-    // 配合 0.8s 无敌构成「受击保护窗口」
-    static constexpr float kContactKnockbackDistance = 150.0f;
 
     // ---- 怪物出生（批三正式版：激活区块内随机 walkable 点；出生点即巢）----
     // 采样区域 = 相机激活区块窗口（最多 3x3 区块；玩家所在区块 ±1），
@@ -380,7 +384,8 @@ private:
     float m_monsterSpeedGrowth = kDefaultMonsterSpeedGrowth; // 速度成长（monster_speed_growth）
     float m_monsterSpawnInterval = kDefaultMonsterSpawnInterval; // 刷新间隔初始值（monster_spawn_interval）
     int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）
-    int m_monsterDamage = kDefaultMonsterDamage;          // 接触伤害（monster_damage）
+    int m_monsterDamage = kDefaultMonsterDamage;          // 怪物攻击伤害（monster_damage）
+    float m_monsterAttackCooldown = kDefaultMonsterAttackCooldown; // 怪物攻击冷却（monster_attack_cooldown，秒）
 
     // 怪物生态参数（批三；AI 状态机的决策半径与回血——onEnter 读取后
     // 注入每个怪物槽位的 MonsterAi；整局沿用，R 重开不重读）
