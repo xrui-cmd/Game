@@ -38,9 +38,11 @@ class Camera;
 //      - 玩家出生点（草地区中心）周围 ±3 格为保护区（出生点绝不卡墙）；
 //      - 水域格不放随机墙与装饰（海洋只属于边界语义）；
 //   4. 激活窗口：以相机视图中心所在区块为基准 ±1（最多 3x3）。激活时把
-//      「地板 + 装饰 + 墙」烘焙成一张 1536x1536 区块纹理（构建一次）；
-//      滑出窗口的区块释放纹理。实体（怪物）是否更新/渲染由场景按
-//      isPointInActiveChunks 门控——非激活区暂停但不删除；
+//      「地板/水砖 + 装饰 + 墙」烘焙成一张 1536x1536 区块纹理（构建一次）；
+//      每格按「本格所属区」（game/Zone.h）选素材表——草地区用地牢原色、
+//      雪山区用冰霜重染色版（批六甲第三笔）；滑出窗口的区块释放纹理。
+//      实体（怪物）是否更新/渲染由场景按 isPointInActiveChunks 门控——
+//      非激活区暂停但不删除；
 //   5. 格级碰撞：isRectWalkable 查「矩形覆盖的全部格是否无墙且非水域」；
 //      slideMove 提供「分轴位移 + 撞墙滑动」的纯函数——玩家与怪物共用。
 //
@@ -49,14 +51,17 @@ class Camera;
 //   - 区块索引 = floor(像素 / kChunkPixels)；区块与格皆可为负（表示世界外）——
 //     wallAt 对世界外统一按「墙」处理（实体永远出不去）。
 //
-// 素材（由 tools/compose_sprites.ps1 组装；雪山区冰霜重染色版见批六甲
-// 第三笔，水砖为程序化绘制）：
-//   assets/tiles_floor.png  地板变体表（8 帧 x 48px，横向排列）
-//   assets/tiles_wall.png   墙块单帧（48x48）
-//   assets/decor_sheet.png  装饰表（skull 48x48 @x=0；crate 48x72 @x=48）
-//   assets/tiles_water.png  海洋水砖变体表（3 帧 x 48px，横向排列）
+// 素材（由 tools/compose_sprites.ps1 组装；雪山区为冰霜重染色版，
+// 水砖为程序化绘制）：
+//   assets/tiles_floor.png       地板变体表（8 帧 x 48px，横向排列）
+//   assets/tiles_wall.png        墙块单帧（48x48）
+//   assets/decor_sheet.png       装饰表（skull 48x48 @x=0；crate 48x72 @x=48）
+//   assets/tiles_water.png       海洋水砖变体表（3 帧 x 48px，横向排列）
+//   assets/tiles_floor_snow.png  雪山地板变体表（同尺寸；冰霜重染色）
+//   assets/tiles_wall_snow.png   雪山墙块（48x48；冰霜重染色）
+//   assets/decor_sheet_snow.png  雪山装饰表（96x72；冰霜重染色）
 //   任何素材缺失都不崩溃：烘焙退化为纯色色块（地板深灰、墙更深、水砖
-//   深蓝）——延续「资源问题不让游戏崩溃」的全局降级契约。
+//   深蓝）或回退原色素材——延续「资源问题不让游戏崩溃」的全局降级契约。
 // ============================================================
 
 class World
@@ -280,6 +285,9 @@ private:
     SDL_Texture* m_wallTile = nullptr;   // 墙块单帧（48x48）
     SDL_Texture* m_decorSheet = nullptr; // 装饰表（skull 48x48 @0；crate 48x72 @48）
     SDL_Texture* m_waterTiles = nullptr; // 水砖变体表（3 帧 x 48px 横向排列；批六甲）
+    SDL_Texture* m_floorTilesSnow = nullptr; // 雪山地板变体表（冰霜重染色；批六甲）
+    SDL_Texture* m_wallTileSnow = nullptr;   // 雪山墙块（48x48；冰霜重染色）
+    SDL_Texture* m_decorSheetSnow = nullptr; // 雪山装饰表（96x72；冰霜重染色）
 };
 
 #endif // !__WORLD_H__

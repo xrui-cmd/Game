@@ -24,6 +24,10 @@
 #         decor_sheet.png          世界装饰表：skull（48x48）+ crate（48x72）
 #         tiles_water.png          海洋水砖变体表：3 帧，每帧 48x48（批六甲·
 #                                  海洋边界——深蓝基色 + 波纹层次，程序化绘制）
+#         tiles_floor_snow.png     雪山地板变体表：floor_1~floor_8 冰霜重染色
+#                                  8 帧（批六甲·雪山区——通道与亮度调整）
+#         tiles_wall_snow.png      雪山墙块：wall_mid 冰霜重染色 48x48
+#         decor_sheet_snow.png     雪山装饰表：skull + crate 冰霜重染色
 #
 # 设计原则：
 #   1. 幂等：可以重复运行，每次覆盖旧文件，输出结果一致（背景变体砖用固定
@@ -175,14 +179,51 @@ function Convert-SwapRedBlue {
 }
 
 # ------------------------------------------------------------
+# 工具函数：冰霜重染色（批六甲·雪山区素材）——「通道与亮度调整」实现
+# 参数：src 源图；返回同尺寸的新位图（调用方负责 Dispose）
+# 思路：冷色化 = 压红、略压绿、蓝通道「原蓝 + 红分量补偿 + 底色抬升」：
+#       - R' = min(255, R*0.50 + 16)  压红（暖色退场，亮度微抬）
+#       - G' = min(255, G*0.72 + 20)  略压绿（保留形状对比）
+#       - B' = min(255, B*0.60 + R*0.50 + 48)  蓝提亮（红分量补偿保住明暗层次）
+#       效果：褐色地牢素材整体推向冰蓝调——同一张图完成「雪山」换肤，
+#       不新增手绘素材。全透明像素保持全透明（不污染边缘）
+# ------------------------------------------------------------
+function Convert-FrostTint {
+    param([System.Drawing.Image]$src)
+    # 目标画布：与源图同尺寸、带透明通道
+    $dst = New-Canvas -width $src.Width -height $src.Height
+    # 逐像素染色（源帧仅 16px 级，全表也不过数千像素，无需优化）
+    for ($y = 0; $y -lt $src.Height; $y++) {
+        for ($x = 0; $x -lt $src.Width; $x++) {
+            # 取源像素（ARGB 各分量）
+            $p = $src.GetPixel($x, $y)
+            if ($p.A -eq 0) {
+                # 全透明像素：原样透明（RGB 不参与显示，保持干净）
+                $dst.SetPixel($x, $y, [System.Drawing.Color]::FromArgb(0, 0, 0, 0))
+                continue
+            }
+            # 通道与亮度调整（公式见函数头注释；min 夹到 255 防溢出）
+            $nr = [int][Math]::Min(255, [Math]::Round($p.R * 0.50 + 16))
+            $ng = [int][Math]::Min(255, [Math]::Round($p.G * 0.72 + 20))
+            $nb = [int][Math]::Min(255, [Math]::Round($p.B * 0.60 + $p.R * 0.50 + 48))
+            # 写入染色像素：A 原样
+            $dst.SetPixel($x, $y, [System.Drawing.Color]::FromArgb($p.A, $nr, $ng, $nb))
+        }
+    }
+    # 返回新位图（源图不动）
+    return $dst
+}
+
+# ------------------------------------------------------------
 # 工具函数：把一串帧横向拼成精灵表（每帧放大 $scale 倍）
 # 参数：names 帧文件名数组（顺序即帧序）；width/height 单帧原始尺寸；outPath 输出路径
 #       swapRedBlue 是否对每帧做 R<->B 换道（批三宝石染色用）
+#       frostTint 是否对每帧做冰霜重染色（批六甲雪山素材用）
 # 返回：无（直接写盘）
 # ------------------------------------------------------------
 function Compose-Sheet {
     param([string[]]$names, [int]$frameWidth, [int]$frameHeight, [string]$outPath,
-          [switch]$swapRedBlue)
+          [switch]$swapRedBlue, [switch]$frostTint)
     # 单帧放大后的宽高（整数倍：源尺寸 x 全局倍数）
     $fw = $frameWidth * $scale
     $fh = $frameHeight * $scale
@@ -195,10 +236,16 @@ function Compose-Sheet {
         for ($i = 0; $i -lt $names.Count; $i++) {
             # 加载本帧原始图
             $img = Get-Frame $names[$i]
-            # 需要染色时先换道出一张副本（原图仍负责释放；副本绘制后释放）
+            # 需要染色时先出一张副本（原图仍负责释放；副本绘制后释放）
             $useImg = $img
+            $tinted = $false # 是否创建过染色副本（决定 finally 是否释放副本）
             if ($swapRedBlue) {
                 $useImg = Convert-SwapRedBlue $img
+                $tinted = $true
+            }
+            elseif ($frostTint) {
+                $useImg = Convert-FrostTint $img
+                $tinted = $true
             }
             try {
                 # 本帧在表中的横向起点（帧内所有像素都落在这段区间里）
@@ -207,7 +254,7 @@ function Compose-Sheet {
                 Draw-ScaledAt -dstG $g -src $useImg -dx $dx -dy 0 -scaleFactor $scale
             } finally {
                 # 染色副本（若创建过）先释放——它不属于 Get-Frame 的调用方
-                if ($swapRedBlue) {
+                if ($tinted) {
                     $useImg.Dispose()
                 }
                 # 无论绘制成败都释放本帧的源图（关闭文件句柄）
@@ -226,16 +273,23 @@ function Compose-Sheet {
 
 # ------------------------------------------------------------
 # 工具函数：把单帧组装为「单帧回退素材」（放大 $scale 倍后另存）
-# 参数：name 帧文件名；outPath 输出路径；swapRedBlue 是否 R<->B 换道
+# 参数：name 帧文件名；outPath 输出路径；swapRedBlue 是否 R<->B 换道；
+#       frostTint 是否冰霜重染色（批六甲雪山素材用）
 # ------------------------------------------------------------
 function Compose-Single {
-    param([string]$name, [string]$outPath, [switch]$swapRedBlue)
+    param([string]$name, [string]$outPath, [switch]$swapRedBlue, [switch]$frostTint)
     # 加载唯一一帧原始图
     $img = Get-Frame $name
-    # 需要染色时先换道出一张副本
+    # 需要染色时先出一张副本
     $useImg = $img
+    $tinted = $false # 是否创建过染色副本（决定 finally 是否释放副本）
     if ($swapRedBlue) {
         $useImg = Convert-SwapRedBlue $img
+        $tinted = $true
+    }
+    elseif ($frostTint) {
+        $useImg = Convert-FrostTint $img
+        $tinted = $true
     }
     try {
         # 画布尺寸 = 单帧放大后的宽高
@@ -257,7 +311,7 @@ function Compose-Single {
         $single.Dispose()
     } finally {
         # 释放染色副本（若创建过）
-        if ($swapRedBlue) {
+        if ($tinted) {
             $useImg.Dispose()
         }
         # 释放源图
@@ -434,38 +488,72 @@ Compose-Sheet -names @(
 # ---- 6.2 世界墙块：wall_mid 单帧 3 倍 -> 48x48 ----
 Compose-Single -name "wall_mid" -outPath (Join-Path $assetsDir "tiles_wall.png")
 
-# ---- 6.3 世界装饰表：skull（48x48）+ crate（48x72）手排 ----
-# 画布宽 = (16 + 16) x 3 = 96；高 = max(16, 24) x 3 = 72（取较高帧）
-$decorBmp = New-Canvas -width 96 -height 72
-# 获取装饰画布的 Graphics 绘图对象（所有绘制都通过它进行）
-$decorG = [System.Drawing.Graphics]::FromImage($decorBmp)
-try {
-    # 第一帧：骷髅头（16x16 -> 48x48）落于 x=0（游戏侧裁剪源矩形 0,0,16,16）
-    $skullImg = Get-Frame "skull"
+# ---- 6.3 世界装饰表：skull（48x48）+ crate（48x72）手排（原色与雪山版共用函数）----
+# 参数：outPath 输出路径；frostTint 是否冰霜重染色（批六甲雪山装饰用）
+function Compose-DecorSheet {
+    param([string]$outPath, [switch]$frostTint)
+    # 画布宽 = (16 + 16) x 3 = 96；高 = max(16, 24) x 3 = 72（取较高帧）
+    $decorBmp = New-Canvas -width 96 -height 72
+    # 获取装饰画布的 Graphics 绘图对象（所有绘制都通过它进行）
+    $decorG = [System.Drawing.Graphics]::FromImage($decorBmp)
     try {
-        # 放大绘制到画布左半区
-        Draw-ScaledAt -dstG $decorG -src $skullImg -dx 0 -dy 0 -scaleFactor $scale
+        # 第一帧：骷髅头（16x16 -> 48x48）落于 x=0（游戏侧裁剪源矩形 0,0,16,16）
+        $skullImg = Get-Frame "skull"
+        $useSkull = $skullImg # 实际绘制的图（染色时替换为副本）
+        if ($frostTint) {
+            $useSkull = Convert-FrostTint $skullImg
+        }
+        try {
+            # 放大绘制到画布左半区
+            Draw-ScaledAt -dstG $decorG -src $useSkull -dx 0 -dy 0 -scaleFactor $scale
+        } finally {
+            # 染色副本先释放（若创建过），再释放骷髅源图（关闭文件句柄）
+            if ($frostTint) {
+                $useSkull.Dispose()
+            }
+            $skullImg.Dispose()
+        }
+        # 第二帧：木箱（16x24 -> 48x72）落于 x=48（游戏侧裁剪源矩形 16,0,16,24）
+        $crateImg = Get-Frame "crate"
+        $useCrate = $crateImg # 实际绘制的图（染色时替换为副本）
+        if ($frostTint) {
+            $useCrate = Convert-FrostTint $crateImg
+        }
+        try {
+            # 放大绘制到画布右半区（72 高恰好到画布底边）
+            Draw-ScaledAt -dstG $decorG -src $useCrate -dx 48 -dy 0 -scaleFactor $scale
+        } finally {
+            # 染色副本先释放（若创建过），再释放木箱源图
+            if ($frostTint) {
+                $useCrate.Dispose()
+            }
+            $crateImg.Dispose()
+        }
     } finally {
-        # 释放骷髅源图（关闭文件句柄）
-        $skullImg.Dispose()
+        # 释放装饰画布 Graphics（内部持有临时资源）
+        $decorG.Dispose()
     }
-    # 第二帧：木箱（16x24 -> 48x72）落于 x=48（游戏侧裁剪源矩形 16,0,16,24）
-    $crateImg = Get-Frame "crate"
-    try {
-        # 放大绘制到画布右半区（72 高恰好到画布底边）
-        Draw-ScaledAt -dstG $decorG -src $crateImg -dx 48 -dy 0 -scaleFactor $scale
-    } finally {
-        # 释放木箱源图（关闭文件句柄）
-        $crateImg.Dispose()
-    }
-} finally {
-    # 释放装饰画布 Graphics（内部持有临时资源）
-    $decorG.Dispose()
+    # 保存装饰表（幂等覆盖）
+    Save-Png -bitmap $decorBmp -path $outPath
+    # 释放装饰画布位图
+    $decorBmp.Dispose()
 }
-# 保存装饰表（幂等覆盖）
-Save-Png -bitmap $decorBmp -path (Join-Path $assetsDir "decor_sheet.png")
-# 释放装饰画布位图
-$decorBmp.Dispose()
+
+# 原色装饰表（草地区/主菜单沿用）
+Compose-DecorSheet -outPath (Join-Path $assetsDir "decor_sheet.png")
+
+# ---- 6.4 雪山素材（批六甲·冰霜重染色版）----
+# 说明：雪山区的三张素材 = 现有地牢素材经 Convert-FrostTint 的冷色化版本
+#（通道与亮度调整——见函数头注释），同一产线幂等生成；世界烘焙时雪山区
+# 的格按「本格所属区」（game/Zone.h）选用这三张表（原区沿用原色表）
+Compose-Sheet -names @(
+    "floor_1", "floor_2", "floor_3", "floor_4",
+    "floor_5", "floor_6", "floor_7", "floor_8"
+) -frameWidth 16 -frameHeight 16 -outPath (Join-Path $assetsDir "tiles_floor_snow.png") -frostTint
+
+Compose-Single -name "wall_mid" -outPath (Join-Path $assetsDir "tiles_wall_snow.png") -frostTint
+
+Compose-DecorSheet -outPath (Join-Path $assetsDir "decor_sheet_snow.png") -frostTint
 
 # ============================================================
 # 7) 攻击反馈素材（批五A：程序化绘制）
@@ -1011,6 +1099,12 @@ Assert-PngSize -path (Join-Path $assetsDir "decor_sheet.png") -expectedWidth 96 
 
 #   海洋水砖（批六甲）：3 变体 x 48 = 144 宽、48 高
 Assert-PngSize -path (Join-Path $assetsDir "tiles_water.png") -expectedWidth 144 -expectedHeight 48
+
+#   雪山素材（批六甲·冰霜重染色）：与地牢素材同尺寸——地砖 384x48、
+#   墙块 48x48、装饰表 96x72
+Assert-PngSize -path (Join-Path $assetsDir "tiles_floor_snow.png") -expectedWidth 384 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "tiles_wall_snow.png") -expectedWidth 48 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "decor_sheet_snow.png") -expectedWidth 96 -expectedHeight 72
 
 #   攻击反馈素材（批五A）：警示「!」24x36；爪痕爆点 48x48
 Assert-PngSize -path (Join-Path $assetsDir "alert.png") -expectedWidth 24 -expectedHeight 36

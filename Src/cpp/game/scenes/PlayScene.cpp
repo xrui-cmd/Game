@@ -928,10 +928,12 @@ void PlayScene::applyCardEffects()
         m_attackArcBase, m_cardLevels[static_cast<int>(CardId::Sweep)]);
     m_player.setAttackArc(m_attackArc); // 武器扫角 = 判定张角（结构性共享）
 
-    // 疾行：移速 = 基准 + 20 x 层数——注入 Player（下一固定步的移动立即使用）
+    // 疾行：移速 = 基准 + 20 x 层数——注入 Player（下一固定步的移动立即使用）；
+    // 批六甲：再乘当前区移速乘区（雪地 x0.85）——「基准+层数」与区乘区
+    // 是两个独立因素，购买/重算路径与过区路径都经本函数/同款公式注入
     m_playerSpeed = cardDashSpeed(
         m_playerSpeedBase, m_cardLevels[static_cast<int>(CardId::Dash)]);
-    m_player.setSpeed(m_playerSpeed); // 移速注入（负数防御在 Player::setSpeed 内部）
+    m_player.setSpeed(m_playerSpeed * currentZoneMoveMultiplier()); // 移速注入（含区乘区）
 
     // 体魄：生命上限 = 基准 + 20 x 层数；当前生命夹到新上限（重算路径不回血——
     // 即时 +20 只在「选择体魄那一刻」发放，见 handleCardChoice）
@@ -949,6 +951,17 @@ void PlayScene::applyCardEffects()
 
     // 慧眼：没有常驻数值可注入——经验乘数在宝石吸收结算时按层数实时计算
     //（见宝石吸收分支的 cardInsightXpValue 调用；此处无需处理）
+}
+
+// 当前区移速乘区（批六甲·双区）：ZoneId::Count = 尚未判定（进局/重开后
+// 首个 Playing 固定步之前）——按草地（1.0）处理，保证注入值总是合法
+float PlayScene::currentZoneMoveMultiplier() const
+{
+    if (m_currentZone == ZoneId::Count) // 未判定：草地语义（无 debuff）
+    {
+        return 1.0f; // 乘区 1.0（原速）
+    }
+    return zoneDef(m_currentZone).moveSpeedMultiplier; // 区表乘区（草 1.0 / 雪 0.85）
 }
 
 // 每帧更新：先处理输入动作边缘（任何状态都响应），再按状态推进战斗。
@@ -1020,6 +1033,11 @@ void PlayScene::update(const UpdateContext& ctx)
     {
         m_levelFlashLeft = std::max(m_levelFlashLeft - ctx.deltaTime, 0.0f);
     }
+    // 区名横幅计时递减（批六甲）：仅 Playing 递减——暂停/面板下横幅冻结
+    if (m_zoneBannerLeft > 0.0f)
+    {
+        m_zoneBannerLeft = std::max(m_zoneBannerLeft - ctx.deltaTime, 0.0f);
+    }
     for (FloatingText& text : m_floatingTexts)
     {
         text.update(ctx.deltaTime); // 寿命递减；位置与透明度在渲染时按进度即时换算
@@ -1066,6 +1084,22 @@ void PlayScene::update(const UpdateContext& ctx)
 
     // 玩家矩形只取一次：本步的碰撞检测、怪物追踪与相机跟随共用一个快照
     const SDL_FRect playerRect = m_player.rect();
+
+    // ---- 区名横幅与雪地移速（批六甲·双区）----
+    // 玩家中心所属区与本步记录不同 -> 过区（含进局/重开后的首次判定）：
+    // 更新当前区、弹区名横幅、打「进入区域」日志（冒烟断言点）、用新区
+    // 的移速乘区重注入玩家速度（雪地 x0.85 实时生效；恢复到草地回满速）
+    const ZoneId zoneNow = zoneAtWorld(playerRect.x + playerRect.w * 0.5f, // 玩家中心 x
+                                       playerRect.y + playerRect.h * 0.5f); // 玩家中心 y
+    if (zoneNow != m_currentZone) // 区变化：过区事件
+    {
+        m_currentZone = zoneNow;                          // 记录当前区（渲染横幅/乘区查询）
+        m_zoneBannerLeft = kZoneBannerSeconds;            // 横幅计时置满（约 1.5s）
+        // 冒烟观测点：进入区域日志（自动化测试据此断言跨区行走）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入区域：%s", zoneDef(zoneNow).name);
+        // 移速重注入：当前「基准 + 疾行层数」的移速 x 新区乘区
+        m_player.setSpeed(m_playerSpeed * currentZoneMoveMultiplier());
+    }
 
     // 相机（批二核心）：平滑跟随玩家中心（指数平滑 camera_smooth_time）。
     // 位置在固定步更新（渲染直接用当前相机位置）；暂停/结束时本函数提前
@@ -2846,6 +2880,12 @@ void PlayScene::restart()
     m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
     m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
 
+    // 分区状态复位（批六甲）：当前区回「未判定」——新一局玩家回到草地区
+    // 中心，开启后的首个 Playing 固定步重新判定并弹「草地」横幅；
+    // 横幅计时清零（上一局的横幅不跨局）
+    m_currentZone = ZoneId::Count; // 未判定哨兵（首个 Playing 步骤触发「进入区域：草地」）
+    m_zoneBannerLeft = 0.0f;       // 横幅计时归零
+
     // 「新纪录」标记复位：上一局的破纪录展示不带到新一局。
     //（m_best 快照保留不动——它是整局的比较基准，只在结算成功时更新）
     m_newKillRecord = false;
@@ -3088,6 +3128,33 @@ void PlayScene::renderHud()
             DebugText::drawFormat(m_renderer, kFpsScale, 20.0f, fpsY,
                                   "FPS: -- | -- ms");
         }
+    }
+
+    // ---- 区名横幅（批六甲·双区）：进入新区时区名大字浮现约 1.5s ----
+    // 绘制条件 = 计时未归零（仅 Playing 递减——暂停/面板下横幅随世界冻结，
+    // 画面保持静止）；透明度包络 = 淡入 0.3s -> 保持 -> 淡出 0.6s，
+    // 经渲染绘制色的 alpha 通道下发（Font 内部读取渲染器绘制色）。
+    // 先画暗色错位一层再画主体——任何底图上都可读
+    if (m_zoneBannerLeft > 0.0f && m_currentZone != ZoneId::Count)
+    {
+        // 透明度包络：进入进度与剩余时长两个斜坡取小（中段恒为 1）
+        const float elapsed = kZoneBannerSeconds - m_zoneBannerLeft;             // 已显示时长
+        const float fadeIn = elapsed / kZoneBannerFadeIn;                        // 淡入斜坡 [0,1]
+        const float fadeOut = m_zoneBannerLeft / kZoneBannerFadeOut;             // 淡出斜坡 [0,1]
+        const float alpha01 = std::max(0.0f, std::min(1.0f, std::min(fadeIn, fadeOut))); // 包络 [0,1]
+        const Uint8 alpha8 = static_cast<Uint8>(alpha01 * 255.0f);               // 8 位 alpha
+
+        const char* zoneName = zoneDef(m_currentZone).name; // 区名文本（草地/雪山）
+        const float bannerCenterX = screenW * 0.5f;         // 水平居中
+        const float bannerY = screenH * kZoneBannerTopRatio; // 纵向位置（上三分之一）
+
+        // 暗影层（右下 +3px 偏移）：深色描底，亮底/暗底都可读
+        SDL_SetRenderDrawColor(m_renderer, 8, 14, 26, alpha8); // 近黑蓝（同透明度）
+        m_bigFont.drawCentered(m_renderer, zoneName, bannerCenterX + 3.0f, bannerY + 3.0f);
+
+        // 主体层（近白偏冰蓝）：大号字（m_bigFont，与暂停/结束标题同字号）
+        SDL_SetRenderDrawColor(m_renderer, 225, 238, 255, alpha8); // 亮冰白
+        m_bigFont.drawCentered(m_renderer, zoneName, bannerCenterX, bannerY);
     }
 
     // ---- 生存 HUD（Playing / LevelUp / Shop / Paused 都显示）----

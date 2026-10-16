@@ -567,11 +567,14 @@ bool World::loadAssets(SDL_Renderer* renderer)
     }
     const std::string base(basePath); // 拷贝基路径（后续不再依赖 SDL 内部缓存）
 
-    // 逐张加载四份世界素材（失败非致命：对应层在烘焙时退化为色块）
+    // 逐张加载七份世界素材（失败非致命：对应层在烘焙时退化为色块或回退原色）
     m_floorTiles = IMG_LoadTexture(renderer, (base + "assets/tiles_floor.png").c_str()); // 地板变体表
     m_wallTile = IMG_LoadTexture(renderer, (base + "assets/tiles_wall.png").c_str());   // 墙块单帧
     m_decorSheet = IMG_LoadTexture(renderer, (base + "assets/decor_sheet.png").c_str()); // 装饰表
     m_waterTiles = IMG_LoadTexture(renderer, (base + "assets/tiles_water.png").c_str()); // 水砖变体表（批六甲）
+    m_floorTilesSnow = IMG_LoadTexture(renderer, (base + "assets/tiles_floor_snow.png").c_str()); // 雪山地板（批六甲）
+    m_wallTileSnow = IMG_LoadTexture(renderer, (base + "assets/tiles_wall_snow.png").c_str());   // 雪山墙块
+    m_decorSheetSnow = IMG_LoadTexture(renderer, (base + "assets/decor_sheet_snow.png").c_str()); // 雪山装饰
 
     // 像素风必需：与实体素材同一采样口径——最近邻，放大保持像素锐利
     if (m_floorTiles != nullptr)
@@ -614,10 +617,42 @@ bool World::loadAssets(SDL_Renderer* renderer)
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "加载海洋水砖 tiles_water.png 失败（%s），水域将退化为纯色", SDL_GetError());
     }
+    if (m_floorTilesSnow != nullptr)
+    {
+        SDL_SetTextureScaleMode(m_floorTilesSnow, SDL_SCALEMODE_NEAREST); // 雪山地板：最近邻
+    }
+    else
+    {
+        // 雪山地板缺失：烘焙时雪山区地板回退原色表（区仍在，观感不换）
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "加载雪山地板 tiles_floor_snow.png 失败（%s），雪山区地板将回退原色", SDL_GetError());
+    }
+    if (m_wallTileSnow != nullptr)
+    {
+        SDL_SetTextureScaleMode(m_wallTileSnow, SDL_SCALEMODE_NEAREST); // 雪山墙块：最近邻
+    }
+    else
+    {
+        // 雪山墙块缺失：烘焙时雪山区墙回退原色表（同上）
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "加载雪山墙块 tiles_wall_snow.png 失败（%s），雪山区墙将回退原色", SDL_GetError());
+    }
+    if (m_decorSheetSnow != nullptr)
+    {
+        SDL_SetTextureScaleMode(m_decorSheetSnow, SDL_SCALEMODE_NEAREST); // 雪山装饰：最近邻
+    }
+    else
+    {
+        // 雪山装饰缺失：烘焙时雪山区装饰回退原色表（同上）
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "加载雪山装饰 decor_sheet_snow.png 失败（%s），雪山区装饰将回退原色", SDL_GetError());
+    }
 
-    // 返回「四张全部就绪」与否（调用方可用于日志；游戏照常可玩）
+    // 返回「七张全部就绪」与否（调用方可用于日志；游戏照常可玩）
     return m_floorTiles != nullptr && m_wallTile != nullptr &&
-           m_decorSheet != nullptr && m_waterTiles != nullptr;
+           m_decorSheet != nullptr && m_waterTiles != nullptr &&
+           m_floorTilesSnow != nullptr && m_wallTileSnow != nullptr &&
+           m_decorSheetSnow != nullptr;
 }
 
 // 释放素材纹理（loadAssets 重加载前与 release 内部调用；幂等）
@@ -643,6 +678,21 @@ void World::releaseAssets()
     {
         SDL_DestroyTexture(m_waterTiles); // 释放水砖变体表（批六甲）
         m_waterTiles = nullptr;           // 置空：幂等
+    }
+    if (m_floorTilesSnow != nullptr)
+    {
+        SDL_DestroyTexture(m_floorTilesSnow); // 释放雪山地板变体表（批六甲）
+        m_floorTilesSnow = nullptr;           // 置空：幂等
+    }
+    if (m_wallTileSnow != nullptr)
+    {
+        SDL_DestroyTexture(m_wallTileSnow); // 释放雪山墙块
+        m_wallTileSnow = nullptr;           // 置空：幂等
+    }
+    if (m_decorSheetSnow != nullptr)
+    {
+        SDL_DestroyTexture(m_decorSheetSnow); // 释放雪山装饰表
+        m_decorSheetSnow = nullptr;           // 置空：幂等
     }
 }
 
@@ -750,10 +800,21 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
     const int baseCellX = chunkX * kChunkCells; // 本区块左上角格 x
     const int baseCellY = chunkY * kChunkCells; // 本区块左上角格 y
 
+    // 本格所属区判定（批六甲·双区素材）：按格中心点查询 zoneAtWorld
+    //（与 Zone 表同一口径——边界格归东侧区）。烘焙是每区块一次性成本，
+    // 每格一次 floor 除法的开销可忽略；静态成员不参与捕获
+    const auto isSnowCell = [](int gx, int gy)
+    {
+        // 格中心点（像素）-> 分区查询 -> 是否雪山区
+        return zoneAtWorld((static_cast<float>(gx) + 0.5f) * kCellSize,
+                           (static_cast<float>(gy) + 0.5f) * kCellSize) == ZoneId::Snow;
+    };
+
     // ---- 第 1 层：地板 / 水砖（铺满 32x32 格；批六甲起水域与地板同层）----
     // 水域格：铺水砖（3 变体按格哈希挑选，波纹相位不同不死板）；地板格：
-    // 铺地板变体。两者都在本层，之后的装饰/墙层对水格天然无内容
-    if (m_floorTiles == nullptr)
+    // 铺地板变体。两者都在本层，之后的装饰/墙层对水格天然无内容。
+    // 素材表按「本格所属区」选择：雪山区用冰霜重染色版（缺失时回退原色）
+    if (m_floorTiles == nullptr && m_floorTilesSnow == nullptr)
     {
         // 素材缺失兜底：深灰蓝色块（一次性设色，循环内只填充）
         SDL_SetRenderDrawColor(renderer, 45, 42, 60, 255); // 地板兜底色（深灰蓝）
@@ -819,12 +880,16 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
                 continue; // 水域格：本层结束（无地板/装饰/墙）
             }
 
-            if (m_floorTiles != nullptr)
+            // 本格地板素材表：雪山区冰霜版（缺失回退原色版——区仍在，观感不换）
+            SDL_Texture* floorSheet = isSnowCell(cellX, cellY)
+                ? ((m_floorTilesSnow != nullptr) ? m_floorTilesSnow : m_floorTiles)
+                : m_floorTiles;
+            if (floorSheet != nullptr)
             {
                 // 变体帧的源矩形：第 variant 帧的横向起点 = variant x 48px
                 const int variant = floorVariantAt(cellX, cellY); // 本格变体
                 const SDL_FRect src{ variant * kCellSize, 0.0f, kCellSize, kCellSize };     // 源帧矩形
-                SDL_RenderTexture(renderer, m_floorTiles, &src, &dst); // 裁帧绘制（1:1 无缩放）
+                SDL_RenderTexture(renderer, floorSheet, &src, &dst); // 裁帧绘制（1:1 无缩放）
             }
             else
             {
@@ -835,16 +900,28 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
     }
 
     // ---- 第 2 层：装饰（地板之上、墙之下；先画好让墙可以覆盖装饰溢出）----
-    if (m_decorSheet != nullptr)
+    // 素材表同样按区选择（雪山版缺失时回退原色版）
+    if (m_decorSheet != nullptr || m_decorSheetSnow != nullptr)
     {
         for (int cellLY = 0; cellLY < kChunkCells; ++cellLY)
         {
             for (int cellLX = 0; cellLX < kChunkCells; ++cellLX)
             {
-                const int decor = decorAt(baseCellX + cellLX, baseCellY + cellLY); // 本格装饰类型
+                const int cellX = baseCellX + cellLX; // 全局格 x
+                const int cellY = baseCellY + cellLY; // 全局格 y
+                const int decor = decorAt(cellX, cellY); // 本格装饰类型
                 if (decor == 0)
                 {
                     continue; // 无装饰：跳过
+                }
+
+                // 本格装饰素材表：雪山区冰霜版（缺失回退原色版）
+                SDL_Texture* decorSheet = isSnowCell(cellX, cellY)
+                    ? ((m_decorSheetSnow != nullptr) ? m_decorSheetSnow : m_decorSheet)
+                    : m_decorSheet;
+                if (decorSheet == nullptr)
+                {
+                    continue; // 两版都缺失：跳过本装饰（纯视觉，不阻塞）
                 }
 
                 // 装饰帧的源矩形与绘制尺寸（与组装脚本约定一致）：
@@ -858,13 +935,13 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
                 const SDL_FRect dst{ cellLX * kCellSize,                          // 水平起点 = 格左缘
                                      cellLY * kCellSize + kCellSize - srcH,       // 底对齐格底
                                      kCellSize, srcH };                           // 宽高 = 帧尺寸
-                SDL_RenderTexture(renderer, m_decorSheet, &src, &dst); // 绘制装饰
+                SDL_RenderTexture(renderer, decorSheet, &src, &dst); // 绘制装饰
             }
         }
     }
 
-    // ---- 第 3 层：墙（最上层）----
-    if (m_wallTile == nullptr)
+    // ---- 第 3 层：墙（最上层；素材表按区选择——雪山版缺失时回退原色）----
+    if (m_wallTile == nullptr && m_wallTileSnow == nullptr)
     {
         // 素材缺失兜底：更深一层的色块（与地板可区分）
         SDL_SetRenderDrawColor(renderer, 58, 52, 72, 255); // 墙兜底色（深紫灰）
@@ -873,16 +950,22 @@ SDL_Texture* World::bakeChunk(SDL_Renderer* renderer, int chunkX, int chunkY) co
     {
         for (int cellLX = 0; cellLX < kChunkCells; ++cellLX)
         {
-            if (!wallAt(baseCellX + cellLX, baseCellY + cellLY))
+            const int cellX = baseCellX + cellLX; // 全局格 x
+            const int cellY = baseCellY + cellLY; // 全局格 y
+            if (!wallAt(cellX, cellY))
             {
                 continue; // 非墙格：跳过
             }
             // 墙格的目标矩形（整格绘制）
             const SDL_FRect dst{ cellLX * kCellSize, cellLY * kCellSize, kCellSize, kCellSize };
-            if (m_wallTile != nullptr)
+            // 本格墙素材：雪山区冰霜版（缺失回退原色版）
+            SDL_Texture* wallTex = isSnowCell(cellX, cellY)
+                ? ((m_wallTileSnow != nullptr) ? m_wallTileSnow : m_wallTile)
+                : m_wallTile;
+            if (wallTex != nullptr)
             {
                 // 墙块单帧纹理：src 传 nullptr = 使用整张纹理
-                SDL_RenderTexture(renderer, m_wallTile, nullptr, &dst);
+                SDL_RenderTexture(renderer, wallTex, nullptr, &dst);
             }
             else
             {

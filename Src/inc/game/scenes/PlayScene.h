@@ -7,6 +7,7 @@
 #include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字/漂浮文字，支持中文）
 #include "game/AttackArc.h"     // AttackArc：横扫扇形判定（纯函数，tests/attack_arc_test.cpp 直测）
 #include "game/World.h"         // World：世界（确定性生成 + 区块 + 格级碰撞；批二）
+#include "game/Zone.h"          // Zone：世界分区（草地/雪山——区表/查询/移速乘区；批六甲）
 #include "game/Player.h"        // Player：玩家实体（移动 + 主动攻击 + 武器横扫表现）
 #include "game/Monster.h"       // Monster：追击怪物（三变体、对象池、批三 AI 生态）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
@@ -32,11 +33,16 @@
 //      玩家/怪物纹理与字体（实体纹理各自析构兜底，玩家的武器素材由
 //      Player 自持，世界纹理由 World 自持并在析构时释放；背景图自批二起
 //      不再用于对局——区块地板取代，MenuScene 仍继续使用 background.png）
-//   2. 世界与相机（批二核心）：
+//   2. 世界与相机（批二核心；批六甲·世界重构）：
 //      - 世界 12288x6144（8x4 区块；区块 1536px = 32 格 x 48px；批六甲），
 //        分两个风格区（西 4x4 草地 / 东 4x4 雪山——game/Zone.h 区表），确定性
-//        生成（坐标哈希 + 种子；seed=0 时每局随机）；世界边界一圈墙 +
-//        每区块随机墙簇（区块交界与出生保护区保证可通行）；
+//        生成（坐标哈希 + 种子；seed=0 时每局随机）；世界最外 2 圈为
+//        海洋水域（不可进入；「入水」归批六乙）+ 每区块随机墙簇（区块
+//        交界与出生保护区保证可通行）；
+//      - 分区表现（批六甲）：玩家中心所属区变化时弹「区名横幅」（大字
+//        浮现约 1.5s）+ 打「进入区域：xxx」日志；雪山区玩家移速乘区
+//        x0.85（Zone 表常量——applyCardEffects 与过区瞬间重注入）；
+//        雪山区地砖/墙/装饰用冰霜重染色素材（World 烘焙按格所属区选表）；
 //      - 玩家移动为「分轴位移 + 撞墙滑动」（World::slideMove，取代旧版
 //        窗口 clamp）；怪物同样碰撞滑动 + 卡住时轻量侧滑（批三延续，
 //        持久化侧滑改进见对应提交）；
@@ -273,8 +279,13 @@ private:
     // 升级选择生效 / 商店购买成交 / restart 四处调用的统一入口）：从
     // 「基准值 + 当前层数」重算全部受强化影响的数值并注入（幂等——重复
     // 调用结果一致；层数清零后调用即等价于「效果全部撤销」）。「即时回血」
-    // 等一次性效果不在此列（选择/购买流程单独发放——重算路径绝不重复回血）
+    // 等一次性效果不在此列（选择/购买流程单独发放——重算路径绝不重复回血）。
+    // 批六甲起移速注入含当前区乘区（雪地 x0.85）——见 currentZoneMoveMultiplier
     void applyCardEffects();
+
+    // 当前区移速乘区（批六甲·双区）：ZoneId::Count（尚未判定——进局首步前）
+    // 按草地（1.0）处理；过区瞬间 update 用新区的乘区重注入玩家移速
+    float currentZoneMoveMultiplier() const;
 
     // ---- 法术（批五B：六法术、自动施法）----
 
@@ -516,6 +527,15 @@ private:
     // 构成「受击保护窗口」。批五A：无敌期间不再有任何闪烁（静默保护）——
     // 受击的可读反馈由玩家的击退与红染承担（见 Player::applyHitKnockback）
     static constexpr float kPlayerInvincibleSeconds = 0.8f;
+
+    // ---- 区名横幅（批六甲·双区世界）----
+    // 玩家过区（含进局/重开后的首次判定）时区名大字浮现的时长与淡入淡出
+    // 包络：总 1.5s = 淡入 0.3s + 保持 + 淡出 0.6s；透明度经渲染绘制色
+    // 的 alpha 通道下发（Font 内部读取渲染器绘制色——批六甲实测可行）
+    static constexpr float kZoneBannerSeconds = 1.5f;  // 横幅总时长（秒）
+    static constexpr float kZoneBannerFadeIn = 0.30f;  // 淡入时长（秒）
+    static constexpr float kZoneBannerFadeOut = 0.60f; // 淡出时长（秒）
+    static constexpr float kZoneBannerTopRatio = 0.26f; // 横幅纵位置（屏高比例）
 
     // ---- 怪物命中特效（批五A）：接触点的爪痕/爆点 ----
     static constexpr float kMonsterHitFxSeconds = 0.15f; // 特效寿命（秒；规格约 0.15——渐隐至 0 即移除）
@@ -781,6 +801,14 @@ private:
     // 仅 Playing 状态递减——暂停/结束时冻结（批五A：静默计时，
     // 不再有任何渲染表现——受击反馈由击退与红染承担）
     float m_playerInvincibleLeft = 0.0f;
+
+    // ---- 分区运行时（批六甲；restart 复位）----
+    // 当前所在区：ZoneId::Count = 尚未判定（进局/重开后首个 Playing 固定步
+    // 会判定并触发「进入区域：草地」日志与横幅）；过区瞬间由 update 重注入
+    // 玩家移速（×雪地 0.85；Zone 表常量）。横幅计时仅 Playing 递减——
+    // 暂停/商店/升级面板下横幅随世界一起冻结
+    ZoneId m_currentZone = ZoneId::Count; // 玩家中心当前所属区（未判定哨兵）
+    float m_zoneBannerLeft = 0.0f;        // 区名横幅剩余时长（秒；0 = 不显示）
 
     // ---- 怪物刷新运行时（restart 复位）----
     float m_monsterElapsed = 0.0f;       // 局内已过秒数（仅 Playing 递增；难度计时基准）
