@@ -354,8 +354,16 @@ bool World::isPointWalkable(float x, float y) const
     return !wallAt(cellFloored(x), cellFloored(y));
 }
 
-// 分轴位移 + 撞墙滑动（纯函数）
+// 分轴位移 + 撞墙滑动（无额外实心体的便捷包装；行为与拆分前完全一致）
 SDL_FPoint World::slideMove(float x, float y, float w, float h, float dx, float dy) const
+{
+    // 直接转发完整版：extraSolid = nullptr = 只查世界墙体（旧调用点零改动）
+    return slideMoveEx(x, y, w, h, dx, dy, nullptr, nullptr);
+}
+
+// 分轴位移 + 撞墙滑动（带「额外实心体」的完整版，见头文件契约）
+SDL_FPoint World::slideMoveEx(float x, float y, float w, float h, float dx, float dy,
+                              ExtraSolidFn extraSolid, void* context) const
 {
     // 零位移快速路径：不产生任何查询
     if (dx == 0.0f && dy == 0.0f)
@@ -378,9 +386,13 @@ SDL_FPoint World::slideMove(float x, float y, float w, float h, float dx, float 
 
     for (int i = 0; i < substeps; ++i)
     {
-        // X 轴尝试：落点可走才推进；被墙挡则停该轴（该轴本子步零位移）
+        // X 轴尝试：落点可走（且不与额外实心体重叠）才推进；被挡则停该轴
         const SDL_FRect nextX{ x + stepX, y, w, h }; // X 轴候选矩形
-        if (isRectWalkable(nextX))
+        // 墙判据 + 额外实心判据（extraSolid 为空 = 只查墙；短路顺序：
+        // 先查墙——墙是静态数据、查询更便宜）
+        const bool blockedX = !isRectWalkable(nextX) ||
+                              (extraSolid != nullptr && extraSolid(context, nextX));
+        if (!blockedX)
         {
             x += stepX; // 推进 X
         }
@@ -388,7 +400,10 @@ SDL_FPoint World::slideMove(float x, float y, float w, float h, float dx, float 
         // Y 轴尝试：用「X 推进后的位置」继续——一轴被挡、另一轴照走，
         // 天然产生「贴墙滑动」的手感（撞墙后沿墙滑行而不是原地卡死）
         const SDL_FRect nextY{ x, y + stepY, w, h }; // Y 轴候选矩形
-        if (isRectWalkable(nextY))
+        // 判据同 X 轴：墙 + 额外实心体（两条件都过才推进）
+        const bool blockedY = !isRectWalkable(nextY) ||
+                              (extraSolid != nullptr && extraSolid(context, nextY));
+        if (!blockedY)
         {
             y += stepY; // 推进 Y
         }

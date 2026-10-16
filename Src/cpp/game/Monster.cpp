@@ -164,6 +164,7 @@ void Monster::spawnAt(float centerX, float centerY)
     m_ai.reset(centerX, centerY);              // 巢 = 本落点；状态清回巡逻
     clearMotionState();                        // 侧滑/卡死检测窗口清零（新怪的干净起点）
     clearAttackState();                        // 攻击状态清零（批四：池复用不带旧出招）
+    clearPlayerBlocker();                      // 玩家盒实心清零（批四：等场景本步重新注入）
 
     // 瞬移类操作的插值收尾（重点）：出生是「瞬间换位」，必须把插值快照
     // 对齐到新落点，否则渲染会从上一位置向新落点拉丝（延续既有纪律）
@@ -376,12 +377,74 @@ void Monster::applyAttackMotion(float dx, float dy)
         return;
     }
 
-    // 碰撞盒口径的分轴滑动（墙；批四·体积碰撞并入「玩家盒实心」）：
+    // 碰撞盒口径的分轴滑动（墙 + 玩家盒；批四·体积碰撞——怪物移动把
+    // 玩家盒当实心，撞上滑停、不可重合）：
     // 短促动作不走卡死检测/侧滑——攻击有明确的时长与预算，被挡就等结算
     const SDL_FRect col = collisionRect(); // 本步起点的碰撞盒（世界坐标）
-    const SDL_FPoint movedBox = m_world->slideMove(col.x, col.y, col.w, col.h, dx, dy);
+    const SDL_FPoint movedBox = m_world->slideMoveEx(col.x, col.y, col.w, col.h, dx, dy,
+                                                     &Monster::playerBlockerCallback, this);
     m_x += movedBox.x - col.x; // 落点折算回精灵左上角（偏移恒定，位移量一致）
     m_y += movedBox.y - col.y; // 同上（y 轴）
+}
+
+// slideMoveEx 回调：把「玩家盒」判定接给世界（批四·体积碰撞）。
+// context = 怪物自身（静态成员满足 C 函数指针签名，私有状态经 this 访问）
+bool Monster::playerBlockerCallback(void* context, const SDL_FRect& rect)
+{
+    const Monster& self = *static_cast<const Monster*>(context); // 还原怪物自身
+
+    // 未注入玩家盒（防御路径）：没有实心体，任何候选都不被挡
+    if (!self.m_hasPlayerBlocker)
+    {
+        return false;
+    }
+
+    // 候选与玩家盒 AABB 相交即挡；恰好贴合不算（可贴着玩家停下）
+    return rectsOverlap(rect, self.m_playerBox);
+}
+
+// 小幅推动（批四·体积碰撞的兜底与软分离共用）
+bool Monster::nudge(float dx, float dy)
+{
+    // 候选位移表：完整 -> 仅 x -> 仅 y（一侧被挡时保留另一侧的分离量）
+    const float candidates[3][2] = {
+        { dx, dy },      // 候选 1：完整位移（常规情形一步到位）
+        { dx, 0.0f },    // 候选 2：只退 x（y 向被墙/玩家挡死时的退化）
+        { 0.0f, dy },    // 候选 3：只退 y（x 向被挡死的退化）
+    };
+
+    for (const auto& candidate : candidates)
+    {
+        // 零位移候选跳过（两个分量都 0 没有推动意义）
+        if (candidate[0] == 0.0f && candidate[1] == 0.0f)
+        {
+            continue;
+        }
+
+        // 候选落点（精灵左上角 + 位移）与对应的碰撞盒
+        const float newX = m_x + candidate[0]; // 候选精灵左上角 x
+        const float newY = m_y + candidate[1]; // 候选精灵左上角 y
+        const SDL_FRect box = collisionRectAt(newX, newY); // 候选脚盒（世界坐标）
+
+        // 墙校验（无世界时跳过——防御：无墙世界不过滤）
+        if (m_world != nullptr && !m_world->isRectWalkable(box))
+        {
+            continue; // 该候选会进墙：换下一个
+        }
+        // 玩家盒校验（已注入时）：不把怪物推入玩家——重叠候选不可用。
+        // 完整分离量由 computeSeparation 保证「推出后恰好留缝」，正常通过；
+        // 此处拒绝只发生在「分离方向同时被墙挤压」的死角情形
+        if (m_hasPlayerBlocker && rectsOverlap(box, m_playerBox))
+        {
+            continue; // 该候选会把怪物压进玩家：换下一个
+        }
+
+        m_x = newX; // 采用候选落定（直接写位置：prev 快照保持，插值照常平滑）
+        m_y = newY;
+        return true; // 推动成功
+    }
+
+    return false; // 三个候选全被挡：原地不动（下一帧再试——绝不推动玩家）
 }
 
 // 覆写更新：AI 状态决策 + 帧动画 + 闪白计时 + 朝目标点移动（移动经世界碰撞）。
@@ -591,9 +654,12 @@ void Monster::moveWithCollision(float stepDX, float stepDY, float dt)
     // ---- 主方向分轴滑动（与玩家移动共用同一个纯函数，行为一致）----
     // 一轴被墙挡住、另一轴照走——「贴墙滑行」的手感来源；内部还带子步
     // 拆分防高速穿透。批四：输入改用「脚部碰撞盒」——原点与位移量都按
-    // 盒口径计算，落点折算回精灵左上角（偏移恒定，位移量一致）
+    // 盒口径计算，落点折算回精灵左上角（偏移恒定，位移量一致）；同时
+    // 把「玩家盒」作为额外实心体传入——怪物移动撞上玩家滑停、不可重合
     const SDL_FRect col = collisionRect(); // 本步起点的碰撞盒（世界坐标）
-    const SDL_FPoint movedBox = m_world->slideMove(col.x, col.y, col.w, col.h, useDX, useDY);
+    const SDL_FPoint movedBox = m_world->slideMoveEx(col.x, col.y, col.w, col.h,
+                                                     useDX, useDY,
+                                                     &Monster::playerBlockerCallback, this);
     const float movedDX = movedBox.x - col.x; // 碰撞后的实际水平位移
     const float movedDY = movedBox.y - col.y; // 碰撞后的实际垂直位移
 
@@ -675,12 +741,21 @@ void Monster::sideSlideCandidates(float stepDX, float stepDY,
     // 当前位置的碰撞盒（世界坐标）：两侧候选都以它为试走起点
     const SDL_FRect col = collisionRect();
 
-    // 右侧滑（顺时针 90°）：(dx, dy) -> (-dy, dx)；盒落点 -> 精灵左上角
-    const SDL_FPoint rightBox = m_world->slideMove(col.x, col.y, col.w, col.h, -stepDY, stepDX);
+    // 右侧滑（顺时针 90°）：(dx, dy) -> (-dy, dx)；盒落点 -> 精灵左上角。
+    // 试走同样带「玩家盒实心」判据（与主方向同一口径：贴玩家滑停）。
+    // const 方法里 this 是 const 指针：cast 掉 const 仅为本回调的只读语义
+    // 服务（回调不写自身状态，纯比较）
+    const SDL_FPoint rightBox = m_world->slideMoveEx(col.x, col.y, col.w, col.h,
+                                                     -stepDY, stepDX,
+                                                     &Monster::playerBlockerCallback,
+                                                     const_cast<Monster*>(this));
     rightPoint = SDL_FPoint{ rightBox.x - kCollisionBoxOffsetX, // 精灵系候选 x
                              rightBox.y - kCollisionBoxOffsetY }; // 精灵系候选 y
     // 左侧滑（逆时针 90°）：(dx, dy) -> (dy, -dx)；同样折算回精灵系
-    const SDL_FPoint leftBox = m_world->slideMove(col.x, col.y, col.w, col.h, stepDY, -stepDX);
+    const SDL_FPoint leftBox = m_world->slideMoveEx(col.x, col.y, col.w, col.h,
+                                                    stepDY, -stepDX,
+                                                    &Monster::playerBlockerCallback,
+                                                    const_cast<Monster*>(this));
     leftPoint = SDL_FPoint{ leftBox.x - kCollisionBoxOffsetX, // 精灵系候选 x
                             leftBox.y - kCollisionBoxOffsetY }; // 精灵系候选 y
 

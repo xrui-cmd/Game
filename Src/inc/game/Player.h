@@ -128,6 +128,17 @@ public:
     // 传 nullptr 视为「无墙世界」（防御——未注入时位移不限制、不崩溃）
     void setWorld(const World* world) { m_world = world; }
 
+    // 注入「额外实心盒」数组（批四·体积碰撞）：场景每固定步刷新一次
+    // （当前为存活怪物们的碰撞盒快照）——玩家移动把它们当「墙」一样对待
+    // （撞上滑停、不可重合；由 World::slideMoveEx 的额外实心判据执行）。
+    // 只借用不持有：数组内存由场景保证贯穿整个 update 周期；
+    // rects 为空指针 / count <= 0 视为「无实心体」（等价旧行为）
+    void setSolidRects(const SDL_FRect* rects, int count)
+    {
+        m_solidRects = rects; // 数组首地址（只读借用）
+        m_solidCount = count; // 元素个数（<=0 = 无实心体）
+    }
+
     // 注入瞄准目标（鼠标的「世界坐标」）：场景每固定步把鼠标屏幕位置经
     // camera.screenToWorld 换算后传来——玩家不依赖相机类型，坐标系换算
     // 收敛在场景层。朝向翻转以它为基准（死区逻辑不变）；从未注入过时
@@ -199,6 +210,14 @@ private:
     float m_aimX = 0.0f;            // 瞄准点世界坐标 x（setAimTarget 写入）
     float m_aimY = 0.0f;            // 瞄准点世界坐标 y
     bool m_hasAim = false;          // 是否已注入过瞄准点（false = 翻转判定保持朝向）
+
+    // ---- 体积碰撞（批四）：额外实心盒（场景注入的怪物盒快照）----
+    const SDL_FRect* m_solidRects = nullptr; // 实心盒数组（场景持有；只读借用；nullptr = 无）
+    int m_solidCount = 0;                    // 数组长度（<=0 = 无实心体）
+
+    // slideMoveEx 回调（静态成员满足 C 函数指针签名；context 传 this）：
+    // 候选矩形与任一实心盒重叠即不可推进——「怪物盒为实心」的实现
+    static bool solidBlockedCallback(void* context, const SDL_FRect& rect);
 
     // 当前速度（像素/秒），逐轴独立渐近：斜向输入时两轴各取自己的目标，
     // 与既有「未归一化直驱」的斜向速度语义保持一致（合速度约 1.41 倍）

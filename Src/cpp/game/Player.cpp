@@ -1,8 +1,9 @@
 #include "game/Player.h"
 #include "game/AttackArc.h" // bladeAngleAt：刀锋角共享曲线（判定与渲染同款）；缓出注释见该文件
-#include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与可走查询
+#include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove/slideMoveEx）与可走查询
 #include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
 #include "engine/Input.h"   // Input：经 ctx.input 查询移动动作的接口定义
+#include "engine/Rect.h"    // rectsOverlap：额外实心盒（怪物盒）的重叠判定
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载武器素材（可选增强）
 #include <algorithm>      // std::min / std::max / std::clamp：速度逼近与边界
 #include <cmath>          // std::sqrt / std::cos / std::sin / std::atan2：方向归一化与横扫曲线
@@ -33,6 +34,31 @@ float approach(float current, float target, float rate, float dt)
 }
 
 } // 匿名命名空间结束
+
+// slideMoveEx 回调：把「额外实心盒」判定接给世界（批四·体积碰撞）。
+// context = 玩家自身（静态成员满足 C 函数指针签名，私有状态经 this 访问）
+bool Player::solidBlockedCallback(void* context, const SDL_FRect& rect)
+{
+    const Player& self = *static_cast<const Player*>(context); // 还原玩家自身
+
+    // 未注入/空数组（防御路径）：没有实心体，任何候选都不被挡
+    if (self.m_solidRects == nullptr || self.m_solidCount <= 0)
+    {
+        return false;
+    }
+
+    // 逐个实心盒做 AABB 相交：任一相交即挡（盒数 <= 12，线性扫描足够）。
+    // 判据与引擎 rectsOverlap 同款：边界恰好贴合不算重叠——贴着怪物
+    // 停下是合法站位（「撞上滑停」的落点语义）
+    for (int i = 0; i < self.m_solidCount; ++i)
+    {
+        if (rectsOverlap(rect, self.m_solidRects[i]))
+        {
+            return true; // 与某个实心盒重叠：该候选不可走
+        }
+    }
+    return false; // 全部不相交：候选可走（额外实心体不挡）
+}
 
 // 析构：先释放本类自持的武器纹理，本体纹理由基类析构兜底释放
 Player::~Player()
@@ -278,9 +304,13 @@ void Player::update(const UpdateContext& ctx)
     if (m_world != nullptr)
     {
         // 世界在位：整段位移交给纯函数（内部拆分小步、逐轴试走）——
-        // 一轴被墙挡住、另一轴照常推进，天然产生「贴墙滑动」的手感
+        // 一轴被挡、另一轴照常推进，天然产生「贴墙滑动」的手感。
+        // 批四：除墙体之外，场景注入的「实心盒」（存活怪物们）同样实心——
+        // 玩家撞上怪物滑停、不可重合（额外实心判据由回调提供）
         const SDL_FRect col = collisionRect(); // 本步起点的碰撞盒（世界坐标）
-        const SDL_FPoint moved = m_world->slideMove(col.x, col.y, col.w, col.h, stepDX, stepDY);
+        const SDL_FPoint moved = m_world->slideMoveEx(col.x, col.y, col.w, col.h,
+                                                      stepDX, stepDY,
+                                                      &Player::solidBlockedCallback, this);
         m_x += moved.x - col.x; // 落定：盒的位移量直接作用于精灵左上角（偏移恒定）
         m_y += moved.y - col.y; // 同上（y 轴）
     }

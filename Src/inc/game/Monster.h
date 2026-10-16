@@ -162,6 +162,19 @@ public:
     // 传 nullptr 视为「无墙世界」（防御——未注入时位移不限制、不崩溃）
     void setWorld(const World* world) { m_world = world; }
 
+    // 注入玩家碰撞盒（批四·体积碰撞，场景每固定步刷新）：怪物移动把它
+    // 当「实心」——撞上滑停、不可重合（由 World::slideMoveEx 的额外
+    // 实心判据执行）；兜底分离（nudge）与攻击动作同样消费它
+    void setPlayerBlocker(const SDL_FRect& box)
+    {
+        m_playerBox = box;          // 玩家脚盒快照（本步位置）
+        m_hasPlayerBlocker = true;  // 标记已注入（此后移动对玩家盒实心）
+    }
+
+    // 清除玩家盒实心（回收/池复用与「玩家目标撤销」时的防御路径）：
+    // 未注入 = 移动只对墙体实心（等价旧行为）
+    void clearPlayerBlocker() { m_hasPlayerBlocker = false; }
+
     // 是否在场（存活）：true = 已生成且未死亡；false = 空槽位（池中待复用）。
     // 场景用它门控 update / render / 碰撞判定
     bool isAlive() const { return m_alive; }
@@ -197,6 +210,7 @@ public:
         m_ai.clear();        // AI 状态回巡逻（巢保留——下次 spawnAt 会重写）
         clearMotionState();  // 清持久化侧滑与卡死检测窗口
         clearAttackState();  // 清攻击状态（批四：出招阶段/冷却/脉冲不跨生命周期）
+        clearPlayerBlocker(); // 清玩家盒实心（批四：池复用不带旧玩家位置）
     }
 
     // 被撞开/被击退：沿「(fromX, fromY) -> 怪物中心」的方向（即远离伤害
@@ -207,6 +221,13 @@ public:
     // 横扫命中用较短的微击退（保持追击压力、方便连扫补刀）。
     // 瞬移类操作：内部同步插值快照（防拉丝）
     void knockback(float fromX, float fromY, float distance);
+
+    // 小幅推动（批四·体积碰撞的兜底与软分离共用）：把怪物沿 (dx, dy)
+    // 移动，「墙可走 + 不推入玩家」的候选才采用。候选尝试次序：
+    // 完整位移 -> 仅 x -> 仅 y（一侧被挡时保留另一侧的分离量）；
+    // 全部被挡返回 false（原地等下一帧，绝不动玩家——玩家优先不动的延伸）。
+    // 公开给场景：重叠兜底（把怪物推出玩家）与怪怪软分离（各退一半）调用
+    bool nudge(float dx, float dy);
 
     // ---- 攻击（批四·蓄力前扑）----
 
@@ -344,6 +365,10 @@ private:
     // 世界指针（碰撞查询；monster 不持有所有权）。nullptr = 无墙世界（防御）
     const World* m_world = nullptr;
 
+    // ---- 玩家盒实心（批四·体积碰撞）：场景每步注入的玩家碰撞盒快照 ----
+    SDL_FRect m_playerBox{};          // 玩家脚盒（世界坐标；setPlayerBlocker 写入）
+    bool m_hasPlayerBlocker = false;  // 是否已注入（false = 移动只对墙实心）
+
     // 清侧滑/卡死检测运行时（despawn 与 spawnAt 复用；落点/状态突变后
     // 旧窗口数据不再有意义——清零避免把旧怪的卡死统计带进新怪）
     void clearMotionState()
@@ -371,6 +396,10 @@ private:
     // 攻击状态机单步推进（蓄力后倾 -> 前扑前冲 -> 结算）：仅 update 内调用。
     // 位移走 applyAttackMotion（墙 + 玩家盒的滑动），不参与卡死检测/侧滑
     void advanceAttack(float dt);
+
+    // slideMoveEx 回调（静态成员满足 C 函数指针签名；context 传 this）：
+    // 候选矩形与玩家盒重叠即不可推进——「怪物移动含玩家盒」的实现
+    static bool playerBlockerCallback(void* context, const SDL_FRect& rect);
 
     // 出招开始：朝玩家一次性锁定方向（零向量退回向右）、启动蓄力计时与
     // 染色脉冲、打出招日志（冒烟观测点「怪物出招（变体名）」）

@@ -224,6 +224,15 @@ private:
     // 并返回 true
     bool spawnMonsterAtSlot(Monster& monster);
 
+    // 把与玩家碰撞盒重叠的怪物按最小分离量推出（批四·体积碰撞兜底）：
+    // 覆盖正常热更顺序之外的所有重叠来源（击退/瞬移落点、上一帧遗留）；
+    // 玩家优先不动——被推的永远是怪物（推不动就原地等下一帧）
+    void pushMonstersOutOfPlayer(const SDL_FRect& playerBox);
+
+    // 怪物↔怪物轻量软分离（批四）：两两检查存活怪物的碰撞盒，重叠的按
+    // 最小分离量各退一半（各自经 nudge 做墙/玩家校验；被挡的一侧少退不退）
+    void separateOverlappingMonsters();
+
     // 绘制 HUD 文字/条（生存 HUD：HP 条、等级+经验条、击杀/存活；
     // FPS 调试行；暂停/结束叠层与结算界面）
     void renderHud();
@@ -355,6 +364,11 @@ private:
 
     Player m_player;                 // 玩家实体
     std::vector<Monster> m_monsters; // 怪物对象池（预创建 kMonsterPoolSize 个槽位）
+
+    // 怪物实心盒快照（批四·体积碰撞）：每步刷新为存活怪物的碰撞盒，
+    // 注入玩家作为「不可穿越」的额外实心体。vector 常驻复用（clear +
+    // push_back），capacity 稳定后无分配；只服务于单步内的指针注入
+    std::vector<SDL_FRect> m_monsterSolidBoxes;
     std::list<XpGem> m_gems;         // 场上未被拾取的经验宝石
     std::list<Coin> m_coins;         // 场上未被拾取的金币（批三局内货币）
     std::list<FloatingText> m_floatingTexts; // 场上存活的漂浮文字（伤害/升级共用）

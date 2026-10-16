@@ -1,5 +1,6 @@
 #include "game/scenes/PlayScene.h"
 #include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
+#include "game/Separation.h"       // computeSeparation：重叠兜底与怪怪软分离的最小分离量（批四）
 #include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
 #include "engine/Input.h"          // Input：ctx.input->pressed 查询暂停/重开/回菜单边缘
 #include "engine/Rect.h"           // rectsOverlap：接触伤害/拾取的 AABB 判定
@@ -402,6 +403,20 @@ void PlayScene::update(const UpdateContext& ctx)
         m_player.setAimTarget(mouseWorld.x, mouseWorld.y);                             // 注入：翻转判定参考它
     }
 
+    // 刷新「怪物实心盒」快照并注入玩家（批四·体积碰撞）：玩家移动把存活
+    // 怪物的碰撞盒当墙——撞上滑停、不可重合（额外实心判据见 slideMoveEx）。
+    // 快照取本步开头位置：怪物随后才更新，玩家面向的阻挡以本步初始局面为准
+    m_monsterSolidBoxes.clear();
+    for (const Monster& monster : m_monsters)
+    {
+        if (monster.isAlive())
+        {
+            m_monsterSolidBoxes.push_back(monster.collisionRect()); // 脚盒快照（世界坐标）
+        }
+    }
+    m_player.setSolidRects(m_monsterSolidBoxes.data(),
+                           static_cast<int>(m_monsterSolidBoxes.size()));
+
     // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动（批二起经
     // World::slideMove 的「分轴 + 撞墙滑动」，不再做窗口 clamp）、按注入的
     // 瞄准点切换朝向翻转，并推进攻击计时
@@ -474,6 +489,18 @@ void PlayScene::update(const UpdateContext& ctx)
     // 怪物追踪/攻击接触判定与体积碰撞共用这一份快照（与渲染用的
     // playerRect 分开：这里是物理口径）
     const SDL_FRect playerBox = m_player.collisionRect();
+
+    // 把玩家盒注入怪物（批四·体积碰撞）：怪物移动把玩家当实心——
+    // 追击/回巢/游荡的滑动判定与攻击动作都不与其重合。
+    // 注入覆盖全部存活槽位（含本步冻结的非激活怪：冻结期间不动，
+    // 但保证下次激活第一步起就有正确的实心口径）
+    for (Monster& monster : m_monsters)
+    {
+        if (monster.isAlive())
+        {
+            monster.setPlayerBlocker(playerBox); // 本步玩家脚盒快照
+        }
+    }
 
     // 怪物追踪：每个存活怪物注入「本步目标 + 本步速度」后更新。
     // 「场景注入、实体执行」的分工让难度规则完全留在本层。
@@ -553,6 +580,16 @@ void PlayScene::update(const UpdateContext& ctx)
             }
         }
     }
+
+    // ---- 体积碰撞收尾（批四）----
+    // 1) 兜底分离：任何来源产生的「怪物与玩家重叠」（正常热更顺序之外——
+    //    如击退/回弹瞬移落点恰好压在玩家上、上一帧的遗留）按最小分离量
+    //    把怪物推出（玩家优先不动；被墙挤死的死角原地等下一帧）
+    pushMonstersOutOfPlayer(playerBox);
+
+    // 2) 怪物↔怪物轻量软分离：两两重叠的按最小分离量各退一半——
+    //    「不完美但稳定」的轻量口径（实现自定见头文件注释，报告说明）
+    separateOverlappingMonsters();
 
     // 经验宝石：推进旋转动画 -> 拾取判定 -> 统一清理
     for (XpGem& gem : m_gems)
@@ -1099,6 +1136,69 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
     // 重试耗尽（少见：窗口内可走区域被墙占满等极端情形）：本步不生成。
     // 刷新时刻表已在调用方推进——下一次刷新时刻自然再试，不会死循环
     return false;
+}
+
+// 把与玩家碰撞盒重叠的怪物按最小分离量推出（批四·体积碰撞兜底）
+void PlayScene::pushMonstersOutOfPlayer(const SDL_FRect& playerBox)
+{
+    for (Monster& monster : m_monsters)
+    {
+        // 空槽位跳过：未激活的怪物不参与物理
+        if (!monster.isAlive())
+        {
+            continue;
+        }
+
+        // 最小分离量（MTV）：把怪物推出玩家盒的最小位移；未重叠则跳过
+        const SeparationResult sep = computeSeparation(monster.collisionRect(), playerBox);
+        if (!sep.overlapping)
+        {
+            continue;
+        }
+
+        // 只推怪物、绝不动玩家（「玩家优先不动」的兜底语义）：
+        // nudge 内部做墙/玩家校验——被挤死则原地等下一帧
+        monster.nudge(sep.pushX, sep.pushY);
+    }
+}
+
+// 怪物↔怪物轻量软分离（批四）：重叠的按最小分离量各退一半
+void PlayScene::separateOverlappingMonsters()
+{
+    // 两两组合（池 <= 12：最多 66 对，每步一轮的开销可忽略）
+    for (size_t i = 0; i < m_monsters.size(); ++i)
+    {
+        Monster& a = m_monsters[i];
+        if (!a.isAlive())
+        {
+            continue; // 空槽位不参与
+        }
+
+        for (size_t j = i + 1; j < m_monsters.size(); ++j)
+        {
+            Monster& b = m_monsters[j];
+            if (!b.isAlive())
+            {
+                continue; // 空槽位不参与
+            }
+
+            // 最小分离量（a 相对 b 的推出向量）：未重叠则跳过
+            const SeparationResult sep =
+                computeSeparation(a.collisionRect(), b.collisionRect());
+            if (!sep.overlapping)
+            {
+                continue;
+            }
+
+            // 各退一半：a 沿推出向量走一半、b 沿反方向走一半（合计 = 完整
+            // 分离量）。各自经 nudge 做「墙 + 不推入玩家」校验——被挡的
+            // 一侧少退不退（轻量口径：多怪挤压极端局面允许短暂残留）
+            const float halfX = sep.pushX * 0.5f; // 各方水平退让量
+            const float halfY = sep.pushY * 0.5f; // 各方垂直退让量
+            a.nudge(halfX, halfY);   // a：沿推出方向退一半
+            b.nudge(-halfX, -halfY); // b：反方向退一半
+        }
+    }
 }
 
 // 重开一局：把整局相关的数据全部恢复到初始状态

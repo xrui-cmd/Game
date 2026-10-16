@@ -110,8 +110,23 @@ public:
     //   2. 每个子步内先试 X 轴、再试 Y 轴：该轴落点可走才推进，
     //      被墙挡则停该轴——「一轴被挡、另一轴照走」天然产生贴墙滑动；
     // 返回位移后的左上角坐标。玩家与怪物的移动都走这里（行为一致，
-    // 单测覆盖「滑动」「不穿透」两个关键性质）
+    // 单测覆盖「滑动」「不穿透」两个关键性质）。
+    // 本批起它是 slideMoveEx 的「无额外实心」便捷包装（行为完全不变）
     SDL_FPoint slideMove(float x, float y, float w, float h, float dx, float dy) const;
+
+    // 「额外实心体」判定回调（批四·体积碰撞）：给定候选矩形（世界坐标），
+    // 返回它是否与某个体积障碍（怪物碰撞盒 / 玩家碰撞盒）重叠。
+    // context 由调用方原样透传（通常传实体自身，回调内还原后查内部状态）
+    using ExtraSolidFn = bool (*)(void* context, const SDL_FRect& rect);
+
+    // 分轴位移 + 撞墙滑动（带「额外实心体」的完整版）：
+    // 与 slideMove 同一套子步/分轴算法，只是「可走」判据多一条——
+    // 候选落点还不能与 extraSolid 指定的实心体重叠（不重叠才推进）。
+    // 用途：玩家移动时把怪物碰撞盒当墙（撞上滑停）、怪物移动时把玩家
+    // 碰撞盒当墙——实体互碰的「不可重合」由滑动截停自然保证。
+    // extraSolid 传 nullptr = 只查世界墙体（等价于 slideMove）
+    SDL_FPoint slideMoveEx(float x, float y, float w, float h, float dx, float dy,
+                           ExtraSolidFn extraSolid, void* context) const;
 
     // ---- 区块索引与激活窗口 ----
 
