@@ -14,6 +14,7 @@
 #include "game/LevelCurve.h"    // LevelCurve：升级经验曲线（纯逻辑，tests/xp_test.cpp 直测）
 #include "game/FloatingText.h"  // FloatingText：漂浮文字（伤害飘字与升级飘字共用）
 #include "game/LevelupSfx.h"    // LevelupSfx：升级音效（游戏层直读；引擎加 SoundId::LevelUp 前的过渡）
+#include "game/UpgradeCard.h"   // UpgradeCard：三选一升级卡（卡池表/抽取/叠加数学/欠账队列；纯逻辑）
 #include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
 #include <array>                // std::array：本扫程命中记录（按怪物池槽位的定长布尔表）
 #include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
@@ -80,12 +81,17 @@
 //        怪物回弹 40px（替换旧 150px 弹开）+ hit 音效；冷却新键
 //        monster_attack_cooldown（默认 1.2s）；命中/落空/出招均有日志；
 //      - 玩家 100 点生命：被攻击命中扣血 + 0.8s 无敌闪烁 + 怪物回弹 40px；
-//      - 成长闭环（批四起：宝石自动吸收）：击杀掉落的经验宝石自动飞向
-//        玩家（homing：700~900px/s 加速、穿墙可达；抵达即 +10 经验——
-//        玩家无需走动；日志「经验被吸收」）-> 按 LevelCurve 曲线循环结算
-//        （溢出一枚可连升多级）-> 每级自动强化：生命上限 +10（并即时
-//        回血 10）、攻击伤害 +3、移速 +10；升级时「升级！」飘字（玩家
-//        上方）+ 等级数字瞬闪高亮 + levelup 音效（LevelupSfx 直读）；
+//      - 成长闭环（批四起：宝石自动吸收；M2 起：升级三选一卡）：
+//        击杀掉落的经验宝石自动飞向玩家（homing：700~900px/s 加速、
+//        穿墙可达；抵达即 +10 经验——玩家无需走动；日志「经验被吸收」；
+//        M2 起经「慧眼」卡乘算提升）-> 按 LevelCurve 曲线循环结算
+//        （溢出一枚可连升多级）-> 每级记一笔「卡牌选择欠账」：进入
+//        LevelUp 状态（世界冻结）弹出三张随机升级卡（1/2/3 抉择、
+//        三张不重复、排除已满层），选择立即生效并记录「升级选择」日志；
+//        欠账未清继续弹下一组（连升连选），清完回 Playing；
+//        升级飘字/等级瞬闪/音效保留；M2 前的「每级自动强化」
+//        （levelup_*）已退役——成长全部由卡牌提供；R 重开清零全部
+//        层数与效果（基准 + 层数重算）
 //      - 生命归零 -> GameOver；结算最佳战绩（最高击杀/最高等级/最长存活，
 //        仅完整对局比较更新并立即写盘；任一项被破播 record 音效 +「新纪录！」）；
 //      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键；
@@ -116,6 +122,9 @@
 //
 // 状态机（PlayState）：
 //   Playing  ：接受输入、推进战斗、检测碰撞与刷新、存活时间正计时
+//   LevelUp  ：升级三选一面板（M2）：世界冻结（同暂停语义），仅响应 1/2/3
+//              与 F3（ESC/M/R 不响应——防误触）；选择生效，欠账未清再弹
+//              下一组（连升连选），清完回 Playing
 //   Paused   ：世界冻结（含存活计时与飘字动画），ESC 恢复、M 回主菜单
 //   GameOver ：世界冻结（仅因玩家生命归零触发），显示本局等级/击杀/存活与三项最佳战绩，
 //              被破项旁标「新纪录！」并播 record 音效；等待 R 重开或 M 回主菜单
@@ -125,6 +134,7 @@
 enum class PlayState
 {
     Playing,  // 正在游戏：接受输入、推进战斗、检测碰撞与刷新
+    LevelUp,  // 升级三选一：世界冻结，仅响应 1/2/3（F3 走事件通道独立生效）
     Paused,   // 暂停：世界冻结，ESC 恢复、M 回主菜单
     GameOver  // 本局结束：世界冻结，等待玩家按 R 重开或按 M 回主菜单
 };
@@ -156,16 +166,31 @@ public:
     void render(float alpha) override;
 
 private:
-    // 重开一局：生命/击杀/等级/经验复位、三项属性回基准、玩家归位（世界
-    // 中心）、回收全部怪物/宝石/飘字、刷新计时重排、清「新纪录」标记；
-    // 相机 snapTo 玩家并立即刷新区块激活窗口（新一局从干净的 3x3 开始）
+    // 重开一局：生命/击杀/等级/经验复位、卡牌层数与欠账清零、三项属性回
+    // 基准、玩家归位（世界中心）、回收全部怪物/宝石/飘字、刷新计时重排、
+    // 清「新纪录」标记；相机 snapTo 玩家并立即刷新区块激活窗口
+    //（新一局从干净的 3x3 开始）
     void restart();
 
     // 输入动作的按下边缘处理：暂停/恢复（Playing <-> Paused）、
     // 重开（GameOver 下 R）、回菜单（Paused/GameOver 下 M）。
     // pressed 在整帧的所有固定步都为 true，用「本帧已处理」标记去重，
-    // 保证每次按下恰好触发一次（行为与事件式完全一致）
+    // 保证每次按下恰好触发一次（行为与事件式完全一致）。
+    // 说明（M2）：LevelUp 状态下三个动作都不响应（防误触）——各分支的
+    // 状态判据天然排除 LevelUp，无需额外分支
     void handleInputEdges(const UpdateContext& ctx);
+
+    // 打开（或再弹）升级三选一面板（M2）：抽一组卡（三张不重复、排除
+    // 已满层、池不足按实际）-> 有卡则进入 LevelUp 展示并打面板日志。
+    // 池空（防御路径：卡池含两张无限卡、正常永不空）时逐笔消费欠账并
+    // 记录跳过，欠账清完后回到 Playing——「无卡可选」绝不卡死流程
+    void openCardPanel();
+
+    // 升级选择输入处理（LevelUp 状态每固定步调用，M2）：
+    // 1/2/3 动作的按下边缘（去重标记与暂停同款）-> 选中的卡层数 +1 ->
+    // 打「升级选择」日志 -> 消费一笔欠账 -> 未清再弹一组 / 清完回 Playing。
+    // 按到空位（不足三张时按 3 等）时本步不做任何事，面板继续等待
+    void handleCardChoice(const UpdateContext& ctx);
 
     // 主动攻击入口（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扫程推进」。
     // 「场景读输入/算方向、玩家管出手、场景做命中结算」的分工：
@@ -336,8 +361,9 @@ private:
     // 多停留一会儿让玩家看清；伤害数字用 FloatingText 的默认寿命（0.8s）
     static constexpr float kLevelupTextLifeSeconds = 1.2f;
 
-    static constexpr float kHudPtSize = 32.0f; // HUD/提示文字字号（像素高，小数需求清晰）
-    static constexpr float kBigPtSize = 64.0f; // 暂停/结束标题字号（大号观感）
+    static constexpr float kHudPtSize = 32.0f;  // HUD/提示文字字号（像素高，小数需求清晰）
+    static constexpr float kBigPtSize = 64.0f;  // 暂停/结束标题字号（大号观感）
+    static constexpr float kCardPtSize = 24.0f; // 升级三选一面板小字字号（卡描述/层数标注；M2）
 
     // FPS 调试行专用：仍走 SDL 内置调试字体（8x8 点阵，仅 ASCII），
     // 缩放 2 倍 => 16 屏幕像素高，与改造前的调试行观感完全一致
@@ -365,8 +391,9 @@ private:
     Camera m_camera;
 
     // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
-    Font m_hudFont; // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
-    Font m_bigFont; // 大号标题（暂停 / 游戏结束）
+    Font m_hudFont;  // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
+    Font m_bigFont;  // 大号标题（暂停 / 游戏结束）
+    Font m_cardFont; // 升级三选一面板的小字号文字（卡描述/层数标注；M2）
 
     Player m_player;                 // 玩家实体
     std::vector<Monster> m_monsters; // 怪物对象池（预创建 kMonsterPoolSize 个槽位）
@@ -432,6 +459,13 @@ private:
     int m_level = 1;                     // 当前等级（restart 复位为 1；升级只增不减）
     int m_xp = 0;                        // 当前级已积累经验（结算后恒小于本级需求；HUD 进度条）
     float m_levelFlashLeft = 0.0f;       // 等级数字瞬闪剩余时长（秒；升级时置满，仅 Playing 递减）
+
+    // ---- 三选一升级卡运行时状态（M2；restart 复位）----
+    int m_cardLevels[kCardCount] = {};       // 各卡当前层数（下标与 CardId 一一对应；R 重开全清零）
+    LevelUpQueue m_choiceQueue;              // 连升欠账队列（每次升级 +1 笔；选择消费；>0 保持逐次弹选）
+    CardDrawResult m_offeredCards;           // 当前面板展示的卡（位序 1/2/3；count 为实际张数）
+    CardSeedRandom m_cardRng;                // 卡池抽取的种子化随机源（onEnter 播种；同种子可复现）
+    bool m_choiceHandled[3] = { false, false, false }; // 1/2/3 按下边缘去重标记（与暂停同款语义）
 
     // ---- 最佳战绩（onEnter 读档快照；restart 不重读——本局比较基准从头到尾一致）----
     BestRecord m_best;             // 开赛时的历史最佳；GameOver 结算后就地更新为最新纪录

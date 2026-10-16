@@ -156,8 +156,13 @@ void GameDev::bindInputActions()
     // 菜单确认（pressed 边缘：菜单按确认进入对局）
     bindAction("confirm", "bind_confirm", "ENTER", SDL_SCANCODE_RETURN);
 
+    // 升级三选一（M2；pressed 边缘：面板按 1/2/3 选择对应卡牌）
+    bindAction("choice_1", "bind_choice_1", "1", SDL_SCANCODE_1);
+    bindAction("choice_2", "bind_choice_2", "2", SDL_SCANCODE_2);
+    bindAction("choice_3", "bind_choice_3", "3", SDL_SCANCODE_3);
+
     // 小键盘回车：确认动作的内置别名（历史行为两个 Enter 都接受；
-    // 它不占配置键位——八个 bind_* 配置保持最小集合，菜单查询时一并检查）
+    // 它不占配置键位——bind_* 配置保持最小集合，菜单查询时一并检查）
     m_input.bind("confirm_kp", SDL_SCANCODE_KP_ENTER);
 }
 

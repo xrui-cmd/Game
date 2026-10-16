@@ -183,9 +183,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     {
         // std::string 构造时会拷贝字符内容，后续不再依赖 SDL 的内部缓存
         const std::string fontPath = std::string(basePath) + "assets/fonts/SmileySans-Oblique.ttf";
-        // 两个字号彼此独立：一份加载失败不影响另一份
-        m_hudFont.load(fontPath, kHudPtSize); // HUD/提示文字
-        m_bigFont.load(fontPath, kBigPtSize); // 暂停/结束标题
+        // 三个字号彼此独立：一份加载失败不影响其余（面板文字安全跳过）
+        m_hudFont.load(fontPath, kHudPtSize);   // HUD/提示文字
+        m_bigFont.load(fontPath, kBigPtSize);   // 暂停/结束标题
+        m_cardFont.load(fontPath, kCardPtSize); // 升级三选一面板小字（描述/层数；M2）
     }
 
     // 7) 玩家纹理：三级回退（精灵表 -> 单帧图 -> 程序化纯色）在 Entity 内完成，
@@ -259,6 +260,12 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 14) 加载升级音效（可选增强）：素材缺失/无音频设备只警告，升级静默、
     //     流程照常（降级细节见 LevelupSfx.h 的契约）
     m_levelupSfx.load();
+
+    // 15) 播种三选一升级卡的随机源（M2）：在 [1, INT32_MAX] 取随机种子——
+    //     与 world_seed=0「每局随机」同款口径（每局卡序不同；种子采用
+    //     非 0 值，0 会被 CardSeedRandom::seed 置换为固定常量）。
+    //     R 重开不重新播种：层数清零后卡池全开，后续抽卡沿用同一序列
+    m_cardRng.seed(static_cast<std::uint32_t>(SDL_rand(0x7FFFFFFF)) + 1u);
 }
 
 // 事件处理：只保留 F3（帧率显示切换）。
@@ -287,6 +294,9 @@ void PlayScene::handleEvent(const SDL_Event& event)
 // 输入动作的按下边缘处理（每个上升沿恰好响应一次）。
 // 调用位置：update 的最开头——暂停/重开/回菜单在任何状态下都要能响应
 //（包括 Paused/GameOver 的冻结分支；PlayScene 世界冻结但输入始终可用）
+// 例外（M2）：LevelUp（升级三选一面板）期间三个动作都不响应（防误触）——
+// 各分支的状态判据（Playing/Paused/GameOver）天然排除 LevelUp，无需额外
+// 分支；去重标记照常记录，面板期间按下的键不会在回到 Playing 后迟到触发
 void PlayScene::handleInputEdges(const UpdateContext& ctx)
 {
     // 本步的边沿采样（ctx.input 为 nullptr 时按「都没按」安全降级）。
@@ -338,18 +348,145 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
     m_menuHandled = menuPressed; // 记录采样：上升沿去重
 }
 
+// 打开（或再弹）升级三选一面板（M2）：抽一组卡 -> 有卡进入 LevelUp 展示；
+// 池空（防御路径：卡池含两张无限卡、正常局永不空）时逐笔消费欠账并记录
+// 跳过，欠账清完后回到 Playing——「无卡可选」绝不把流程卡死。
+// 调用时机：升级（grantXp 记完欠账）与选择后仍有欠账时
+void PlayScene::openCardPanel()
+{
+    // 欠账 > 0 才需要面板；循环处理「抽到卡」与「池空跳过」两种结果。
+    // 正常流程第一轮就抽到卡返回；池空的循环只是防御兜底（不会死循环：
+    // 每轮要么抽到卡返回、要么消费一笔欠账直到清零）
+    while (m_choiceQueue.pending() > 0)
+    {
+        // 抽取一组：三张不重复、排除已满层、池不足按实际（纯逻辑，见 UpgradeCard.h）
+        m_offeredCards = drawUpgradeCards(m_cardLevels, &CardSeedRandom::nextFrom, &m_cardRng);
+
+        // 抽到至少一张：进入 LevelUp 状态（世界从下一固定步起冻结）并打日志
+        if (m_offeredCards.count > 0)
+        {
+            m_state = PlayState::LevelUp; // 切换状态：update 的冻结分支接管
+
+            // 冒烟观测点：面板日志（含实际张数与卡名——「连升连选」断言点：
+            // 连续两组面板会连续出现两条本日志）
+            std::string panelText = "升级选择面板（"; // 拼接「（A / B / C）」样式
+            for (int i = 0; i < m_offeredCards.count; ++i) // 逐张追加卡名
+            {
+                if (i > 0) // 非首张：先加分隔符
+                {
+                    panelText += " / "; // 卡名分隔符
+                }
+                panelText += cardDef(m_offeredCards.cards[i]).name; // 追加本张卡名
+            }
+            panelText += "）"; // 收尾括号
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "%s", panelText.c_str()); // 面板日志
+            return; // 面板就位：本次打开结束
+        }
+
+        // 池空（防御路径）：本笔欠账没有卡可选——消费并记录，继续尝试下一笔
+        m_choiceQueue.consume(); // 消费一笔欠账（无卡可选的欠账直接作废）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择跳过（卡池已满）"); // 观测点
+    }
+
+    // 欠账全部清空（全部因池空跳过）：确保回到 Playing 并记录恢复
+    m_state = PlayState::Playing; // 恢复对局（正常流程不会走到这里）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择完毕，恢复对局"); // 观测点
+}
+
+// 升级选择输入处理（LevelUp 状态每固定步调用，M2）：
+// 1/2/3 动作的按下边缘（去重标记与暂停同款）-> 选中的卡层数 +1 ->
+// 打「升级选择」日志 -> 消费一笔欠账 -> 未清再弹一组 / 清完回 Playing。
+// 说明：pressed 在整帧的所有固定步都为 true——去重标记保证「一次按住」
+// 恰好选一张；连选下一组不会被同一帧的重复边沿误消费（下一帧 pressed
+// 已消失，需玩家重新按键）
+void PlayScene::handleCardChoice(const UpdateContext& ctx)
+{
+    // 本步的三个选择动作边沿（ctx.input 为 nullptr 时按「都没按」安全降级）
+    const bool choice1Pressed = ctx.input != nullptr && ctx.input->pressed("choice_1");
+    const bool choice2Pressed = ctx.input != nullptr && ctx.input->pressed("choice_2");
+    const bool choice3Pressed = ctx.input != nullptr && ctx.input->pressed("choice_3");
+
+    // 选中栏位：1/2/3 中恰好一个「未被本帧消费过」的上升沿；-1 = 本步无选择
+    int chosen = -1; // 选中的展示位序（0/1/2）
+    if (choice1Pressed && !m_choiceHandled[0])
+    {
+        chosen = 0; // 按 1：第 1 张
+    }
+    else if (choice2Pressed && !m_choiceHandled[1])
+    {
+        chosen = 1; // 按 2：第 2 张
+    }
+    else if (choice3Pressed && !m_choiceHandled[2])
+    {
+        chosen = 2; // 按 3：第 3 张
+    }
+
+    // 记录本步采样（去重基线）：上升沿消失前不再重复响应——面板换组后，
+    // 同一次按住不会连选下一组（与暂停/重开的去重语义完全一致）
+    m_choiceHandled[0] = choice1Pressed; // 1 号采样记录
+    m_choiceHandled[1] = choice2Pressed; // 2 号采样记录
+    m_choiceHandled[2] = choice3Pressed; // 3 号采样记录
+
+    // 无有效选择（没按 / 按的是空位——不足三张时按 3 等）：面板继续等待
+    if (chosen < 0 || chosen >= m_offeredCards.count)
+    {
+        return; // 本步不做任何事
+    }
+
+    // ---- 卡牌生效：层数 +1（封顶防御——已满层不会再入池，这里是第二道闸）----
+    const CardId id = m_offeredCards.cards[chosen];       // 选中的卡 id
+    const int cardIndex = static_cast<int>(id);           // 层数数组下标（与 CardId 对应）
+    m_cardLevels[cardIndex] = gainCardLevel(id, m_cardLevels[cardIndex]); // 层数 +1（有限卡封顶）
+
+    // ---- 冒烟观测点：升级选择日志（规格文案「升级选择：卡片名（层数 x/上限）」；
+    //      无限卡上限写作「无限」）----
+    const CardDef& def = cardDef(id); // 卡定义（名称与上限文本的来源）
+    char limitText[16];               // 上限文本：数字或「无限」（16 字节绰绰有余）
+    if (def.maxLevel > 0)             // 有限卡：上限写数字
+    {
+        SDL_snprintf(limitText, sizeof(limitText), "%d", def.maxLevel); // 如 "5"
+    }
+    else                              // 无限卡：上限写「无限」
+    {
+        SDL_strlcpy(limitText, "无限", sizeof(limitText)); // 文案（UTF-8 6 字节）
+    }
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "升级选择：%s（层数 %d/%s）",
+                def.name, m_cardLevels[cardIndex], limitText); // 选择日志
+
+    // ---- 欠账消费与后续：未清再弹一组（连升连选）/ 清完回 Playing ----
+    const bool hasMore = m_choiceQueue.consume(); // 消费一笔：返回是否还有欠账
+    if (hasMore)
+    {
+        openCardPanel(); // 欠账未清：立刻抽下一组（换面板继续选）
+    }
+    else
+    {
+        m_state = PlayState::Playing; // 欠账清完：恢复对局（update 下一步起推进世界）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "升级选择完毕，恢复对局"); // 恢复日志
+    }
+}
+
 // 每帧更新：先处理输入动作边缘（任何状态都响应），再按状态推进战斗。
 // Paused（暂停）与 GameOver（结束）都冻结玩家、怪物、宝石与计时——暂停
 // 由此天然实现了「世界与计时冻结」（实体 update 的统一门控就在本函数）
 void PlayScene::update(const UpdateContext& ctx)
 {
     // 输入动作边缘：暂停/重开/回菜单（与状态无关，先于冻结分支处理——
-    // 否则暂停后按 ESC/M 将无法恢复/回菜单）
+    // 否则暂停后按 ESC/M 将无法恢复/回菜单）。LevelUp 下三个动作不响应
+    //（各分支状态判据天然排除——防误触；见 handleInputEdges 说明）
     handleInputEdges(ctx);
 
     // 非 Playing 状态：世界冻结。
     if (m_state != PlayState::Playing)
     {
+        // LevelUp（M2 三选一）：先处理 1/2/3 选择——选择可能消费最后一笔
+        // 欠账并切回 Playing，但本步仍按冻结处理（世界下一固定步才恢复）
+        if (m_state == PlayState::LevelUp)
+        {
+            handleCardChoice(ctx); // 选择生效/换面板/恢复对局都在内部完成
+        }
+
         // 冻结期间的插值自查（重要）：把各实体的插值快照对齐到当前位置。
         // 若不对齐，最后一次 update 留下的 prev->cur 区间会随渲染帧的
         // alpha 波动来回插值，暂停画面上会出现亚像素级漂移/抖动；
@@ -1004,10 +1141,14 @@ void PlayScene::grantXp(int amount)
         m_levelupSfx.play();
     }
 
-    // 有升级才触发 HUD 瞬闪：短暂窗口内等级数字金白交替（渲染端消费本计时）
+    // 有升级才触发 HUD 瞬闪：短暂窗口内等级数字金白交替（渲染端消费本计时）。
+    // 三选一升级卡（M2）同点接入：连升的每一级记一笔欠账（逐次弹选）、
+    // 立即打开第一组选择面板（抽卡 + 进入 LevelUp——世界从下一固定步冻结）
     if (result.levelsGained > 0)
     {
         m_levelFlashLeft = kLevelFlashSeconds; // 重置为满值（连升多级只刷一次时长）
+        m_choiceQueue.add(result.levelsGained); // 欠账登记：每升一级欠一次选择
+        openCardPanel(); // 打开选择面板（正常路径：抽到卡并进入 LevelUp）
     }
 }
 
@@ -1249,6 +1390,20 @@ void PlayScene::restart()
     m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
     m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
 
+    // 三选一升级卡清零（M2：「R 重开清零全部层数与效果」的层数侧）：
+    // 层数与欠账全清、面板卡位清空、1/2/3 去重标记复位——新一局的卡池
+    // 从零层开始（效果侧随三项属性回基准一并清零）。
+    // 卡池随机源不重播种：层数清零后卡池全开，沿用同一序列即可
+    for (int& level : m_cardLevels) // 逐卡遍历层数数组
+    {
+        level = 0; // 该卡层数归零
+    }
+    m_choiceQueue.clear();             // 欠账清零（未清完的选择不带进新一局）
+    m_offeredCards = CardDrawResult{}; // 面板卡位清空（count = 0）
+    m_choiceHandled[0] = false;        // 1 号去重标记复位
+    m_choiceHandled[1] = false;        // 2 号去重标记复位
+    m_choiceHandled[2] = false;        // 3 号去重标记复位
+
     // 「新纪录」标记复位：上一局的破纪录展示不带到新一局。
     //（m_best 快照保留不动——它是整局的比较基准，只在结算成功时更新）
     m_newKillRecord = false;
@@ -1413,10 +1568,12 @@ void PlayScene::renderHud()
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    // Paused / GameOver 叠层加半透明暗化遮罩：把游戏世界（区块/玩家/怪物）
-    // 整体压暗，让叠层文字从画面中浮出来。绘制顺序：遮罩放在最前——
+    // Paused / LevelUp / GameOver 叠层加半透明暗化遮罩：把游戏世界
+    //（区块/玩家/怪物）整体压暗，让叠层文字从画面中浮出来（LevelUp 的
+    // 升级面板同样悬浮在压暗的世界之上）。绘制顺序：遮罩放在最前——
     // 之后绘制的 FPS 行与叠层文字都压在遮罩之上，保持全亮
-    if (m_state == PlayState::Paused || m_state == PlayState::GameOver)
+    if (m_state == PlayState::Paused || m_state == PlayState::LevelUp ||
+        m_state == PlayState::GameOver)
     {
         // 打开混合模式：颜色按 alpha 与画面混合（默认模式会直接覆盖）
         if (!SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND))
@@ -1465,10 +1622,11 @@ void PlayScene::renderHud()
         }
     }
 
-    // ---- 生存 HUD（Playing 与 Paused 都显示）----
-    // 暂停时保留完整 HUD：玩家能看清冻结时刻的生命/等级/经验/击杀/存活；
-    // GameOver 不显示（结束界面有自己的结算排版）
-    if (m_state == PlayState::Playing || m_state == PlayState::Paused)
+    // ---- 生存 HUD（Playing / LevelUp / Paused 都显示）----
+    // 暂停与升级选择时保留完整 HUD：玩家能看清冻结时刻的生命/等级/经验/
+    // 击杀/存活（升级面板悬浮其上）；GameOver 不显示（结束界面有自己的排版）
+    if (m_state == PlayState::Playing || m_state == PlayState::Paused ||
+        m_state == PlayState::LevelUp)
     {
         // 条状 HUD 几何常量（左上角第一块内容）
         constexpr float kBarX = 20.0f;    // 条左边界（与后续文字同一条左边线）
@@ -1643,6 +1801,78 @@ void PlayScene::renderHud()
 
         // 第八行：回菜单提示（白色）。行距与上一行保持一致
         m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, centerY + 244.0f);
+    }
+    else if (m_state == PlayState::LevelUp)
+    {
+        // 升级三选一面板（M2）：标题 + 三卡横排 + 操作提示。
+        // 世界画面冻结在遮罩之下；卡片 = 色块底板 + 金色边框 + 编号/卡名/
+        // 描述/层数（简洁版——观感美化留 M3）
+        const float centerX = screenW / 2.0f; // 水平中心：标题与卡片行的对齐基准
+
+        // 标题（金色，屏幕上缘 11% 处）
+        SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色：与升级高光同族
+        m_hudFont.drawCentered(m_renderer, "升级！选择强化（1/2/3）", centerX, screenH * 0.11f);
+
+        // 卡片几何常量（像素）：宽 300、高 300、间距 30——三张总宽 960，
+        // 1280 窗口下居中后左右各留 160，观感舒展（面板按实际张数排布）
+        constexpr float kCardW = 300.0f;  // 卡宽（像素）
+        constexpr float kCardH = 300.0f;  // 卡高（像素）
+        constexpr float kCardGap = 30.0f; // 卡间距（像素）
+
+        const int cardNum = m_offeredCards.count;                         // 实际张数（1~3）
+        const float totalW = cardNum * kCardW + (cardNum - 1) * kCardGap; // 卡片行总宽
+        const float startX = centerX - totalW * 0.5f;                     // 首卡左边界（整体居中）
+        const float cardY = screenH * 0.30f;                              // 卡片上边界（标题之下）
+
+        for (int i = 0; i < cardNum; ++i) // 逐卡绘制
+        {
+            const CardId id = m_offeredCards.cards[i];            // 本卡的卡 id
+            const CardDef& def = cardDef(id);                     // 本卡定义（名称/描述/上限）
+            const float x = startX + i * (kCardW + kCardGap);     // 本卡左边界
+            const SDL_FRect cardRect{ x, cardY, kCardW, kCardH }; // 本卡矩形
+
+            // 底板：深色半透明（世界画面隐约透出）——填充需要混合模式
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND); // 打开混合
+            SDL_SetRenderDrawColor(m_renderer, 28, 32, 46, 232);         // 深蓝灰底（近乎不透明）
+            SDL_RenderFillRect(m_renderer, &cardRect);                   // 填充底板
+            SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE);  // 恢复默认混合
+
+            // 边框：金色描边（SDL_RenderRect 画空心矩形）
+            SDL_SetRenderDrawColor(m_renderer, 205, 175, 70, 255); // 金色
+            SDL_RenderRect(m_renderer, &cardRect);                 // 画边框
+
+            // 编号（左上角，金色）：与 1/2/3 按键一一对应
+            char indexText[8]; // 容纳 "1"~"3"，绰绰有余
+            SDL_snprintf(indexText, sizeof(indexText), "%d", i + 1); // 位序即按键号
+            SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255);    // 金色
+            m_hudFont.draw(m_renderer, indexText, x + 16.0f, cardY + 14.0f); // 左上角绘制
+
+            // 卡名（居中，黄色，HUD 字号）
+            SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 黄色：与编号同族
+            m_hudFont.drawCentered(m_renderer, def.name, x + kCardW * 0.5f, cardY + 76.0f);
+
+            // 效果描述（居中，白色，小字号）
+            SDL_SetRenderDrawColor(m_renderer, 235, 235, 235, 255); // 近白
+            m_cardFont.drawCentered(m_renderer, def.desc, x + kCardW * 0.5f, cardY + 158.0f);
+
+            // 当前层数（居中，浅灰小字）：有限卡「层数 x/上限」、无限卡「层数 x/无限」
+            const int level = m_cardLevels[static_cast<int>(id)]; // 本卡当前层数
+            char levelText[64]; // 容纳「层数 99/无限」，绰绰有余
+            if (def.maxLevel > 0) // 有限卡：上限写数字
+            {
+                SDL_snprintf(levelText, sizeof(levelText), "层数 %d/%d", level, def.maxLevel);
+            }
+            else // 无限卡：上限写「无限」
+            {
+                SDL_snprintf(levelText, sizeof(levelText), "层数 %d/无限", level);
+            }
+            SDL_SetRenderDrawColor(m_renderer, 190, 190, 190, 255); // 浅灰
+            m_cardFont.drawCentered(m_renderer, levelText, x + kCardW * 0.5f, cardY + 228.0f);
+        }
+
+        // 底部操作提示（浅灰，居中，卡片行之下）
+        SDL_SetRenderDrawColor(m_renderer, 200, 200, 200, 255); // 浅灰
+        m_hudFont.drawCentered(m_renderer, "按对应数字键选择", centerX, cardY + kCardH + 40.0f);
     }
 }
 
