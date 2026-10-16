@@ -204,17 +204,19 @@ void Monster::knockback(float fromX, float fromY, float distance)
         return;
     }
 
-    // 落点校验（批二落地、批三沿用）：从全距离开始，被墙挡则按 1/2、1/4
-    // 逐级缩短重试。「贴墙可接受」的口径下不允许落点推进墙内——否则怪物
-    // 会卡在墙里两轴都出不来（而贴墙边站位是允许的：矩形与墙格相交才被拒）
+    // 落点校验（批二落地、批三沿用；批四改碰撞盒口径）：从全距离开始，
+    // 被墙挡则按 1/2、1/4 逐级缩短重试。「贴墙可接受」的口径下不允许
+    // 脚盒推进墙内——否则怪物会卡在墙里两轴都出不来（而贴墙边站位是
+    // 允许的：碰撞盒与墙格相交才被拒；精灵身体叠压墙脚属正常画面）
     for (float factor = 1.0f; factor >= 0.25f; factor *= 0.5f)
     {
-        // 候选落点（左上角坐标）：中心 + 方向 x 距离 x 比例 - 半尺寸
+        // 候选落点（精灵左上角坐标）：中心 + 方向 x 距离 x 比例 - 半尺寸
         const float candidateX = centerX + dirX * distance * factor - m_w * 0.5f;
         const float candidateY = centerY + dirY * distance * factor - m_h * 0.5f;
 
-        // 候选矩形可走：采用并结束（候选矩形 = 怪物尺寸的 AABB）
-        const SDL_FRect candidate{ candidateX, candidateY, m_w, m_h };
+        // 候选可走：采用并结束——候选盒 = 精灵左上角代入的脚部碰撞盒
+        //（collisionRectAt 与移动判定同一条偏移换算，口径一致）
+        const SDL_FRect candidate = collisionRectAt(candidateX, candidateY);
         if (m_world->isRectWalkable(candidate))
         {
             m_x = candidateX; // 采用候选落点 x
@@ -304,11 +306,11 @@ void Monster::update(const UpdateContext& ctx)
             const float targetX = nestX + std::cos(angle) * radius; // 候选点 x
             const float targetY = nestY + std::sin(angle) * radius; // 候选点 y
 
-            // 候选点可走校验：怪物矩形（48x48）在候选点必须无墙。
-            // 无世界（防御路径）直接接受——没有墙的概念就没有校验
-            const SDL_FRect candidate{ targetX - m_w * 0.5f, // 候选矩形左上角 x
-                                       targetY - m_h * 0.5f, // 左上角 y
-                                       m_w, m_h };           // 怪物尺寸
+            // 候选点可走校验（批四改碰撞盒口径）：按「脚部碰撞盒」在候选
+            // 落点做可走查询——与移动判定同一口径（精灵可叠压墙脚，脚盒
+            // 不许进墙）。无世界（防御路径）直接接受——没有墙就没有校验
+            const SDL_FRect candidate = collisionRectAt(targetX - m_w * 0.5f,  // 候选精灵左上角 x
+                                                        targetY - m_h * 0.5f); // 候选精灵左上角 y
             if (m_world == nullptr || m_world->isRectWalkable(candidate))
             {
                 m_ai.setPatrolTarget(targetX, targetY); // 供水：开始朝它游荡
@@ -406,10 +408,17 @@ void Monster::moveWithCollision(float stepDX, float stepDY, float dt)
 
     // ---- 主方向分轴滑动（与玩家移动共用同一个纯函数，行为一致）----
     // 一轴被墙挡住、另一轴照走——「贴墙滑行」的手感来源；内部还带子步
-    // 拆分防高速穿透
-    const SDL_FPoint moved = m_world->slideMove(m_x, m_y, m_w, m_h, useDX, useDY);
-    const float movedDX = moved.x - m_x; // 碰撞后的实际水平位移
-    const float movedDY = moved.y - m_y; // 碰撞后的实际垂直位移
+    // 拆分防高速穿透。批四：输入改用「脚部碰撞盒」——原点与位移量都按
+    // 盒口径计算，落点折算回精灵左上角（偏移恒定，位移量一致）
+    const SDL_FRect col = collisionRect(); // 本步起点的碰撞盒（世界坐标）
+    const SDL_FPoint movedBox = m_world->slideMove(col.x, col.y, col.w, col.h, useDX, useDY);
+    const float movedDX = movedBox.x - col.x; // 碰撞后的实际水平位移
+    const float movedDY = movedBox.y - col.y; // 碰撞后的实际垂直位移
+
+    // 盒落点 -> 精灵左上角语义（侧滑候选与主结果的比较/赋值都按精灵位置）；
+    // 盒到精灵的换算 = 减偏移，与 collisionRectAt 的加偏移互为逆运算
+    const SDL_FPoint moved{ movedBox.x - kCollisionBoxOffsetX, // 精灵左上角逐点 x
+                            movedBox.y - kCollisionBoxOffsetY }; // 精灵左上角 y
 
     // 期望/实际位移的平方（比较用平方，省一次开方）
     const float expectedSq = useDX * useDX + useDY * useDY;      // 期望位移平方
@@ -428,7 +437,8 @@ void Monster::moveWithCollision(float stepDX, float stepDY, float dt)
     }
     else
     {
-        // 正常推进（含单轴贴墙滑动的常见情形与侧滑混合路径）
+        // 正常推进（含单轴贴墙滑动的常见情形与侧滑混合路径）。
+        // moved 已是「精灵左上角」语义（批四起由盒落点折算）——直接赋值
         m_x = moved.x; // 采用主方向滑动结果 x
         m_y = moved.y; // 采用主方向滑动结果 y
     }
@@ -474,15 +484,23 @@ float Monster::slideWeight() const
     return kSlideWeightFloor + (1.0f - kSlideWeightFloor) * t;
 }
 
-// 计算左右侧滑的候选结果（从当前位置、以期望位移旋转 ±90° 试走）
+// 计算左右侧滑的候选结果（从当前位置、以期望位移旋转 ±90° 试走；
+// 批四起按「脚部碰撞盒」试走，返回值折算回精灵左上角语义）
 void Monster::sideSlideCandidates(float stepDX, float stepDY,
                                   SDL_FPoint& rightPoint, float& rightMovedSq,
                                   SDL_FPoint& leftPoint, float& leftMovedSq) const
 {
-    // 右侧滑（顺时针 90°）：(dx, dy) -> (-dy, dx)
-    rightPoint = m_world->slideMove(m_x, m_y, m_w, m_h, -stepDY, stepDX);
-    // 左侧滑（逆时针 90°）：(dx, dy) -> (dy, -dx)
-    leftPoint = m_world->slideMove(m_x, m_y, m_w, m_h, stepDY, -stepDX);
+    // 当前位置的碰撞盒（世界坐标）：两侧候选都以它为试走起点
+    const SDL_FRect col = collisionRect();
+
+    // 右侧滑（顺时针 90°）：(dx, dy) -> (-dy, dx)；盒落点 -> 精灵左上角
+    const SDL_FPoint rightBox = m_world->slideMove(col.x, col.y, col.w, col.h, -stepDY, stepDX);
+    rightPoint = SDL_FPoint{ rightBox.x - kCollisionBoxOffsetX, // 精灵系候选 x
+                             rightBox.y - kCollisionBoxOffsetY }; // 精灵系候选 y
+    // 左侧滑（逆时针 90°）：(dx, dy) -> (dy, -dx)；同样折算回精灵系
+    const SDL_FPoint leftBox = m_world->slideMove(col.x, col.y, col.w, col.h, stepDY, -stepDX);
+    leftPoint = SDL_FPoint{ leftBox.x - kCollisionBoxOffsetX, // 精灵系候选 x
+                            leftBox.y - kCollisionBoxOffsetY }; // 精灵系候选 y
 
     // 各自的实际位移平方：评判「哪一侧更能动」的度量
     const float rightDX = rightPoint.x - m_x; // 右滑实际水平位移

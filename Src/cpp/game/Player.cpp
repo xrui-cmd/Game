@@ -269,7 +269,9 @@ void Player::update(const UpdateContext& ctx)
     // 4) 位置积分：本步位移 = 当前速度 x 固定步长（速度单位：像素/秒）。
     //    自批二起改为「世界碰撞滑动」：分轴尝试 + 撞墙停该轴 + 子步防穿透
     //    （取代旧版「窗口边框 clamp」——玩家活动范围 = 世界边界，由边界墙
-    //    自然形成；判定在实体内部、按注入的 World 执行）
+    //    自然形成；判定在实体内部、按注入的 World 执行）。
+    //    自批四（碰撞体积与视觉解耦）：滑动判定输入改用「脚部碰撞盒」
+    //    （左上角 = 精灵左上角 + 偏移）——身体可叠压墙脚、脚盒不穿透
     const float stepDX = m_velocityX * dt; // 本步期望水平位移（像素）
     const float stepDY = m_velocityY * dt; // 本步期望垂直位移（像素）
 
@@ -277,9 +279,10 @@ void Player::update(const UpdateContext& ctx)
     {
         // 世界在位：整段位移交给纯函数（内部拆分小步、逐轴试走）——
         // 一轴被墙挡住、另一轴照常推进，天然产生「贴墙滑动」的手感
-        const SDL_FPoint moved = m_world->slideMove(m_x, m_y, m_w, m_h, stepDX, stepDY);
-        m_x = moved.x; // 落定后的世界坐标 x（可能被墙截停）
-        m_y = moved.y; // 落定后的世界坐标 y
+        const SDL_FRect col = collisionRect(); // 本步起点的碰撞盒（世界坐标）
+        const SDL_FPoint moved = m_world->slideMove(col.x, col.y, col.w, col.h, stepDX, stepDY);
+        m_x += moved.x - col.x; // 落定：盒的位移量直接作用于精灵左上角（偏移恒定）
+        m_y += moved.y - col.y; // 同上（y 轴）
     }
     else
     {

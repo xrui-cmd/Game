@@ -555,13 +555,16 @@ void PlayScene::update(const UpdateContext& ctx)
 
     // 接触伤害：仅玩家非无敌时整段检测（无敌期 = 保护窗口，跳过判定）。
     // 命中结算：扣生命、播 hit 音效、玩家进入无敌、怪物弹开；
-    // 同一步至多结算一次（结算后玩家立即无敌，其余怪物不再判定）
+    // 同一步至多结算一次（结算后玩家立即无敌，其余怪物不再判定）。
+    // 批四：触碰判定改用双方「脚部碰撞盒」——全身像可视觉交叠、脚盒
+    // 触碰才结算（与移动/出生同一口径；怪物攻击替换本机制于后续提交）
     if (m_playerInvincibleLeft <= 0.0f)
     {
+        const SDL_FRect playerBox = m_player.collisionRect(); // 玩家脚盒（本步快照）
         for (Monster& monster : m_monsters)
         {
-            // 空槽位或与本步玩家矩形不相交：检查下一只（逐只独立判定）
-            if (!monster.isAlive() || !rectsOverlap(playerRect, monster.rect()))
+            // 空槽位或与本步玩家脚盒不相交：检查下一只（逐只独立判定）
+            if (!monster.isAlive() || !rectsOverlap(playerBox, monster.collisionRect()))
             {
                 continue;
             }
@@ -579,11 +582,12 @@ void PlayScene::update(const UpdateContext& ctx)
             // 3) 玩家无敌：碰撞检测从下一步起跳过；渲染上每 0.1s 显/隐交替
             m_playerInvincibleLeft = kPlayerInvincibleSeconds;
 
-            // 4) 怪物弹开：沿「玩家中心 -> 怪物中心」方向瞬移 150px（沿用机制）。
+            // 4) 怪物弹开：沿「玩家盒中心 -> 怪物中心」方向瞬移 150px（沿用机制）。
             //    knockback 是瞬移类操作：内部对落点做世界可走校验（被墙挡
-            //    逐级缩短）并快照 prev=cur 防止插值拉丝
-            const float playerCenterX = playerRect.x + playerRect.w * 0.5f;
-            const float playerCenterY = playerRect.y + playerRect.h * 0.5f;
+            //    逐级缩短）并快照 prev=cur 防止插值拉丝；批四起弹开方向
+            //    取自玩家脚盒中心（与触碰判定同一口径）
+            const float playerCenterX = playerBox.x + playerBox.w * 0.5f;
+            const float playerCenterY = playerBox.y + playerBox.h * 0.5f;
             monster.knockback(playerCenterX, playerCenterY,
                               kContactKnockbackDistance);
 
@@ -1022,10 +1026,11 @@ float PlayScene::currentSpawnInterval() const
 // 为指定空槽位寻找落点并生成怪物（批三正式版出生规则，契约见头文件）
 bool PlayScene::spawnMonsterAtSlot(Monster& monster)
 {
-    // 玩家中心：出生距离校验的圆心（每步重取——玩家在移动，距离随人走）
-    const SDL_FRect playerRect = m_player.rect();                   // 玩家矩形快照
-    const float playerCenterX = playerRect.x + playerRect.w * 0.5f; // 玩家中心 x（世界坐标）
-    const float playerCenterY = playerRect.y + playerRect.h * 0.5f; // 玩家中心 y
+    // 玩家中心：出生距离校验的圆心（每步重取——玩家在移动，距离随人走）。
+    // 批四：取「碰撞盒（脚部）中心」——出生距离与物理判定同一口径
+    const SDL_FRect playerBox = m_player.collisionRect();           // 玩家脚盒快照
+    const float playerCenterX = playerBox.x + playerBox.w * 0.5f;   // 玩家盒中心 x（世界坐标）
+    const float playerCenterY = playerBox.y + playerBox.h * 0.5f;   // 玩家盒中心 y
 
     // 采样区域 = 激活区块窗口（批三正式版：怪物在激活区块内随机点出生）。
     // 窗口已由 World 回钳在世界内；「区块索引 -> 像素」换算用区块边长
@@ -1050,16 +1055,16 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
             continue; // 离玩家太近：换一个候选
         }
 
-        // 条件二：怪物矩形可走（候选矩形 = 怪物尺寸 AABB；世界边界墙与
-        // 内部墙簇均会在查询中被挡下——不会把怪生进墙里）。
+        // 条件二：怪物「脚部碰撞盒」在候选点必须可走（批四起由整张精灵
+        // 改为碰撞盒口径——与移动判定一致，不会把脚生进墙里；精灵身体
+        // 贴墙叠压属正常画面）。
         // 说明：采样区域 = 激活窗口，故候选点必在激活区块内（无需另查）
-        const SDL_FRect monsterRect{ spawnCenterX - monster.width() * 0.5f,  // 候选左上角 x
-                                     spawnCenterY - monster.height() * 0.5f, // 候选左上角 y
-                                     monster.width(),                        // 宽（48）
-                                     monster.height() };                     // 高（48）
-        if (!m_world.isRectWalkable(monsterRect))
+        const SDL_FRect monsterBox =
+            monster.collisionRectAt(spawnCenterX - monster.width() * 0.5f,  // 候选精灵左上角 x
+                                    spawnCenterY - monster.height() * 0.5f); // 候选精灵左上角 y
+        if (!m_world.isRectWalkable(monsterBox))
         {
-            continue; // 落点是墙：换一个候选
+            continue; // 脚盒落点是墙：换一个候选
         }
 
         // 两个校验全过：等权随机变体 -> 槽位换皮 -> 落位生成。

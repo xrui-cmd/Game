@@ -63,6 +63,10 @@ class Camera;
 //   8. 头顶血条（批三新增）：受损后（hp < maxHp）在头顶绘制小血条
 //      （40x5、深色底 + 红色按比例填充；屏幕空间绘制经相机换算）；
 //      满血隐藏——「看一眼血量、不看面板」的轻量读血方式
+//   9. 碰撞盒（批四·碰撞体积与视觉解耦）：构造时设置「脚部小盒」
+//      36x30、底部内收 6px（setCollisionBox）——移动滑动、击退落点、
+//      游荡点校验、玩家互碰全部改用碰撞盒；渲染/血条照旧用完整精灵
+//      （48x48）。俯视角下「身体可叠压墙脚、脚盒不穿透」
 // ============================================================
 
 // 怪物变体枚举：等权随机刷新的取值范围（Count 恒为变体数量，用作随机上界）
@@ -88,6 +92,12 @@ public:
     {
         m_w = kSize; // 宽 48 像素：变体帧宽 16px x 3 倍放大（见 tools/compose_sprites.ps1）
         m_h = kSize; // 高 48 像素：变体帧高 16px x 3 倍放大
+
+        // 脚部碰撞盒（批四）：48x48 全身像中只取脚部 36x30 的小盒——
+        // 宽居中（右移 6px）、底边内收 6px（上移 12px）；墙滑动/落点校验/
+        // 玩家互碰都改用它，精灵身体可叠压墙脚而不穿透（判定/渲染解耦）
+        setCollisionBox(kCollisionBoxW, kCollisionBoxH,
+                        kCollisionBoxOffsetX, kCollisionBoxOffsetY);
     }
 
     // 按指定变体加载/重载纹理：设置变体类型 -> 释放旧纹理 -> 三级回退加载
@@ -192,6 +202,14 @@ public:
 private:
     static constexpr float kSize = 48.0f;           // 怪物边长（正方形），也是单帧宽高
     static constexpr float kHitFlashSeconds = 0.1f; // 受击闪白时长（秒；代码常量，不进配置）
+
+    // ---- 脚部碰撞盒（批四）：判定的「体积」与 48x48 的视觉解耦 ----
+    // 取值（像素）：36x30 的小盒摆在精灵底部——宽居中（偏移 (48-36)/2 = 6）、
+    // 底边内收 6px（偏移 48-30-6 = 12）。可调：改这四个常量即改判定体积
+    static constexpr float kCollisionBoxW = 36.0f;       // 碰撞盒宽（像素）
+    static constexpr float kCollisionBoxH = 30.0f;       // 碰撞盒高（像素）
+    static constexpr float kCollisionBoxOffsetX = 6.0f;  // 盒左上角相对精灵左上角的 x 偏移
+    static constexpr float kCollisionBoxOffsetY = 12.0f; // 同上 y 偏移（下移到脚部）
 
     // 「已到达」判定的距离阈值（像素）：小于它就原地不动。
     // 双重作用：避免目标点附近的来回抖动，也排除归一化除以零的退化情形

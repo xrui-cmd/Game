@@ -32,7 +32,11 @@ class Camera;
 //      「移动/静止」的判据是速度是否精确归零——动画切换以它为准。
 //      自批二起：位置推进改为「分轴位移 + 撞墙滑动」（World::slideMove），
 //      取代旧版「窗口边框 clamp」——玩家活动范围 = 世界边界（由边界墙
-//      自然形成），碰撞判定在实体内部、按注入的 World 执行
+//      自然形成），碰撞判定在实体内部、按注入的 World 执行。
+//      自批四起（碰撞体积与视觉解耦）：滑动判定改用「脚部碰撞盒」
+//      （宽 32 x 高 26、底部内收 4px，构造时 setCollisionBox 设置）——
+//      精灵身体（48x84 全身像）可以自然叠压墙脚，脚盒不穿透；渲染/
+//      朝向/武器挂点照旧用完整精灵（rect），判定与画面由此解耦
 //   3. 朝向翻转（批二改版）：跟随鼠标——指针在玩家中心右侧朝右、左侧朝左；
 //      指针贴近中心线（±kFlipDeadZone 像素）时保持上一次朝向，避免抖动。
 //      鼠标位置由场景注入「世界坐标」（setAimTarget）——场景负责
@@ -74,6 +78,12 @@ public:
     {
         m_w = 48.0f; // 宽 48 像素：骑士帧宽 16px x 3 倍放大（见 tools/compose_sprites.ps1）
         m_h = 84.0f; // 高 84 像素：骑士帧高 28px x 3 倍放大（含头盔羽饰的全身像）
+
+        // 脚部碰撞盒（批四·碰撞体积与视觉解耦）：48x84 全身像中只取脚部
+        // 32x26 的小盒——宽居中（右移 8px）、底边内收 4px（上移 54px）；
+        // 墙滑动/落点/玩家↔怪物触碰/攻击距离都改用它（渲染照旧全身像）
+        setCollisionBox(kCollisionBoxW, kCollisionBoxH,
+                        kCollisionBoxOffsetX, kCollisionBoxOffsetY);
     }
 
     // 析构：基类兜底释放本体纹理之外，本类还要释放自持的武器纹理
@@ -205,6 +215,14 @@ private:
     static constexpr float kWeaponHeight = 87.0f;      // 武器绘制高（像素）：与 weapon.png 尺寸一致
     static constexpr float kDirectionEpsilon = 0.001f; // 方向归一化的退化阈值（长度小于它保留旧方向）
     static constexpr float kFlipDeadZone = 4.0f;       // 朝向跟随鼠标的死区（像素）：横向差小于它时保持朝向
+
+    // ---- 脚部碰撞盒（批四·碰撞体积与视觉解耦）----
+    // 取值（像素）：32x26 的小盒摆在精灵底部——宽居中（偏移 (48-32)/2 = 8）、
+    // 底边内收 4px（偏移 84-26-4 = 54）。可调：改这四个常量即改判定体积
+    static constexpr float kCollisionBoxW = 32.0f;       // 碰撞盒宽（像素）
+    static constexpr float kCollisionBoxH = 26.0f;       // 碰撞盒高（像素）
+    static constexpr float kCollisionBoxOffsetX = 8.0f;  // 盒左上角相对精灵左上角的 x 偏移
+    static constexpr float kCollisionBoxOffsetY = 54.0f; // 同上 y 偏移（下移到脚部；底部内收 4px）
 
     // 残影轨迹参数（本批新增）：主体剑之后拖 3 道渐隐剑影，角度依次
     // 落后于当前刀锋——读作「刚才扫过的几个位置」；绘制在主体剑之下、
