@@ -157,23 +157,26 @@ int main()
         // 有限卡超上限层数：先封顶再计价（99 层按上限 3 层计）
         expectInt("横扫 lv99 价格 = 20（封顶后按 lv3）", shopPrice(CardId::Sweep, 99), 20);
 
-        // 价格总表打印（报告参考：1~5 层逐层价格；无限卡到 5 层）
+        // 价格总表打印（报告参考：1~上限层逐层价格；无限卡到 5 层）
         std::printf("        [价格总表] 基础价x(层数+1)，第 1~5 层：\n");
         for (int i = 0; i < kCardCount; ++i) // 逐项打印
         {
             const CardId id = static_cast<CardId>(i); // 本项 id
-            const CardDef& def = cardDef(id);         // 本项定义（名称）
+            const CardDef& def = cardDef(id);         // 本项定义（名称/上限）
             std::printf("          %s: ", def.name);  // 名称前缀
-            for (int lv = 0; lv < 5; ++lv)            // 1~5 层价格
+
+            // 打印层数上限：有限卡到上限为止、无限卡到 5 层（演示线性增长）
+            const int lvLimit = (def.maxLevel > 0 && def.maxLevel < 5) ? def.maxLevel : 5; // 本项打印层数
+            for (int lv = 0; lv < lvLimit; ++lv)      // 逐层价格
             {
                 std::printf("%d", shopPrice(id, lv)); // 本层价格
-                if (lv < 4) { std::printf(" / "); }   // 分隔
+                if (lv + 1 < lvLimit) { std::printf(" / "); } // 分隔
             }
-            if (def.maxLevel > 0 && def.maxLevel < 5) // 上限不足 5 层的标注
+            if (def.maxLevel > 0) // 有限卡标注上限
             {
                 std::printf("（上限 %d 层）", def.maxLevel);
             }
-            else if (def.maxLevel == 0) // 无限卡标注
+            else // 无限卡标注
             {
                 std::printf(" / ...（无限）");
             }
