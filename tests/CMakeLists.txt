@@ -303,3 +303,123 @@ set_target_properties(monster_ai_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  碰撞盒 / 最小分离 / 追踪吸附单元测试（collision_homing_test，批四）
+#
+#  被测对象：引擎 Entity 碰撞盒（libs/GameEngine 的 Entity.h/.cpp）+
+#  game/Separation.h（最小分离 MTV）+ game/Homing.h（追踪吸附单步积分）。
+#
+#  与 world_test 同模式：编译 Entity.cpp 并链接 SDL3 与 SDL3_image
+#  （Entity.cpp 的加载路径引用 IMG_LoadTexture 等符号）。实际跑到的
+#  路径全部是纯计算（碰撞盒换算 / 分离向量 / 追踪位移），不创建窗口、
+#  不加载素材，任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\collision_homing_test.exe
+# ============================================================
+
+add_executable(collision_homing_test
+    collision_homing_test.cpp
+    ../libs/GameEngine/src/Entity.cpp
+)
+
+if (MSVC)
+    target_compile_options(collision_homing_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Separation.h / Homing.h 在游戏仓 Src/inc，
+# Entity.h 在引擎子模块，SDL 头在 vendor
+target_include_directories(collision_homing_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL3_image/include")
+
+# 链接主工程构建出的 SDL3 与 SDL3_image 导入库
+#（Entity.cpp 引用 SDL_LogWarn 与 IMG_LoadTexture 两组符号）
+target_link_libraries(collision_homing_test PRIVATE
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib"
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL3_image/SDL3_image.lib")
+
+# 运行目录放 SDL3.dll 与 SDL3_image.dll（与主工程同一份构建产物）
+add_custom_command(TARGET collision_homing_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3.dll"
+    "$<TARGET_FILE_DIR:collision_homing_test>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3_image.dll"
+    "$<TARGET_FILE_DIR:collision_homing_test>"
+)
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(collision_homing_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
+
+# ============================================================
+#  怪物攻击状态机单元测试（monster_attack_test，批四）
+#
+#  被测对象：game/Monster.h + Monster.cpp 的攻击部分——蓄力后倾 / 前扑
+#  前冲 / 接触范围判定（碰撞盒 + 6px 余量）/ 冷却门控 / Hit-Miss 结算 /
+#  池复用清态 / 方向零向量防御。
+#
+#  与 world_test 同模式：编译 Monster.cpp + Entity.cpp + World.cpp 并链接
+#  SDL3 与 SDL3_image（日志 / 随机数 / 纹理符号）。实际跑到的路径不依赖
+#  世界（World 指针为 nullptr 的防御分支）与纹理（不做渲染），任何环境
+#  都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\monster_attack_test.exe
+# ============================================================
+
+add_executable(monster_attack_test
+    monster_attack_test.cpp
+    ../Src/cpp/game/Monster.cpp
+    ../Src/cpp/game/World.cpp
+    ../libs/GameEngine/src/Entity.cpp
+)
+
+if (MSVC)
+    target_compile_options(monster_attack_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Monster.h 等游戏头在 Src/inc，引擎头在子模块，SDL 头在 vendor
+target_include_directories(monster_attack_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL3_image/include")
+
+# 链接主工程构建出的 SDL3 与 SDL3_image 导入库
+#（Monster/World/Entity 引用 SDL_Log、SDL_randf 与 IMG_LoadTexture 等符号）
+target_link_libraries(monster_attack_test PRIVATE
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib"
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL3_image/SDL3_image.lib")
+
+# 运行目录放 SDL3.dll 与 SDL3_image.dll（与主工程同一份构建产物）
+add_custom_command(TARGET monster_attack_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3.dll"
+    "$<TARGET_FILE_DIR:monster_attack_test>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3_image.dll"
+    "$<TARGET_FILE_DIR:monster_attack_test>"
+)
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(monster_attack_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
