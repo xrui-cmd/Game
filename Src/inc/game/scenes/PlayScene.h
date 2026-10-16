@@ -71,6 +71,8 @@
 //        与金币（批三：金币数按变体——史莱姆 1 / 哥布林 2 / 骷髅 1）；
 //        金币为「局内货币」：拾取计数（音效沿用 coin.wav）、本局累计、
 //        R 重开清零；本批只储备不消费（为将来商店/强化体系铺路）；
+//        批四：金币磁吸——玩家进入 coin_magnet_radius（默认 140px）后
+//        朝玩家加速吸引、触及即拾取；范围外静止不动（仍可走过去拾取）；
 //      - 怪物攻击（批四·蓄力前扑，替换旧「纯接触即伤」）：处于接触范围
 //        （双方碰撞盒触接 + 6px 余量）且冷却就绪 -> 蓄力 0.3s（移速归零 +
 //        轻微后倾，方向出招瞬间锁定——躲避窗口）-> 前扑前冲 10px ->
@@ -78,7 +80,9 @@
 //        怪物回弹 40px（替换旧 150px 弹开）+ hit 音效；冷却新键
 //        monster_attack_cooldown（默认 1.2s）；命中/落空/出招均有日志；
 //      - 玩家 100 点生命：被攻击命中扣血 + 0.8s 无敌闪烁 + 怪物回弹 40px；
-//      - 成长闭环：拾取宝石 +10 经验 -> 按 LevelCurve 曲线循环结算
+//      - 成长闭环（批四起：宝石自动吸收）：击杀掉落的经验宝石自动飞向
+//        玩家（homing：700~900px/s 加速、穿墙可达；抵达即 +10 经验——
+//        玩家无需走动；日志「经验被吸收」）-> 按 LevelCurve 曲线循环结算
 //        （溢出一枚可连升多级）-> 每级自动强化：生命上限 +10（并即时
 //        回血 10）、攻击伤害 +3、移速 +10；升级时「升级！」飘字（玩家
 //        上方）+ 等级数字瞬闪高亮 + levelup 音效（LevelupSfx 直读）；
@@ -95,6 +99,7 @@
 //      （monster_damage）与攻击冷却（monster_attack_cooldown）、
 //      怪物生态（monster_patrol_radius 巡逻/monster_aggro_radius 仇恨/
 //      monster_leash_radius 栓绳/回巢回血 monster_return_heal_percent）、
+//      金币磁吸（coin_magnet_radius）、
 //      世界（world_chunks_x/y、world_seed）与相机（camera_smooth_time）、
 //      升级曲线（xp_level_base/xp_level_growth）与每级强化
 //      （levelup_max_hp_bonus/levelup_damage_bonus/levelup_speed_bonus）；
@@ -253,6 +258,7 @@ private:
     static constexpr int kDefaultMonsterMaxCount = 4;           // 数量上限初始值（只）
     static constexpr int kDefaultMonsterDamage = 10;            // 怪物攻击伤害（monster_damage，点；攻击命中时扣）
     static constexpr float kDefaultMonsterAttackCooldown = 1.2f; // 怪物攻击冷却缺省（monster_attack_cooldown，秒）
+    static constexpr float kDefaultCoinMagnetRadius = 140.0f;    // 金币磁吸半径缺省（coin_magnet_radius，像素）
     static constexpr float kDefaultMonsterPatrolRadius = 96.0f; // 巡逻半径缺省（monster_patrol_radius，像素）
     static constexpr float kDefaultMonsterAggroRadius = 320.0f; // 仇恨半径缺省（monster_aggro_radius，像素）
     static constexpr float kDefaultMonsterLeashRadius = 500.0f; // 栓绳半径缺省（monster_leash_radius，像素）
@@ -400,6 +406,7 @@ private:
     int m_monsterMaxCount = kDefaultMonsterMaxCount;      // 数量上限初始值（monster_max_count）
     int m_monsterDamage = kDefaultMonsterDamage;          // 怪物攻击伤害（monster_damage）
     float m_monsterAttackCooldown = kDefaultMonsterAttackCooldown; // 怪物攻击冷却（monster_attack_cooldown，秒）
+    float m_coinMagnetRadius = kDefaultCoinMagnetRadius;  // 金币磁吸半径（coin_magnet_radius，像素）
 
     // 怪物生态参数（批三；AI 状态机的决策半径与回血——onEnter 读取后
     // 注入每个怪物槽位的 MonsterAi；整局沿用，R 重开不重读）

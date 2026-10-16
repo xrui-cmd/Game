@@ -32,9 +32,14 @@
 //      回退为程序化 18x21 金黄色方块（素材缺失时兜底，保证游戏可运行）
 //   2. 动画节奏：4 帧循环、默认每帧 0.18 秒（代码常量，不进配置文件）——
 //      与经验宝石同一节奏（同源帧素材，整转观感一致：0.18 x 4 = 0.72 秒）
-//   3. 生命周期：怪物死亡时场景创建并 load -> update 播动画 -> 玩家触碰后
-//      markPicked -> 场景统一清理（cleanup 时析构并释放纹理）。
-//      拾取音效沿用 coin.wav（与宝石拾取共用同一反馈，语义恰好吻合）
+//   3. 生命周期（批四·磁吸版）：怪物死亡时场景创建并 load -> 每步由
+//      场景注入玩家盒中心；玩家中心进入 coin_magnet_radius 后开始磁吸
+//      （朝玩家加速吸引、触及即拾取）-> markPicked -> 场景统一清理。
+//      **范围外静止不动**（仍可像旧版一样走过去拾取）；磁吸一旦触发
+//      即保持（跑出范围也不会半路丢下——「吸到手」的确定性）
+//   4. 磁吸飞行（批四）：速度从 0 起步、按 kMagnetAccel 加速、封顶
+//      kMagnetMaxSpeed（800 像素/秒）；**飞行忽略墙体**（磁吸是拾取的
+//      强化表演：进入吸附半径即必有回报，不因地形打折）
 // ============================================================
 
 class Coin : public Entity
@@ -42,6 +47,11 @@ class Coin : public Entity
 public:
     // 默认帧时长：旋转动画每帧 0.18 秒（代码常量；4 帧整转约 0.72 秒）
     static constexpr float kDefaultFrameTime = 0.18f; // 默认每帧显示时长（秒）
+
+    // 磁吸速度曲线（批四；代码常量）：从静止加速（加速度 2000px/s²）、
+    // 封顶 800px/s——在默认半径 140px 下约 0.37 秒吸到脚下
+    static constexpr float kMagnetAccel = 2000.0f;    // 加速度（像素/秒²）
+    static constexpr float kMagnetMaxSpeed = 800.0f;  // 速度封顶（像素/秒）
 
     // 构造：固定金币尺寸为 18x21（与精灵表的单帧尺寸一致）
     Coin()
@@ -62,12 +72,43 @@ public:
     // 是否已被拾取（场景清理阶段据此移除对象）
     bool isPicked() const { return m_picked; }
 
+    // ---- 磁吸（批四）----
+
+    // 开始磁吸（场景在「玩家中心进入 coin_magnet_radius」时调用一次）：
+    // 此后本枚金币每步朝玩家盒中心加速飞——一次性触发、永久保持
+    void beginMagnet() { m_magnetized = true; }
+
+    // 是否已磁化（场景查询用：未磁化才做半径判定；渲染/日志可扩展使用）
+    bool magnetized() const { return m_magnetized; }
+
+    // 注入磁吸目标（玩家碰撞盒中心的世界坐标；场景每固定步在磁化后调用）：
+    // 目标随玩家移动刷新——金币追的是「当前的脚下」，不是触发时那一点
+    void setMagnetTarget(float worldX, float worldY)
+    {
+        m_magnetX = worldX; // 目标点世界坐标 x（本步快照）
+        m_magnetY = worldY; // 目标点世界坐标 y
+        m_hasTarget = true; // 标记：此后 update 追踪它（磁化后才消费）
+    }
+
+    // 覆写更新：基类帧动画之外，加入磁吸追踪位移（批四）——速度按
+    // kMagnetAccel/kMagnetMaxSpeed 推进；位移经 advanceHomingPoint 纯函数
+    //（抵达不过冲，见 Homing.h）；未磁化/未注入目标时静止不动。
+    // 拾取（触及）由场景按玩家盒重叠判定后标记
+    void update(const UpdateContext& ctx) override;
+
 private:
     static constexpr float kWidth = 18.0f;  // 金币宽（像素）＝单帧宽
     static constexpr float kHeight = 21.0f; // 金币高（像素）＝单帧高
     static constexpr int kFrameCount = 4;   // 旋转精灵表总帧数（4 帧 x 18px = 72px 宽）
 
     bool m_picked = false; // 是否已被玩家拾取（拾取后等待场景清理）
+
+    // ---- 磁吸运行时（批四）----
+    bool m_magnetized = false;   // 是否已触发磁吸（一次性、永久保持）
+    float m_magnetSpeed = 0.0f;  // 当前磁吸速度（像素/秒；从静止加速到封顶）
+    float m_magnetX = 0.0f;      // 磁吸目标 x（世界坐标；setMagnetTarget 写入）
+    float m_magnetY = 0.0f;      // 磁吸目标 y
+    bool m_hasTarget = false;    // 是否已注入目标（false = 不位移——防御）
 };
 
 #endif // !__COIN_H__

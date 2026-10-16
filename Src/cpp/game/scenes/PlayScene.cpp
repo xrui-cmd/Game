@@ -63,6 +63,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     //      monster_max_count       数量上限初始值（只，随局内时间 +2）
     //      monster_damage          怪物攻击伤害（攻击命中时扣除的生命值）
     //      monster_attack_cooldown 怪物攻击冷却（秒；两次出招的最小间隔）
+    //      coin_magnet_radius      金币磁吸半径（像素；进入后朝玩家吸引）
     //      monster_patrol_radius   巡逻半径（像素；绕巢游荡范围）
     //      monster_aggro_radius    仇恨半径（像素；玩家进入即追击）
     //      monster_leash_radius    栓绳半径（像素；离巢超过即回巢）
@@ -97,6 +98,10 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 与 attack_cooldown 的防御口径一致）；注入时机见下方怪物池装配
     m_monsterAttackCooldown =
         std::max(0.0f, config.getFloat("monster_attack_cooldown", kDefaultMonsterAttackCooldown));
+
+    // 批四新增：金币磁吸半径（像素）——负值夹到 0（0 = 只在完全贴合时
+    // 吸附的显式语义；范围外金币静止不动，可走过去拾取）
+    m_coinMagnetRadius = std::max(0.0f, config.getFloat("coin_magnet_radius", kDefaultCoinMagnetRadius));
 
     // 批三新增：怪物生态参数（AI 决策半径 + 回巢回血预留键）。
     // 半径做下界夹取（负半径没有玩法语义——宁可按 0 处理，也不让
@@ -591,44 +596,69 @@ void PlayScene::update(const UpdateContext& ctx)
     //    「不完美但稳定」的轻量口径（实现自定见头文件注释，报告说明）
     separateOverlappingMonsters();
 
-    // 经验宝石：推进旋转动画 -> 拾取判定 -> 统一清理
+    // 经验宝石（批四·自动吸收）：注入吸收目标 -> 追踪位移 -> 玩家盒
+    // 重叠即吸收（+10 经验）。玩家无需走动——掉落即朝玩家飞
+    const float playerCenterX = playerBox.x + playerBox.w * 0.5f; // 吸收目标 x（玩家脚盒中心）
+    const float playerCenterY = playerBox.y + playerBox.h * 0.5f; // 吸收目标 y
     for (XpGem& gem : m_gems)
     {
-        // 播放旋转动画（基类默认 update：推进帧时间轴，与渲染帧率解耦）
+        // 注入本步吸收目标（玩家在移动——每步刷新，目标恒为当前脚下）
+        gem.setHomingTarget(playerCenterX, playerCenterY);
+
+        // 推进旋转动画 + 追踪位移（速度/加速度曲线在 XpGem 内，纯函数积分）
         gem.update(ctx);
 
-        // AABB 相交即拾取：标记 + 累计经验 + 播放「叮」音效；
-        // 实际移除放在循环之后统一做（避免边遍历边删除）
-        if (!gem.isPicked() && rectsOverlap(playerRect, gem.rect()))
+        // 抵达判定：与玩家碰撞盒（脚盒）相交即吸收——宝石朝脚下飞，
+        // 必然命中（单步位移 5.8~7.5px，不会穿透 32x26 的盒）
+        if (!gem.isPicked() && rectsOverlap(playerBox, gem.rect()))
         {
             gem.markPicked(); // 标记：本次遍历结束后统一清理
 
-            // 经验结算（本批新增）：进度累计 + 按曲线循环结算 + 逐级强化与
-            // 反馈（可能连升多级——grantXp 内部循环，日志逐级记录）
+            // 经验结算（批三新增沿用）：进度累计 + 按曲线循环结算 + 逐级
+            // 强化与反馈（可能连升多级——grantXp 内部循环，日志逐级记录）
             grantXp(kGemXpValue);
 
-            // 拾取音效沿用 coin.wav（与旧金币收集同一听觉反馈）
+            // 吸收音效沿用 coin.wav（与旧金币收集同一听觉反馈）
             m_audio->play(SoundId::Coin);
 
-            // 冒烟观测点：拾取日志（自动化测试据此断言掉落-拾取链路）。
-            // 经验展示为「当前级进度/本级需求」——升级后的进度重置肉眼可查
+            // 冒烟观测点：吸收日志（批四口径：由「拾取经验宝石」改为
+            // 「经验被吸收」——自动吸收语义；进度/需求/等级字段不变）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "拾取经验宝石（进度 %d/%d，等级 %d）",
+                        "经验被吸收（进度 %d/%d，等级 %d）",
                         m_xp, m_levelCurve.needed(m_level), m_level);
         }
     }
-    // 统一清理已被拾取的宝石（保持其余元素的地址不变）
+    // 统一清理已被吸收的宝石（保持其余元素的地址不变）
     std::erase_if(m_gems, [](const XpGem& gem) { return gem.isPicked(); });
 
-    // 金币（批三）：推进旋转动画 -> 拾取判定 -> 统一清理（与宝石同一套流程）
+    // 金币（批三掉落、批四磁吸版）：范围外静止；玩家中心进入
+    // coin_magnet_radius 即磁化吸附，触及（玩家盒重叠）即拾取
     for (Coin& coin : m_coins)
     {
-        // 播放旋转动画（基类默认 update：推进帧时间轴，与渲染帧率解耦）
-        coin.update(ctx);
+        // 磁吸触发判定（未磁化时）：硬币中心与玩家盒中心距离 <= 半径
+        //（含边界）即磁化；一次触发、永久保持（跑出范围也不半路丢下）
+        if (!coin.magnetized())
+        {
+            const SDL_FRect coinRect = coin.rect();                             // 硬币快照
+            const float dx = coinRect.x + coinRect.w * 0.5f - playerCenterX;    // 与玩家中心横向差
+            const float dy = coinRect.y + coinRect.h * 0.5f - playerCenterY;    // 纵向差
+            // 平方比较（省一次开方）；半径 0 时只有完全贴中心才触发（显式语义）
+            if (dx * dx + dy * dy <= m_coinMagnetRadius * m_coinMagnetRadius)
+            {
+                coin.beginMagnet(); // 磁化：此后每步追踪玩家脚下
+            }
+        }
 
-        // AABB 相交即拾取：标记 + 局内货币累计 + 播放「叮」音效；
-        // 实际移除放在循环之后统一做（避免边遍历边删除）
-        if (!coin.isPicked() && rectsOverlap(playerRect, coin.rect()))
+        // 磁化后注入本步目标（玩家会移动——每步刷新）再推进
+        if (coin.magnetized())
+        {
+            coin.setMagnetTarget(playerCenterX, playerCenterY); // 目标 = 当前脚下
+        }
+        coin.update(ctx); // 旋转动画 + （磁化时）追踪位移（速度曲线在 Coin 内）
+
+        // 触及即拾取：与玩家碰撞盒（脚盒）相交 -> 标记 + 局内货币累计 +
+        // 播放「叮」音效；实际移除放在循环之后统一做（避免边遍历边删除）
+        if (!coin.isPicked() && rectsOverlap(playerBox, coin.rect()))
         {
             coin.markPicked(); // 标记：本次遍历结束后统一清理
 
@@ -636,7 +666,7 @@ void PlayScene::update(const UpdateContext& ctx)
             // 强化体系铺路；restart 清零）
             ++m_coinCount;
 
-            // 拾取音效沿用 coin.wav（与宝石拾取同一听觉反馈，语义恰好吻合）
+            // 拾取音效沿用 coin.wav（与宝石吸收同一听觉反馈，语义恰好吻合）
             m_audio->play(SoundId::Coin);
 
             // 冒烟观测点：拾取金币日志（本局累计——冒烟断言 HUD 计数增长）
