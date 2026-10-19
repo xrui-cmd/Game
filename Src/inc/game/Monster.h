@@ -82,6 +82,10 @@ class Camera;
 //      结果经 consumeAttackResult 交场景消费（扣血/无敌/回弹/音效/
 //      命中爪痕特效都是场景职责）；出招后进入冷却（monster_attack_cooldown
 //      注入）。出招瞬间的红色脉冲（0.1s）保留——素材复用不加新图
+//  11. 等级（批六丙）：出生时由场景按「出生点所在区 + 距本区神龛距离」
+//      算出并传入 spawnAt（公式与抖动都在 game/MonsterLevel.h，纯逻辑）；
+//      本类存下等级并按它缩放出生生命上限、击杀金币数；攻击伤害与宝石
+//      经验由场景用同一份纯函数按 level() 计算。等级不改变移速曲线。
 // ============================================================
 
 // 怪物攻击结算结果（批四）：Monster 每步至多发布一次，场景消费一次
@@ -135,9 +139,14 @@ public:
     // （monster_speed_growth x 局内秒数）并封顶，再经 setChaseSpeed 注入
     float baseSpeed() const;
 
-    // 本变体的击杀金币掉落数（枚）：史莱姆 1 / 哥布林 2 / 骷髅 1。
-    // 查变体表（唯一数据源）；场景在击杀结算时按它掉落
+    // 击杀金币掉落数（枚）：变体基础（史莱姆 1 / 哥布林 2 / 骷髅 1）
+    // + 等级加成 floor((lv-1)/10)（批六丙：1~10 级 +0、11~20 级 +1、
+    // 21~30 级 +2）。场景在击杀结算时按它掉落
     int coinDrop() const;
+
+    // 当前等级（批六丙：出生时按出生位置所在区与距神龛距离定，存于本对象）。
+    // 场景用于：攻击伤害缩放、经验宝石价值、血条旁「Lv.n」显示与日志断言
+    int level() const { return m_level; }
 
     // 设置本步的追踪目标点（传玩家「碰撞盒」，内部取中心存储；批四起
     // 同时留存完整盒——攻击接触范围判定用）。PlayScene 每个固定步在
@@ -213,13 +222,16 @@ public:
     // 负数伤害属于调用方错误：忽略并警告，不改变任何状态
     bool takeDamage(int amount);
 
-    // 生成（批三正式版）：在「调用方选好的可信落点」上激活本对象——
-    // 落点以怪物中心给出（世界坐标），由场景侧按出生规则选择并完成
-    // 「激活区块内 + 可走 + 离玩家 >= 500px」校验（落点规则属玩法层）。
-    // 出生生命按变体数值表写入；本落点同时登记为「巢」（出生点即巢，
-    // 巡逻/栓绳都以它为圆心）。瞬移类操作：落点定稿后同步插值快照（防拉丝）；
+    // 生成（批三正式版；批六丙加等级）：在「调用方选好的可信落点」上激活
+    // 本对象——落点以怪物中心给出（世界坐标），由场景侧按出生规则选择并完成
+    // 「激活区块内 + 可走 + 环带距离」校验（落点规则属玩法层）。
+    // level 由场景按「出生点所在区 + 距本区神龛的距离 + jitter」计算后传入
+    // （公式见 game/MonsterLevel.h）；本类存下它并按等级缩放出生生命上限。
+    // 缺省 1 保持既有调用（测试/防御）可直接 spawnAt(x, y)。
+    // 本落点同时登记为「巢」（出生点即巢，巡逻/栓绳都以它为圆心）。
+    // 瞬移类操作：落点定稿后同步插值快照（防拉丝）；
     // AI 状态全量复位（池复用语义：旧怪物的仇恨/游荡状态不带进新怪物）
-    void spawnAt(float centerX, float centerY);
+    void spawnAt(float centerX, float centerY, int level = 1);
 
     // 回收：从场上移除本怪物（重开清场/未来清屏技使用），槽位可被再次
     // spawnAt 复用。清掉追踪目标、红染状态与 AI/侧滑运行时——
@@ -252,6 +264,13 @@ public:
     // 公开给场景：重叠兜底（把怪物推出玩家）与怪怪软分离（各退一半）调用
     bool nudge(float dx, float dy);
 
+    // ---- 头顶血条（批三）：受伤后显示 ----
+    // public：批六丙的「Lv.n」小字与血条同锚点绘制（场景层用同一份几何，
+    // 避免两处各写一遍 40/5/6 后悄悄错位）
+    static constexpr float kHpBarWidth = 40.0f;  // 血条宽（像素；约 40 与规格一致）
+    static constexpr float kHpBarHeight = 5.0f;  // 血条高（像素；规格 5）
+    static constexpr float kHpBarGapY = 6.0f;    // 头顶与血条底边的间隙（像素）
+
     // ---- 攻击（批四·蓄力前扑）----
 
     // 命中回弹距离（像素）：攻击命中时怪物沿「玩家 -> 怪物」方向弹开的
@@ -281,6 +300,15 @@ public:
     // 朝目标移动（移动经世界碰撞与绕墙轻量改进）；状态切换/回巢事件的
     // 日志也在此处（含变体名——冒烟断言用）。签名与基类保持一致
     void update(const UpdateContext& ctx) override;
+
+    // 渲染插值位置（世界坐标左上角）：与本体/血条/警示使用同一条
+    // 「prev -> cur 按 alpha 线性插值」公式。批六丙供场景绘制血条旁
+    // 「Lv.n」小字时定位——文字与血条贴合同一个插值锚点，快速移动不脱节
+    SDL_FPoint interpolatedTopLeft(float alpha) const
+    {
+        return SDL_FPoint{ m_prevX + (m_x - m_prevX) * alpha, // 插值左上角 x
+                           m_prevY + (m_y - m_prevY) * alpha }; // 插值左上角 y
+    }
 
     // 覆写渲染：前扑残影（1~2 重渐隐副本）-> 基础绘制（经相机世界->屏幕
     // 换算）-> 出招染色脉冲（出招瞬间 0.1s）/ 受击红染（批五A：红光叠加，
@@ -335,11 +363,6 @@ private:
     static constexpr float kSlideHoldSeconds = 1.2f;  // 侧滑方向维持时长（秒）
     static constexpr float kSlideWeightFloor = 0.35f; // 衰减下限（维持期末尾）
 
-    // ---- 头顶血条（批三）：受伤后显示 ----
-    static constexpr float kHpBarWidth = 40.0f;  // 血条宽（像素；约 40 与规格一致）
-    static constexpr float kHpBarHeight = 5.0f;  // 血条高（像素；规格 5）
-    static constexpr float kHpBarGapY = 6.0f;    // 头顶与血条底边的间隙（像素）
-
     // ---- 蓄力警示「!」（批五A）：素材尺寸与头顶锚位 ----
     static constexpr float kAlertWidth = 24.0f;   // 警示绘制宽（像素；与 alert.png 尺寸一致）
     static constexpr float kAlertHeight = 36.0f;  // 警示绘制高（像素；同上）
@@ -375,7 +398,8 @@ private:
     MonsterType m_type = MonsterType::Goblin; // 当前变体（默认哥布林；刷新时由场景指定）
 
     bool m_alive = false;     // 是否在场：spawnAt 置 true，受击致死/回收置 false
-    int m_hp = 0;             // 当前生命值（spawnAt 时按变体数值表写入）
+    int m_level = 1;          // 怪物等级（批六丙：spawnAt 时由场景按出生位置写入）
+    int m_hp = 0;             // 当前生命值（spawnAt 时按变体数值表 x 等级缩放写入）
     int m_maxHp = 0;          // 当前生命上限（同上；血条比例与回血夹取读它）
     float m_hitTintLeft = 0.0f; // 受击红染剩余时长（秒；>0 时 render 叠加红光）
 

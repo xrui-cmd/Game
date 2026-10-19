@@ -1,4 +1,5 @@
 #include "game/Monster.h"
+#include "game/MonsterLevel.h" // scaledMonsterHp / monsterCoinDrop：等级数值缩放（批六丙纯逻辑）
 #include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
 #include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
 #include "engine/Rect.h"    // rectsOverlap：攻击接触范围（碰撞盒 + 余量）的 AABB 判定
@@ -118,11 +119,14 @@ float Monster::baseSpeed() const
     return kVariants[variantIndex(m_type)].baseSpeed;
 }
 
-// 本变体的击杀金币掉落数（枚）：场景在击杀结算时读取（史莱姆 1 / 哥布林 2 / 骷髅 1）
+// 击杀金币掉落数（枚）：变体基础 + 等级加成 floor((lv-1)/10)（批六丙）。
+// 场景在击杀结算时读取（史莱姆 1 / 哥布林 2 / 骷髅 1 —— 1~10 级为原值）
 int Monster::coinDrop() const
 {
-    // 查表返回掉落数；越界情形由 variantIndex 夹取保护
-    return kVariants[variantIndex(m_type)].coinDrop;
+    // 查表取变体基础枚数；越界情形由 variantIndex 夹取保护
+    const int baseCoins = kVariants[variantIndex(m_type)].coinDrop;
+    // 按当前等级套金币公式（纯函数：每满 10 级 +1 枚）
+    return monsterCoinDrop(baseCoins, m_level);
 }
 
 // 设置追踪目标：存完整目标盒（接触范围判定用）与中心点（AI 追迹用）。
@@ -194,19 +198,22 @@ bool Monster::takeDamage(int amount)
     return false; // 仍有生命：调用方通常接着施加击退
 }
 
-// 生成（批三正式版）：在调用方选好的可信落点上激活本对象
-void Monster::spawnAt(float centerX, float centerY)
+// 生成（批三正式版；批六丙加等级）：在调用方选好的可信落点上激活本对象
+void Monster::spawnAt(float centerX, float centerY, int level)
 {
     // 落点换算：入参是「怪物中心」的世界坐标，转成左上角存内部
     //（位置成员一直是左上角语义——与 rect()/渲染同一口径）
     m_x = centerX - m_w * 0.5f; // 左上角 x = 中心 - 半宽
     m_y = centerY - m_h * 0.5f; // 左上角 y = 中心 - 半高
 
-    // 激活 + 按变体数值表写入战斗数值：出生生命/上限都取自当前变体
-    //（stale 防护：至少 1 点——表内数值恒为正，这里的 max 是防未来改表的兜底）
+    // 等级：出生时定稿并伴随本对象（批六丙）；至少 1 级（调用方/改表防御）
+    m_level = std::max(1, level); // 当前怪物等级（血条显示/伤害/经验/金币共用）
+
+    // 激活 + 按变体数值表 x 等级缩放写入战斗数值：出生生命/上限都取自
+    // 当前变体，再乘等级系数（生命 x(1+10%/级)，见 MonsterLevel.h）
     const VariantSpec& spec = kVariants[variantIndex(m_type)]; // 本变体规格
     m_alive = true;                     // 本对象进入战场：更新/渲染/碰撞自此生效
-    m_maxHp = std::max(spec.hp, 1);     // 生命上限（血条比例与回血夹取都读它）
+    m_maxHp = scaledMonsterHp(spec.hp, m_level); // 生命上限（等级 1 = 基础值）
     m_hp = m_maxHp;                     // 出生满血（0 血出生会在首帧判定为已死）
     m_hitTintLeft = 0.0f;               // 新生怪物不带受击红染
     m_hasTarget = false;                // 玩家目标等场景下个固定步注入
