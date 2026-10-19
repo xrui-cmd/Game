@@ -549,6 +549,64 @@ int main()
     endCase(8, p0, f0);
 
     // ------------------------------------------------------------------
+    // CASE 9 海洋开放（批六乙）：玩家可入水 / 怪物仍视为实心
+    // ------------------------------------------------------------------
+    beginCase(9, "水域通行差异（slideMovePlayer 可入水 / slideMove 截停）");
+    p0 = gPass; f0 = gFail;
+    {
+        World w;
+        w.generate(8, 4, 777); // 固定种子：沿岸陆地布局可复现
+
+        // 找一行「x=2 与 x=3 都是陆地（非墙非水）」——从水圈内侧开始扫描
+        int shoreY = -1; // 沿岸陆地所在行（格）
+        for (int y = World::kWaterRingCells; y < w.cellsY() - World::kWaterRingCells; ++y)
+        {
+            if (!w.waterAt(2, y) && !w.wallAt(2, y) &&
+                !w.waterAt(3, y) && !w.wallAt(3, y)) // x=2/3 均为可走陆地
+            {
+                shoreY = y; // 命中：记录并结束
+                break;
+            }
+        }
+        expectTrue("环境构置：找到 x=2/3 均为陆地的行", shoreY >= 0);
+
+        if (shoreY >= 0)
+        {
+            const float yPixels = static_cast<float>(shoreY) * World::kCellSize; // 该行像素 y
+            const SDL_FRect landRect{ 3.0f * World::kCellSize, yPixels,
+                                      World::kCellSize, World::kCellSize }; // 陆地格矩形
+            expectTrue("陆地格：默认口径可走", w.isRectWalkable(landRect)); // 怪物/落点口径
+            expectTrue("陆地格：allowWater=true 也可走", w.isRectWalkableEx(landRect, true)); // 玩家口径
+            expectTrue("陆地格不与水重叠", !w.rectTouchesWater(landRect)); // 落水判定为 false
+
+            // 水格：默认口径不可走；玩家口径可走（水对玩家开放）
+            const SDL_FRect waterRect{ 0.5f * World::kCellSize, yPixels,
+                                       World::kCellSize, World::kCellSize }; // 水圈首格
+            expectTrue("水格：isRectWalkable 不可走（怪物实心）", !w.isRectWalkable(waterRect));
+            expectTrue("水格：allowWater=true 可走（玩家可入水）", w.isRectWalkableEx(waterRect, true));
+            expectTrue("水格：rectTouchesWater = true", w.rectTouchesWater(waterRect));
+
+            // 从陆地 x=3 格水平向左推：怪物口径停在 x=96（水缘）；
+            // 玩家口径可穿过 2 格水圈，停在世界外墙壁前（x=0）
+            const float startX = 3.0f * World::kCellSize; // x=144
+            const SDL_FPoint monsterStop =
+                w.slideMoveEx(startX, yPixels, World::kCellSize, World::kCellSize,
+                              -1000.0f, 0.0f, nullptr, nullptr); // 怪物：水实心
+            const SDL_FPoint playerStop =
+                w.slideMovePlayer(startX, yPixels, World::kCellSize, World::kCellSize,
+                                  -1000.0f, 0.0f, nullptr, nullptr); // 玩家：水可通行
+            expectTrue("怪物向左被水圈截停（96 <= x < 120）",
+                       monsterStop.x >= 96.0f && monsterStop.x < 120.0f);
+            expectTrue("玩家穿过水圈、停在世界边界前（0 <= x < 24）",
+                       playerStop.x >= 0.0f && playerStop.x < 24.0f);
+            expectTrue("玩家最终站位与水重叠（已入水）",
+                       w.rectTouchesWater(SDL_FRect{ playerStop.x, playerStop.y,
+                                                     World::kCellSize, World::kCellSize }));
+        }
+    }
+    endCase(9, p0, f0);
+
+    // ------------------------------------------------------------------
     // 总结
     // ------------------------------------------------------------------
     std::printf("\n==============================================================\n");

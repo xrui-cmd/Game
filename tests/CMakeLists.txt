@@ -631,3 +631,39 @@ set_target_properties(shop_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  复活规则单元测试（respawn_test，批六乙）
+#
+#  被测对象：Src/inc/game/Shrine.h（神龛表 / 最近激活点 / 交互范围）+
+#  Src/inc/game/RespawnRules.h（升级历史栈 / 死亡惩罚数学）。
+#
+#  与 zone_test 同模式：纯头文件逻辑，只依赖 SDL 头（Shrine.h 经 Zone.h/
+#  World.h 使用 SDL 类型），不链接 SDL3 运行时——任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\respawn_test.exe
+# ============================================================
+
+add_executable(respawn_test respawn_test.cpp)
+
+if (MSVC)
+    target_compile_options(respawn_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Shrine.h / RespawnRules.h / Zone.h 位于游戏仓 Src/inc；
+# SDL3 头目录供 Zone.h -> World.h 的 SDL.h 依赖（仅类型与内联函数，不链接）
+target_include_directories(respawn_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(respawn_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
