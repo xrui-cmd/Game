@@ -667,3 +667,40 @@ set_target_properties(respawn_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  怪物等级与缩放单元测试（monster_level_test，批六丙）
+#
+#  被测对象：Src/inc/game/MonsterLevel.h（header-only 纯逻辑）——
+#  区最远距离 / 出生点 -> 等级（归区/距离归一/抖动/clamp）/
+#  生命 / 伤害 / 经验 / 金币四条缩放公式。
+#
+#  与 zone_test / respawn_test 同模式：只依赖 SDL 头（Zone.h -> World.h
+#  的 SDL.h 类型），不链接 SDL3 运行时——任何环境都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\monster_level_test.exe
+# ============================================================
+
+add_executable(monster_level_test monster_level_test.cpp)
+
+if (MSVC)
+    target_compile_options(monster_level_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：MonsterLevel.h / Zone.h 位于游戏仓 Src/inc；
+# SDL3 头目录供 Zone.h -> World.h 的 SDL.h 依赖（仅类型与内联函数，不链接）
+target_include_directories(monster_level_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(monster_level_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
