@@ -704,3 +704,40 @@ set_target_properties(monster_level_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  进攻模组与冰霜元素状态单元测试（attack_element_test，批六丁）
+#
+#  被测对象：
+#    - Src/inc/game/AttackModule.h（六型进攻模组表：蓄力/方式/距离/时长/
+#      命中半径/伤害倍率/元素参数）；
+#    - Src/inc/game/ElementStatus.h（SlowStatus 减速刷新不叠乘 /
+#      FreezeMeter 累积·衰减·阈值·冻结结束清零·2s 抗冻缓冲）。
+#
+#  与 xp_test 同模式：纯头文件逻辑，不依赖 SDL3、无 .cpp、无链接——
+#  任何环境都能确定性构建运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\attack_element_test.exe
+# ============================================================
+
+add_executable(attack_element_test attack_element_test.cpp)
+
+if (MSVC)
+    target_compile_options(attack_element_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：AttackModule.h / ElementStatus.h 位于游戏仓 Src/inc
+target_include_directories(attack_element_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(attack_element_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
