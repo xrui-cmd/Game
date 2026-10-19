@@ -459,6 +459,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         monster.setReturnHealPercent(m_monsterReturnHealPercent); // 回巢回血（0=关闭）
         monster.setAttackCooldown(m_monsterAttackCooldown);  // 攻击冷却（批四；出招间隔）
         monster.setAlertTexture(m_alertTexture);             // 蓄力警示「!」（批五A；共享纹理、只借用）
+        // 落地冰环（批六丁）：复用冰霜新星贴图（共享纹理、只借用；缺图则不画）
+        monster.setFrostNovaTexture(m_spellTextures[static_cast<int>(SpellId::FrostNova)]);
     }
 
     // 13) 读取最佳战绩快照：本局的比较基准（缺失/旧格式/损坏自动按无记录处理，
@@ -1015,7 +1017,7 @@ void PlayScene::applyCardEffects()
     // 是两个独立因素，购买/重算路径与过区路径都经本函数/同款公式注入
     m_playerSpeed = cardDashSpeed(
         m_playerSpeedBase, m_cardLevels[static_cast<int>(CardId::Dash)]);
-    m_player.setSpeed(m_playerSpeed * currentZoneMoveMultiplier()); // 移速注入（含区乘区）
+    refreshPlayerMoveSpeed(); // 移速注入（含区乘区与减速乘区；批六丁统一入口）
 
     // 体魄：生命上限 = 基准 + 20 x 层数；当前生命夹到新上限（重算路径不回血——
     // 即时 +20 只在「选择体魄那一刻」发放，见 handleCardChoice）
@@ -1044,6 +1046,68 @@ float PlayScene::currentZoneMoveMultiplier() const
         return 1.0f; // 乘区 1.0（原速）
     }
     return zoneDef(m_currentZone).moveSpeedMultiplier; // 区表乘区（草 1.0 / 雪 0.85）
+}
+
+// 重算并注入玩家移速（批六丁）：乘算顺序 = 基础/卡牌移速 x 区乘区 x 减速乘区。
+// 例：雪区常驻 x0.85 与冰史莱姆 x0.8 同时生效 = x0.68（规格要求乘算）。
+// 所有会改变其中任一乘区的路径（卡牌重算 / 过区 / 减速施加与到期）都调它。
+void PlayScene::refreshPlayerMoveSpeed()
+{
+    const float zoneMultiplier = currentZoneMoveMultiplier(); // 区乘区（雪 0.85）
+    const float slowMultiplier = m_playerSlow.moveMultiplier(); // 减速乘区（无减速 = 1）
+    m_player.setSpeed(m_playerSpeed * zoneMultiplier * slowMultiplier); // 注入最终移速
+}
+
+// 怪物攻击命中后的元素结算（批六丁）：减速 / 冻结条。
+// 由怪物 Hit 分支在「无敌判定通过后」调用——命中即生效（护盾全吸收也算命中）；
+// 召唤者负责先确认本次命中真实发生，本函数不再判断距离。
+void PlayScene::applyAttackElement(const Monster& monster)
+{
+    const AttackModule& module = monster.attackModule(); // 本次攻击的模组（元素参数）
+    if (module.element == AttackElement::Slow) // 元素：减速（冰史莱姆）
+    {
+        m_playerSlow.apply(module.slowFactor, module.slowSeconds); // 覆盖乘区并刷新时长
+        refreshPlayerMoveSpeed(); // 立即按新乘区注入移速（不叠乘）
+        // 冒烟观测点：减速命中（乘区/时长/雪区乘算后的最终倍率）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "冰霜减速命中（移速 x%.2f，持续 %.1f 秒；区乘区 x%.2f）",
+                    module.slowFactor, module.slowSeconds, currentZoneMoveMultiplier());
+        return; // 一个模组只带一种元素
+    }
+    if (module.element == AttackElement::Freeze) // 元素：冻结条（霜哥布林/霜骷髅）
+    {
+        const float valueBefore = m_freezeMeter.value(); // 累积前的值（判断是否真加进去）
+        const FreezeTickResult result = m_freezeMeter.add(module.freezeAmount); // 累积冻结条
+        if (m_freezeMeter.value() > valueBefore || result.freezeStarted) // 本次确实累积
+        {
+            // 冒烟观测点：冻结条累积（当前值/上限——HUD 条与冒烟断言共用）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "冻结条 +%d（%d/%d）", module.freezeAmount,
+                        static_cast<int>(m_freezeMeter.value()), FreezeMeter::kMaxValue);
+        }
+        else // 冻结中 / 抗冻缓冲：本次不累积（如实记录，避免误读日志）
+        {
+            // 冒烟观测点：不累积原因（冻结剩余 / 缓冲剩余）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "冻结条未累积（%s，剩余 %.1f 秒）",
+                        m_freezeMeter.isFrozen() ? "冻结中" : "抗冻缓冲",
+                        m_freezeMeter.isFrozen() ? m_freezeMeter.freezeLeft()
+                                                 : m_freezeMeter.immunityLeft());
+        }
+        if (result.freezeStarted) // 本步刚好满 100：立即冻结
+        {
+            m_player.setFrozen(true);          // 锁定移动（不可移动）
+            m_player.cancelSwingVisual();      // 取消挥砍表现（不可攻击）
+            m_sweepRunning = false;            // 场景侧扫程终止（不再结算后续刀锋）
+            m_sweepHitCount = 0;               // 命中计数清零
+            m_sweepHit.fill(false);            // 命中记录清空
+            // 冒烟观测点：冻结开始（时长——冒烟连拍「不可移动」断言）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "玩家冻结（%.1f 秒，不可移动/攻击）", FreezeMeter::kFreezeSeconds);
+        }
+        return; // 元素结算结束
+    }
+    // 无元素（草地三型）：命中只造成伤害
 }
 
 // 每帧更新：先处理输入动作边缘（各状态按判据响应），再按状态推进战斗。
@@ -1149,6 +1213,28 @@ void PlayScene::update(const UpdateContext& ctx)
         m_playerInvincibleLeft = std::max(m_playerInvincibleLeft - ctx.deltaTime, 0.0f);
     }
 
+    // ---- 冰霜元素计时（批六丁；仅 Playing 推进，暂停/面板下冻结）----
+    // 减速：到期恢复移速（乘区统一经 refreshPlayerMoveSpeed 重注入）
+    if (m_playerSlow.update(ctx.deltaTime))
+    {
+        refreshPlayerMoveSpeed(); // 到期：移速回到「区乘区」口径
+        // 冒烟观测点：减速结束（与「冰霜减速命中」成对）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "冰霜减速结束（移速恢复）");
+    }
+    // 冻结条：冻结中倒数 1.5s；结束后清条并给 2s 抗冻缓冲；其余时间每秒衰减 10
+    const FreezeTickResult freezeTick = m_freezeMeter.update(ctx.deltaTime);
+    if (freezeTick.freezeEnded)
+    {
+        m_player.setFrozen(false); // 解除移动/攻击锁定（裹冰视觉随之消失）
+        // 冒烟观测点：冻结结束（含抗冻缓冲时长——冒烟断言「缓冲期不积累」）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "冻结结束（抗冻缓冲 %.1f 秒）", FreezeMeter::kImmunitySeconds);
+    }
+    if (m_freezeMeter.isFrozen())
+    {
+        m_player.setFrozen(true); // 防御性重申：冻结期间玩家保持锁定
+    }
+
     // 等级瞬闪计时与漂浮文字推进（仅 Playing 分支能走到这里）：暂停/结束时
     // 本函数提前返回，计时与飘字寿命随世界一起冻结——暂停画面完全静止，
     // 与「世界与计时冻结」的既有承诺一致
@@ -1220,8 +1306,8 @@ void PlayScene::update(const UpdateContext& ctx)
         m_zoneBannerLeft = kZoneBannerSeconds;            // 横幅计时置满（约 1.5s）
         // 冒烟观测点：进入区域日志（自动化测试据此断言跨区行走）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入区域：%s", zoneDef(zoneNow).name);
-        // 移速重注入：当前「基准 + 疾行层数」的移速 x 新区乘区
-        m_player.setSpeed(m_playerSpeed * currentZoneMoveMultiplier());
+        // 移速重注入：当前「基准 + 疾行层数」移速 x 新区乘区 x 减速乘区
+        refreshPlayerMoveSpeed();
     }
 
     // 相机（批二核心）：平滑跟随玩家中心（指数平滑 camera_smooth_time）。
@@ -1378,8 +1464,13 @@ void PlayScene::update(const UpdateContext& ctx)
                 //    扣血；有吸收即打「护盾吸收」日志（冒烟断言点——先盾后血
                 //    的观测顺序：护盾吸收日志先于/取代 扣血日志）
                 // 待结算伤害（先盾后血的中间量）：基础伤害按本怪等级缩放
-                //（伤害 x(1+6%/级)，批六丙；等级 1 = 配置原值）
-                int remainingDamage = scaledMonsterDamage(m_monsterDamage, monster.level());
+                //（伤害 x(1+6%/级)，批六丙；等级 1 = 配置原值），再乘模组倍率
+                //（批六丁数据表；本批六型均为 1.0，保持既有调平）
+                const AttackModule& attackModule = monster.attackModule(); // 本次攻击模组
+                int remainingDamage = static_cast<int>(std::lround(
+                    scaledMonsterDamage(m_monsterDamage, monster.level()) *
+                    attackModule.damageMultiplier)); // 等级伤害 x 模组倍率（四舍五入）
+                remainingDamage = std::max(remainingDamage, 0); // 防御：负倍率不变成治疗
                 if (m_playerShield > 0 && remainingDamage > 0) // 有盾才走吸收
                 {
                     const int absorbed = std::min(m_playerShield, remainingDamage); // 可吸收量（盾与伤害取小）
@@ -1389,6 +1480,10 @@ void PlayScene::update(const UpdateContext& ctx)
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "护盾吸收（%d 点，剩余护盾 %d）", absorbed, m_playerShield);
                 }
+
+                // 元素结算（批六丁）：命中即生效——即使护盾全吸收（攻击确实命中），
+                // 冰史莱姆减速 / 霜怪冻结条也照常累积；无敌期已在上层跳过
+                applyAttackElement(monster); // 减速或冻结条（无元素则空操作）
 
                 if (remainingDamage > 0) // 尚有伤害余量：走原扣血反馈链
                 {
@@ -1455,7 +1550,11 @@ void PlayScene::update(const UpdateContext& ctx)
     // 法术自动施法（批五B）：仅 Playing 分支走到这里；各自冷却独立、
     // 无需按键，与横扫互不打断（独立的索敌/结算/特效链）。时机选在
     // 怪物更新之后：火球碰撞、光环/新星的范围判定都用本步怪物的最新位置
-    updateSpells(ctx, playerBox);
+    // 批六丁：冻结期间不可攻击——自动法术同样停摆（冷却计时一并冻结）
+    if (!m_freezeMeter.isFrozen())
+    {
+        updateSpells(ctx, playerBox);
+    }
 
     // ---- 体积碰撞收尾（批四）----
     // 1) 兜底分离：任何来源产生的「怪物与玩家重叠」（正常热更顺序之外——
@@ -1658,6 +1757,13 @@ void PlayScene::beginDeath(DeathCause cause)
     // 死亡下行音：复用现有 gameover.wav（引擎 SoundId::GameOver，不新增素材）
     m_audio->play(SoundId::GameOver);
 
+    // 冰霜状态清空（批六丁）：死亡/落水时解除冻结与减速，并把移速恢复到
+    // 区乘区口径——复活后不会带着「冻结/减速」开场
+    m_playerSlow.reset();          // 减速清零
+    m_freezeMeter.reset();         // 冻结条 + 冻结/缓冲清零
+    m_player.setFrozen(false);     // 解除移动/攻击锁定
+    refreshPlayerMoveSpeed();      // 移速恢复（区乘区）
+
     // 战绩结算（批六乙口径）：在惩罚之前比较写盘——保留死亡瞬间的
     // 等级/击杀/存活；静默（仅日志，不播 record、不弹「新纪录」界面）
     settleRecords();
@@ -1780,10 +1886,11 @@ void PlayScene::respawnPlayerAtShrine(int shrineIndex)
 // 刀必须扫完（表现与判定同生命周期，松开左键也不例外）
 void PlayScene::resolvePlayerAttack(const UpdateContext& ctx, const SDL_FRect& playerRect)
 {
-    // 无输入系统（旧调用方）：既没有鼠标位置也没有攻击动作，本步不处理
-    if (ctx.input == nullptr)
+    // 无输入系统（旧调用方）：既没有鼠标位置也没有攻击动作，本步不处理。
+    // 批六丁：冻结期间同样不处理——不可攻击（挥砍表现已在冻结开始时取消）
+    if (ctx.input == nullptr || m_freezeMeter.isFrozen())
     {
-        return;
+        return; // 本步无攻击行为（扫程也已终止）
     }
 
     // 主动攻击门控：左键没按住就不尝试出手——「不按不挥」是本批与自动
@@ -3118,9 +3225,11 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
         const int levelJitter = static_cast<int>(SDL_rand(3)) - 1; // 等概率 -1/0/+1
         const int spawnLevel = monsterLevelForSpawn(spawnZone, spawnCenterX, spawnCenterY,
                                                     levelJitter); // 本只怪等级（已夹区区间）
-        const auto variant = static_cast<MonsterType>(
-            SDL_rand(static_cast<int>(MonsterType::Count))); // 等权三变体（各 1/3）
-        monster.loadVariant(m_renderer, variant);            // 复用槽位换皮（先释放旧纹理）
+        // 生成分表（批六丁）：草地原色三型 / 雪山冰霜三型，区内等权各 1/3。
+        // 变体跟着「出生点所在区」走（与等级同口径，跨区边界也不串味）
+        const auto variant = monsterVariantForZone(
+            spawnZone, static_cast<int>(SDL_rand(3))); // 等权 roll -> 区内变体
+        monster.loadVariant(m_renderer, variant);      // 复用槽位换皮（先释放旧纹理）
         monster.spawnAt(spawnCenterX, spawnCenterY, spawnLevel); // 落位（写等级+生命+巢，快照防拉丝）
         return true; // 生成成功：调用方接着写日志/累计
     }
@@ -3264,6 +3373,12 @@ void PlayScene::restart()
     m_levelFlashLeft = 0.0f;       // 清掉上一局残留的等级瞬闪状态
     m_survivalSeconds = 0.0f;      // 存活计时清零：新一局从 00:00 起算
     m_playerInvincibleLeft = 0.0f; // 新一局从非无敌开始
+
+    // 冰霜状态清空（批六丁）：减速/冻结条/锁定/裹冰视觉不跨局
+    m_playerSlow.reset();       // 减速乘区与计时清零
+    m_freezeMeter.reset();      // 冻结条、冻结与抗冻缓冲清零
+    m_player.setFrozen(false);  // 解除移动/攻击锁定
+    refreshPlayerMoveSpeed();   // 移速按「基准 x 区乘区」重新注入（无减速）
 
     // 分区状态复位（批六甲）：当前区回「未判定」——新一局玩家回到草地区
     // 中心，开启后的首个 Playing 固定步重新判定并弹「草地」横幅；
@@ -3760,6 +3875,64 @@ void PlayScene::renderHud()
             SDL_SetRenderDrawColor(m_renderer, 120, 220, 255, 255); // 亮青：与护盾罩同族
             m_hudFont.draw(m_renderer, shieldText,
                            kBarX + kBarW + 12.0f + hpSize.x + 24.0f, 16.0f); // HP 右侧 24px 处
+        }
+
+        // ---- 冻结条（批六丁）：贴近 HP 条下方，>0（或冻结中）才显示 ----
+        // 深蓝底 + 冰蓝前景；满 100 时整条亮白（冻结中）。
+        if (m_freezeMeter.value() > 0.0f || m_freezeMeter.isFrozen())
+        {
+            constexpr float kFreezeBarY = 50.0f; // 冻结条上边界（HP 条下 6px）
+            constexpr float kFreezeBarH = 8.0f;  // 冻结条高度
+            SDL_SetRenderDrawColor(m_renderer, 24, 42, 66, 255); // 深蓝底
+            const SDL_FRect freezeBack{ kBarX, kFreezeBarY, kBarW, kFreezeBarH };
+            SDL_RenderFillRect(m_renderer, &freezeBack); // 底条
+            const float freezeRatio = std::clamp(m_freezeMeter.value01(), 0.0f, 1.0f); // 比例
+            if (m_freezeMeter.isFrozen()) // 冻结中：整条亮白（满条 + 状态强调）
+            {
+                SDL_SetRenderDrawColor(m_renderer, 235, 250, 255, 255); // 冰白
+            }
+            else // 累积中：冰蓝前景
+            {
+                SDL_SetRenderDrawColor(m_renderer, 130, 210, 250, 255); // 冰蓝
+            }
+            const SDL_FRect freezeFill{ kBarX, kFreezeBarY, // 与底条同起点
+                                        kBarW * freezeRatio, kFreezeBarH }; // 按比例缩宽
+            SDL_RenderFillRect(m_renderer, &freezeFill); // 前景条
+
+            // 右侧文字：累积中「冻结 N/100」、冻结中「冻结中 x.xs」
+            char freezeText[64]; // 文本缓冲
+            if (m_freezeMeter.isFrozen()) // 冻结中：显示剩余时长
+            {
+                SDL_snprintf(freezeText, sizeof(freezeText), "冻结中 %.1fs",
+                             m_freezeMeter.freezeLeft()); // 例：冻结中 1.2s
+            }
+            else // 累积中：显示当前值
+            {
+                SDL_snprintf(freezeText, sizeof(freezeText), "冻结 %d/%d",
+                             static_cast<int>(m_freezeMeter.value()), FreezeMeter::kMaxValue);
+            }
+            SDL_SetRenderDrawColor(m_renderer, 205, 240, 255, 255); // 冰白文字
+            m_smallFont.draw(m_renderer, freezeText, kBarX + kBarW + 12.0f, 42.0f); // 条右侧
+        }
+
+        // ---- 减速小图标（批六丁）：冰史莱姆减速生效时，HP 条右下角雪花 ----
+        // 复用冰霜新星 HUD 图标（icon_frost_nova.png）；无图标素材时静默跳过
+        if (m_playerSlow.active() &&
+            m_spellIconTextures[static_cast<int>(SpellId::FrostNova)] != nullptr)
+        {
+            constexpr float kSlowIconSize = 22.0f; // 图标边长（像素）
+            constexpr float kSlowIconX = 232.0f;   // HP 条右缘外（不与冻结条文字重叠）
+            constexpr float kSlowIconY = 68.0f;    // 等级行右侧
+            const SDL_FRect iconDst{ kSlowIconX, kSlowIconY, // 图标目标矩形
+                                     kSlowIconSize, kSlowIconSize }; // 正方形
+            SDL_RenderTexture(m_renderer, // 绘制图标
+                              m_spellIconTextures[static_cast<int>(SpellId::FrostNova)],
+                              nullptr, &iconDst); // 整张图标
+            SDL_SetRenderDrawColor(m_renderer, 165, 225, 255, 255); // 冰蓝文字
+            char slowText[32]; // 文本缓冲（容纳「减速 2.4s」）
+            SDL_snprintf(slowText, sizeof(slowText), "减速 %.1fs", m_playerSlow.remaining()); // 剩余时长
+            m_smallFont.draw(m_renderer, slowText, // 图标右侧
+                             kSlowIconX + kSlowIconSize + 6.0f, kSlowIconY); // 同行排布
         }
 
         // 等级行（第 2 行）：升级瞬闪窗口内金/白交替闪烁（高光反馈），

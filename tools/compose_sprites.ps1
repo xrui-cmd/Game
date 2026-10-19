@@ -10,6 +10,11 @@
 #         monster_goblin_sheet.png 哥布林（goblin run）4 帧，每帧 48x48
 #         monster_skelet_sheet.png 骷髅（skelet run）4 帧，每帧 48x48
 #         monster_*.png            三个变体的单帧回退（各自动画 f0）
+#         monster_ice_slime_sheet.png / monster_frost_goblin_sheet.png /
+#         monster_frost_skelet_sheet.png  雪山三型（原色版冰霜重染色；
+#                                  4 帧 x 48x48，批六丁）
+#         monster_ice_slime.png / monster_frost_goblin.png /
+#         monster_frost_skelet.png        雪山三型单帧回退（批六丁）
 #         coin_sheet.png           金币（coin_anim）4 帧，每帧 18x21——素材包原色
 #         coin.png                 金币单帧回退（coin_anim f0）
 #         gem_sheet.png            经验宝石（coin_anim）4 帧，每帧 18x21——
@@ -361,6 +366,30 @@ Compose-Sheet -names @(
 ) -frameWidth 16 -frameHeight 16 -outPath (Join-Path $assetsDir "monster_skelet_sheet.png")
 # 单帧回退：跑动首帧
 Compose-Single -name "skelet_run_anim_f0" -outPath (Join-Path $assetsDir "monster_skelet.png")
+
+# ---- 2.4 雪山三型（批六丁）：原色三变体的冰霜重染色版（精灵表 + 单帧回退）----
+# 复用 Convert-FrostTint 的同一条染色公式（与 tiles/decor 雪山素材完全一致），
+# 输出尺寸与 Monster 的 48x48 单帧 / 4 帧 x 48 精灵表严格一致；幂等覆盖。
+# 冰史莱姆：swampy 4 帧冰霜重染色
+Compose-Sheet -names @(
+    "swampy_anim_f0", "swampy_anim_f1", "swampy_anim_f2", "swampy_anim_f3"
+) -frameWidth 16 -frameHeight 16 -outPath (Join-Path $assetsDir "monster_ice_slime_sheet.png") -frostTint
+# 冰史莱姆单帧回退：动画首帧（同样染色）
+Compose-Single -name "swampy_anim_f0" -outPath (Join-Path $assetsDir "monster_ice_slime.png") -frostTint
+
+# 霜哥布林：goblin run 4 帧冰霜重染色
+Compose-Sheet -names @(
+    "goblin_run_anim_f0", "goblin_run_anim_f1", "goblin_run_anim_f2", "goblin_run_anim_f3"
+) -frameWidth 16 -frameHeight 16 -outPath (Join-Path $assetsDir "monster_frost_goblin_sheet.png") -frostTint
+# 霜哥布林单帧回退：跑动首帧（同样染色）
+Compose-Single -name "goblin_run_anim_f0" -outPath (Join-Path $assetsDir "monster_frost_goblin.png") -frostTint
+
+# 霜骷髅：skelet run 4 帧冰霜重染色
+Compose-Sheet -names @(
+    "skelet_run_anim_f0", "skelet_run_anim_f1", "skelet_run_anim_f2", "skelet_run_anim_f3"
+) -frameWidth 16 -frameHeight 16 -outPath (Join-Path $assetsDir "monster_frost_skelet_sheet.png") -frostTint
+# 霜骷髅单帧回退：跑动首帧（同样染色）
+Compose-Single -name "skelet_run_anim_f0" -outPath (Join-Path $assetsDir "monster_frost_skelet.png") -frostTint
 
 # ============================================================
 # 3) 金币（素材包原色）与经验宝石（同源帧换道染色：青蓝调）
@@ -1191,6 +1220,14 @@ Assert-PngSize -path (Join-Path $assetsDir "monster_skelet_sheet.png") -expected
 Assert-PngSize -path (Join-Path $assetsDir "monster_slime.png") -expectedWidth 48 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "monster_goblin.png") -expectedWidth 48 -expectedHeight 48
 Assert-PngSize -path (Join-Path $assetsDir "monster_skelet.png") -expectedWidth 48 -expectedHeight 48
+
+#   雪山三型（批六丁）：精灵表 4 帧 x 48 = 192 x 48；单帧 48x48
+Assert-PngSize -path (Join-Path $assetsDir "monster_ice_slime_sheet.png") -expectedWidth 192 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "monster_frost_goblin_sheet.png") -expectedWidth 192 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "monster_frost_skelet_sheet.png") -expectedWidth 192 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "monster_ice_slime.png") -expectedWidth 48 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "monster_frost_goblin.png") -expectedWidth 48 -expectedHeight 48
+Assert-PngSize -path (Join-Path $assetsDir "monster_frost_skelet.png") -expectedWidth 48 -expectedHeight 48
 
 #   金币精灵表：4 帧 x 18 宽 = 72，高 21（Coin 的 m_w=18 / m_h=21）
 Assert-PngSize -path (Join-Path $assetsDir "coin_sheet.png") -expectedWidth 72 -expectedHeight 21

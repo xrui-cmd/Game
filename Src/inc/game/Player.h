@@ -190,6 +190,15 @@ public:
     // 只影响表现，不改冷却/方向/命中记录（场景侧扫程状态另行复位）
     void cancelSwingVisual();
 
+    // 设置冻结锁定（批六丁·冻结条满 100）：true = 不可移动/不可攻击。
+    // 冻结期间 update 跳过输入与位移（速度/击退残余清零），render 叠加
+    // 「蓝白裹冰」视觉；场景同时跳过普攻与法术施放。false = 解除锁定。
+    // 纯状态开关：冻结时长与抗冻缓冲由 ElementStatus::FreezeMeter 负责
+    void setFrozen(bool frozen) { m_frozen = frozen; }
+
+    // 是否处于冻结锁定（场景/HUD 查询）
+    bool frozen() const { return m_frozen; }
+
     // 重开归位：把玩家瞬间移动到 (x, y) 并清零速度与攻击状态
     //（内部委托基类 setPosition，同时同步插值快照）；保留这个语义化名字
     // 让调用处（PlayScene::restart / onEnter）读起来更直观
@@ -267,6 +276,11 @@ private:
     // 不污染后续绘制。只在 m_drownAlpha < 255 或 m_drownSinkY > 0 时走这里
     void renderDrownBody(SDL_Renderer* renderer, float alpha, const Camera& camera) const;
 
+    // 冻结裹冰视觉（批六丁）：在本体之上叠加半透明冰蓝方罩 + 亮白边框 +
+    // 三道斜冰纹（纯 SDL 图元，无新素材）。位置与本体同一条插值公式，
+    // 绘制后恢复混合模式（不污染后续绘制）。只在 m_frozen 时调用
+    void renderFreezeOverlay(SDL_Renderer* renderer, float alpha, const Camera& camera) const;
+
     // 当前速度（像素/秒），逐轴独立渐近：斜向输入时两轴各取自己的目标，
     // 与既有「未归一化直驱」的斜向速度语义保持一致（合速度约 1.41 倍）
     float m_velocityX = 0.0f; // 水平速度：正右负左
@@ -326,6 +340,9 @@ private:
     // 淡出：纹理 alpha 从 255 递减到 0。碰撞/位置/判定完全不受影响
     float m_drownSinkY = 0.0f;    // 下沉偏移（像素；0 = 无）
     Uint8 m_drownAlpha = 255;     // 本体不透明度（255 = 正常；0 = 完全淡出）
+
+    // ---- 冻结锁定（批六丁·冻结条满 100；场景 setFrozen 控制）----
+    bool m_frozen = false;        // true = 不可移动/不可攻击 + 裹冰视觉
 
     SDL_Texture* m_weaponTexture = nullptr; // 武器纹理（assets/weapon.png；加载失败为 nullptr，横扫跳过）
 

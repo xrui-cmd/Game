@@ -3,14 +3,16 @@
 
 #include "engine/Entity.h"     // Entity：实体基类（空间/纹理/帧动画公共能力）
 #include "game/MonsterAi.h"    // MonsterAi：AI 状态决策（纯逻辑，批三巡逻/仇恨/栓绳）
+#include "game/AttackModule.h" // AttackModule：六型进攻模组数据表（批六丁·蓄力/距离/元素）
 
 // 前置声明：世界（碰撞）与相机（渲染换算）在本类中只以指针/引用出现，
 // 完整定义由 Monster.cpp 的包含获得（减少头依赖）
 class World;
 class Camera;
+enum class ZoneId; // 分区 id（批六丁生成分表：草地原色 / 雪山冰霜版）
 
 // ============================================================
-// Monster：怪物实体（三变体：史莱姆 / 哥布林 / 骷髅）
+// Monster：怪物实体（六变体：草地原色三型 + 雪山冰霜三型）
 // ============================================================
 //
 // 本批改造（批三·怪物生态）：行为升级为「巡逻/仇恨/栓绳回巢」状态机，
@@ -27,6 +29,8 @@ class Camera;
 //        - 史莱姆：生命 20 / 速度 90 / 掉落金币 1 —— 慢吞吞的软柿子
 //        - 哥布林：生命 30 / 速度 110 / 掉落金币 2 —— 基准线（赏金略高）
 //        - 骷髅  ：生命 18 / 速度 140 / 掉落金币 1 —— 快而脆的压力型目标
+//        - 冰史莱姆/霜哥布林/霜骷髅：数值沿用同族原色版，差异只在冰霜
+//          外观与命中元素（批六丁；见 AttackModule.h）
 //      速度的实际值 = 变体基础速度 + 难度成长 x 局内秒数，封顶 260
 //      （成长与封顶都由 PlayScene 注入，本类只提供 baseSpeed()）
 //   2. 纹理：每个变体一套「精灵表 + 单帧回退」，4 帧 / 每帧 48x48
@@ -34,6 +38,8 @@ class Camera;
 //        monster_slime_sheet.png   史莱姆（原始帧：swampy 软泥怪动画）
 //        monster_goblin_sheet.png  哥布林（原始帧：goblin run）
 //        monster_skelet_sheet.png  骷髅（原始帧：skelet run）
+//        monster_ice_slime_sheet.png / monster_frost_goblin_sheet.png /
+//        monster_frost_skelet_sheet.png  雪山三型（同源帧冰霜重染色）
 //      loadVariant() 按需切换变体纹理：对象池槽位复用时先换皮再生成。
 //      换变体前必须先释放旧纹理（本类在加载前调用 release()）——
 //      loadTextureWithFallback 每次都会新建纹理并覆写指针，不先释放
@@ -69,16 +75,16 @@ class Camera;
 //      36x30、底部内收 6px（setCollisionBox）——移动滑动、击退落点、
 //      游荡点校验、玩家互碰全部改用碰撞盒；渲染/血条照旧用完整精灵
 //      （48x48）。俯视角下「身体可叠压墙脚、脚盒不穿透」
-//  10. 攻击（批五A 升级·蓄力前扑强化版，替换批四轻量版）：玩家进入接触
-//      范围（双方碰撞盒触接 + 小余量）且冷却就绪时出招——
-//        - 蓄力 0.35s：移速归零 + 后倾加深 8px（沿出招反方向后退，
-//          给玩家躲避窗口；方向在出招瞬间朝玩家一次性锁定）+ 头顶警示
-//          「!」（alert 纹理由场景注入，蓄力期间显示、前扑开始消失）；
-//        - 前扑：朝锁定方向冲 24px / 0.12s（快出慢收曲线——初速为
-//          2 倍平均、线性收势到 0），期间拖 1~2 重渐隐残影（复用武器
-//          残影思路：半透明副本画在两个自然采样点上）；
-//        - 结算：玩家仍在接触范围 = Hit、否则 Miss（蓄力落空）；
-//        - 落空收势：Miss 后原地收势 0.2s 再回追击（扑空的恢复节奏）；
+//  10. 攻击（批六丁·数据表驱动，替换单一蓄力前扑）：玩家进入接触范围
+//      （双方碰撞盒触接 + 小余量）且冷却就绪时出招；六型参数全部来自
+//      AttackModule 表（蓄力时长/位移/时长/命中半径/伤害倍率/元素）：
+//        - 史莱姆/冰史莱姆：深蹲蓄力 0.45s -> 弧线跃出 80px/0.3s ->
+//          落点 40px 范围结算（冰史莱姆落地冰环 + 命中减速）；
+//        - 哥布林/霜哥布林：既有前扑（0.35s 后倾 -> 24px/0.12s；霜哥布林
+//          冰爪视觉 + 冻结条 +25）；
+//        - 骷髅/霜骷髅：后倾 0.3s -> 突刺 140px/0.25s，撞墙/命中即止
+//          （霜骷髅冰痕视觉 + 冻结条 +20）；
+//      玩家是否真扣血、元素是否累积由场景裁决（无敌期整段跳过）；
 //      结果经 consumeAttackResult 交场景消费（扣血/无敌/回弹/音效/
 //      命中爪痕特效都是场景职责）；出招后进入冷却（monster_attack_cooldown
 //      注入）。出招瞬间的红色脉冲（0.1s）保留——素材复用不加新图
@@ -92,21 +98,48 @@ class Camera;
 enum class MonsterAttackResult
 {
     None, // 本步无结算（未构成一次完整出招）
-    Miss, // 前扑结束、玩家已不在接触范围（蓄力落空——躲开了）
-    Hit   // 前扑结束、玩家仍在接触范围（是否真扣血由场景按无敌状态裁决）
+    Miss, // 攻击结束、玩家不在命中范围（蓄力落空/落点未覆盖/突刺落空）
+    Hit   // 攻击命中（是否真扣血/元素是否累积由场景按无敌状态裁决）
 };
 
-// 怪物变体枚举：等权随机刷新的取值范围（Count 恒为变体数量，用作随机上界）
+// 怪物变体枚举：生成分表按区取三型（草地原色 / 雪山冰霜版），区内等权。
+// 顺序 = 进攻模组表 kAttackModules 的下标（见 game/AttackModule.h），不可交换。
 enum class MonsterType
 {
-    Slime,  // 史莱姆：生命 20 / 速度 90 / 掉落金币 1（慢而拖延）
-    Goblin, // 哥布林：生命 30 / 速度 110 / 掉落金币 2（基准线）
-    Skelet, // 骷髅：生命 18 / 速度 140 / 掉落金币 1（快而脆）
-    Count   // 变体总数（哨兵值）：SDL_rand(Count) 实现等权随机时的上界
+    Slime,       // 草地史莱姆：生命 20 / 速度 90 / 金币 1 / 跳跃砸击
+    Goblin,      // 草地哥布林：生命 30 / 速度 110 / 金币 2 / 蓄力前扑
+    Skelet,      // 草地骷髅：生命 18 / 速度 140 / 金币 1 / 突刺冲锋
+    IceSlime,    // 雪山冰史莱姆：同史莱姆数值 / 跳跃砸击 + 落地冰环 + 减速
+    FrostGoblin, // 雪山霜哥布林：同哥布林数值 / 前扑 + 冰爪 + 冻结条 +25
+    FrostSkelet, // 雪山霜骷髅：同骷髅数值 / 突刺 + 冰痕 + 冻结条 +20
+    Count        // 变体总数（哨兵值）：SDL_rand(Count) 的合法上界
 };
 
-// 变体名（日志展示用，如「怪物出现（第 1 只，骷髅）」）
+// 变体名（日志展示用，如「怪物出现（第 1 只，霜骷髅 Lv.24，雪山…）」）
 const char* monsterTypeName(MonsterType type);
+
+// 是否为雪山冰霜变体（外观/命中元素共用判据）
+inline bool monsterTypeIsFrost(MonsterType type)
+{
+    return type == MonsterType::IceSlime || // 冰史莱姆
+           type == MonsterType::FrostGoblin || // 霜哥布林
+           type == MonsterType::FrostSkelet; // 霜骷髅
+}
+
+// 按变体取进攻模组（数据表唯一入口；下标即 MonsterType 枚举值）
+inline const AttackModule& attackModuleFor(MonsterType type)
+{
+    return attackModuleForIndex(static_cast<int>(type)); // 越界由表访问器夹取
+}
+
+// 编译期约束：变体数必须与进攻模组表行数一致（加怪忘加模组时直接编译失败）
+static_assert(static_cast<int>(MonsterType::Count) == kAttackModuleCount,
+              "MonsterType::Count 必须等于 kAttackModuleCount（六型各一行模组）");
+
+// 生成分表（批六丁）：zone = 出生点所属区，roll = [0,3) 等权随机数。
+// 草地 -> 史莱姆/哥布林/骷髅；雪山 -> 冰史莱姆/霜哥布林/霜骷髅。
+// roll 越界（调用方错误/未来扩表）夹到 0..2——绝不越界、结果可预测。
+MonsterType monsterVariantForZone(ZoneId zone, int roll);
 
 class Monster : public Entity
 {
@@ -147,6 +180,14 @@ public:
     // 当前等级（批六丙：出生时按出生位置所在区与距神龛距离定，存于本对象）。
     // 场景用于：攻击伤害缩放、经验宝石价值、血条旁「Lv.n」显示与日志断言
     int level() const { return m_level; }
+
+    // 本变体的进攻模组（批六丁）：场景在命中结算时读取伤害倍率/元素效果；
+    // 冒烟与单测也可直接查看当前蓄力/位移参数
+    const AttackModule& attackModule() const { return attackModuleFor(m_type); }
+
+    // 注入法术冰环纹理（场景复用 spell_frost_nova.png）：冰史莱姆落地时
+    // 绘制一圈冰环视觉。只借用不持有（纹理生命周期归场景）；nullptr = 不画
+    void setFrostNovaTexture(SDL_Texture* texture) { m_frostNovaTexture = texture; }
 
     // 设置本步的追踪目标点（传玩家「碰撞盒」，内部取中心存储；批四起
     // 同时留存完整盒——攻击接触范围判定用）。PlayScene 每个固定步在
@@ -368,30 +409,36 @@ private:
     static constexpr float kAlertHeight = 36.0f;  // 警示绘制高（像素；同上）
     static constexpr float kAlertOffsetY = 24.0f; // 警示底边相对精灵顶部上移量（像素；高于血条区，同屏不重叠）
 
-    // ---- 攻击（批五A 升级·蓄力前扑强化版）：常量与内部状态机 ----
-    // 蓄力/前扑/收势/回弹为「代码常量并注释」（规格口径）——回弹距离公开
-    // 见上方 kAttackRecoilDistance（场景命中结算消费），其余仅本类内部使用
+    // ---- 攻击（批六丁·数据表驱动）：常量与内部状态机 ----
+    // 蓄力/位移/时长/命中半径/伤害倍率/元素全部来自 AttackModule 表；本类只保留
+    // 「所有模组共用」的表现常量。回弹距离公开见上方 kAttackRecoilDistance。
     static constexpr float kDefaultAttackCooldown = 1.2f;  // 缺省冷却（秒）：monster_attack_cooldown 缺键回退
-    static constexpr float kAttackWindupSeconds = 0.35f;   // 蓄力时长（秒）——批五A：0.3 -> 0.35（躲避窗口加长、警示更从容）
-    static constexpr float kAttackLeanDistance = 8.0f;     // 蓄力后倾距离（像素）：沿反方向的后退总位移——批五A：4 -> 8（蓄势更深）
-    static constexpr float kAttackLungeDistance = 24.0f;   // 前冲距离（像素）——批五A：10 -> 24（大幅前扑；被玩家碰撞盒截停时实际更短）
-    static constexpr float kAttackLungeSeconds = 0.12f;    // 前冲时长（秒）——批五A：0.1 -> 0.12；位移走「快出慢收」曲线（初速 2 倍平均）
-    static constexpr float kAttackRecoverySeconds = 0.2f;  // 落空收势时长（秒）：Miss 后原地收势（扑空惩罚窗口）再回追击
+    static constexpr float kAttackLeanDistance = 8.0f;     // 蓄力后倾距离（像素）：前扑/突刺沿反方向的后退总位移
+    static constexpr float kAttackRecoverySeconds = 0.2f;  // 收势时长（秒）：落空/落地/撞墙后的原地恢复窗口
     static constexpr float kAttackPulseSeconds = 0.1f;     // 出招染色脉冲时长（秒；规格约 0.1）
     static constexpr float kAttackContactMargin = 6.0f;    // 接触范围余量（像素）：碰撞盒触接之外再放宽 6px
     static constexpr float kAttackDirEpsilon = 0.001f;     // 出招方向零向量阈值（长度小于它退回默认方向）
+    static constexpr float kJumpArcHeight = 34.0f;         // 跳跃弧线视觉高度（像素；纵向偏移，不影响判定）
+    static constexpr float kJumpCrouchScaleY = 0.78f;      // 深蹲压扁比例（视觉：高度压到 78%）
+    static constexpr float kJumpCrouchScaleX = 1.10f;      // 深蹲压扁比例（视觉：宽度撑到 110%）
+    static constexpr float kLandingFxSeconds = 0.35f;      // 落地冰环特效寿命（秒；展开 + 淡出）
+    static constexpr float kLandingFxStartScale = 0.55f;   // 冰环起始缩放（相对落点直径）
+    static constexpr float kLandingFxEndScale = 1.15f;     // 冰环结束缩放（略大于判定半径，观感饱满）
+    static constexpr float kThrustWallStopRatio = 0.35f;   // 突刺撞墙判据：实际位移 < 期望 x 本比例即视为被挡
+    static constexpr float kFrozenGhostGreenBlue = 220;    // 冰霜残影色（R=160/G=B=220：青蓝调残影）
 
-    // ---- 前扑残影（批五A）：复用武器残影思路的半透明副本 ----
-    static constexpr int kLungeGhostCount = 2;             // 残影数量（重）：前扑起点 1 重 + 过半 1 重
-    static constexpr float kLungeGhostLifeSeconds = 0.18f; // 每重残影的渐隐寿命（秒）：覆盖前扑全程并留一点尾巴
+    // ---- 前扑/突刺残影（批五A 起；批六丁扩展给突刺）：半透明副本 ----
+    static constexpr int kLungeGhostCount = 2;             // 残影数量（重）：出招起点 1 重 + 过半 1 重
+    static constexpr float kLungeGhostLifeSeconds = 0.18f; // 每重残影的渐隐寿命（秒）：覆盖位移全程并留一点尾巴
     static constexpr int kLungeGhostStartAlpha = 115;      // 残影起始透明度（0~255；约 0.45，越旧越淡）
-    static constexpr float kLungeGhostSample = 0.5f;       // 第 2 重残影的采样进度（前扑归一化进度过半时记录）
+    static constexpr float kLungeGhostSample = 0.5f;       // 第 2 重残影的采样进度（位移进度过半时记录）
 
-    // 攻击阶段（内部状态机）：None 平时 / Windup 蓄力 / Lunge 前扑 /
-    // Recovery 落空收势（批五A 新增——Miss 后的原地收势窗口）。
-    // 「命中结算」不单列阶段——前扑走完的那一步就地判定 Hit/Miss：
-    // Hit 直接回 None；Miss 先进 Recovery 再回 None
-    enum class AttackPhase { None, Windup, Lunge, Recovery };
+    // 攻击阶段（内部状态机）：None 平时 / Windup 蓄力 / Strike 攻击位移 /
+    // Recovery 收势。三种攻击方式共用同一阶段机，差异全部来自 AttackModule：
+    //   - 前扑：位移结束就地判定 Hit/Miss（命中直接回 None，落空进 Recovery）；
+    //   - 跳跃：落地时判定 40px 范围，固定进 Recovery（落地收拾姿态）；
+    //   - 突刺：位移中命中/撞墙即止，进 Recovery（余下时长用于收势）。
+    enum class AttackPhase { None, Windup, Strike, Recovery };
 
     static constexpr int kFrameCount = 4; // 每个变体精灵表的总帧数（4 帧 x 48px = 192px 宽）
 
@@ -413,18 +460,20 @@ private:
     SDL_FRect m_targetBox{};   // 玩家碰撞盒快照（批四：接触范围判定用完整盒）
     float m_chaseSpeed = 0.0f; // 本步移动速度（像素/秒，由场景注入）
 
-    // ---- 攻击运行时（批四）；批五A：前扑进度 + 残影 + 收势 ----
-    AttackPhase m_attackPhase = AttackPhase::None; // 当前攻击阶段（平时/蓄力/前扑/落空收势）
+    // ---- 攻击运行时（批四；批六丁：模组数据 + 三种位移方式）----
+    AttackPhase m_attackPhase = AttackPhase::None; // 当前攻击阶段（平时/蓄力/攻击位移/收势）
+    AttackKind m_attackKind = AttackKind::Lunge;   // 本次出招的攻击方式（蓄力瞬间从模组快照）
     float m_attackCooldown = kDefaultAttackCooldown; // 冷却总时长（秒）：setAttackCooldown 注入
     float m_attackCooldownLeft = 0.0f; // 冷却剩余（秒）：<=0 且接触才可出招
-    float m_attackPhaseLeft = 0.0f;    // 当前阶段剩余时长（秒）：蓄力/前扑/收势共用倒计时
-    float m_lungeMoved = 0.0f;         // 前扑已分配位移（像素）：按「快出慢收」曲线逐步逼近 24px 预算
+    float m_attackPhaseLeft = 0.0f;    // 当前阶段剩余时长（秒）：蓄力/位移/收势共用倒计时
+    float m_strikeMoved = 0.0f;        // 攻击位移已分配量（像素）：按曲线逼近模组 distance 预算
     float m_attackDirX = 1.0f;         // 出招锁定方向 x（单位向量；蓄力开始时朝玩家一次性锁定）
     float m_attackDirY = 0.0f;         // 出招锁定方向 y（同上）
     float m_attackPulseLeft = 0.0f;    // 出招染色脉冲剩余时长（秒）：>0 时 render 叠加偏红
+    float m_landingFxLeft = 0.0f;      // 落地冰环剩余时长（秒；冰史莱姆落地时置满）
     MonsterAttackResult m_attackResult = MonsterAttackResult::None; // 待消费结果（每步至多一条）
 
-    // ---- 前扑残影运行时（批五A）----
+    // ---- 前扑/突刺残影运行时（批五A）----
     struct LungeGhost
     {
         float x = 0.0f;    // 残影位置 x（记录时的精灵左上角世界坐标）
@@ -435,6 +484,7 @@ private:
     int m_lungeGhostNext = 0; // 下一个待记录的残影槽位（0..kLungeGhostCount；>= 数量 = 已录满）
 
     SDL_Texture* m_alertTexture = nullptr; // 蓄力警示「!」纹理（场景注入的共享资源；nullptr = 不绘制）
+    SDL_Texture* m_frostNovaTexture = nullptr; // 落地冰环贴图（场景复用 spell_frost_nova.png；nullptr = 不绘制）
 
     // AI 状态机（决策核心；参数/巢/回血百分比都封装在内部，见 MonsterAi）
     MonsterAi m_ai;
@@ -478,12 +528,14 @@ private:
     void clearAttackState()
     {
         m_attackPhase = AttackPhase::None;          // 阶段回平时
+        m_attackKind = AttackKind::Lunge;           // 攻击方式回默认（新怪出招时重新快照）
         m_attackCooldownLeft = 0.0f;                // 冷却清空：新怪接触即可出招
         m_attackPhaseLeft = 0.0f;                   // 阶段计时清零
-        m_lungeMoved = 0.0f;                        // 前扑位移进度清零
+        m_strikeMoved = 0.0f;                       // 攻击位移进度清零
         m_attackPulseLeft = 0.0f;                   // 染色脉冲熄灭
+        m_landingFxLeft = 0.0f;                     // 落地冰环熄灭（不跨生命周期）
         m_attackResult = MonsterAttackResult::None; // 待消费结果丢弃（不跨生命周期发布）
-        clearLungeGhosts();                         // 前扑残影清空（批五A：不跨生命周期）
+        clearLungeGhosts();                         // 前扑/突刺残影清空（不跨生命周期）
     }
 
     // 清前扑残影（批五A）：寿命清零（render 不再绘制）并复位记录槽位——
@@ -528,10 +580,27 @@ private:
     // 出招触发与命中结算共用的位置判据（玩家目标未注入时恒 false）
     bool playerInContactRange() const;
 
-    // 攻击动作的短位移出口（蓄力后倾 / 前扑共用）：碰撞盒口径的分轴滑动
-    // + 位置落定。与 moveWithCollision 的差异：不做卡死检测/持久化侧滑——
-    // 攻击是短促的脚本化动作，不走绕行策略、不污染追击的卡死统计窗口
+    // 玩家是否处于「落点圆形范围」：跳跃砸击的 40px 范围判定。
+    // 以怪物中心为圆心、radius 为半径，与玩家碰撞盒最近点比较（含边界）；
+    // 玩家目标未注入（防御路径）恒 false
+    bool playerInHitRadius(float radius) const;
+
+    // 攻击位移的短位移出口（蓄力后倾 / 前扑 / 跳跃 / 突刺共用）：
+    // 碰撞盒口径的分轴滑动 + 位置落定。与 moveWithCollision 的差异：
+    // 不做卡死检测/持久化侧滑——攻击是短促的脚本化动作，不走绕行策略、
+    // 不污染追击的卡死统计窗口
     void applyAttackMotion(float dx, float dy);
+
+    // 按「当前动作的视觉姿态」绘制本体（批六丁）：普通状态原样绘制；
+    // 跳跃蓄力 = 深蹲压扁（底边锚定）、跳跃位移 = 纵向弧线偏移。
+    // offsetY 为世界坐标的纵向偏移（负值向上），scaleX/scaleY 为绘制缩放。
+    // 攻击脉冲/受击红染复用同一入口，保证偏移与压扁在叠加绘制时一致
+    void drawBody(SDL_Renderer* renderer, float alpha, const Camera& camera,
+                  float offsetY, float scaleX, float scaleY) const;
+
+    // 当前跳跃弧线纵向偏移（像素；非跳跃位移阶段恒 0）：
+    // 用 sin(pi x 进度) 做「起跳 -> 最高点 -> 落地」的视觉弧线
+    float jumpVisualOffsetY() const;
 
     // 位移推进（含墙体碰撞 + 卡死检测 + 持久化侧滑）：本类移动的唯一出口，
     // 三种状态（巡逻/追击/回巢）共用。行为与参数说明见实现（Monster.cpp）

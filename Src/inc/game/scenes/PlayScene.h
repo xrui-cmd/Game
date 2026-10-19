@@ -23,6 +23,7 @@
 #include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
 #include "game/Shrine.h"        // Shrine：复活点表 / 最近激活点 / 交互范围（批六乙）
 #include "game/RespawnRules.h"  // RespawnRules：升级历史栈与死亡惩罚数学（批六乙，纯逻辑）
+#include "game/ElementStatus.h" // ElementStatus：减速计时与冻结条（批六丁，纯逻辑）
 #include <array>                // std::array：本扫程命中记录（按怪物池槽位的定长布尔表）
 #include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
 #include <string>               // std::string：激活键提示文案（config 的 bind_activate 键名）
@@ -339,6 +340,15 @@ private:
     // 当前区移速乘区（批六甲·双区）：ZoneId::Count（尚未判定——进局首步前）
     // 按草地（1.0）处理；过区瞬间 update 用新区的乘区重注入玩家移速
     float currentZoneMoveMultiplier() const;
+
+    // 重算并注入玩家移速（批六丁）：最终速度 = 基础/卡牌移速 x 区乘区 x 减速乘区。
+    // 减速生效/刷新/到期、过区、卡牌重算都经此唯一入口（乘算口径集中一处）
+    void refreshPlayerMoveSpeed();
+
+    // 怪物攻击命中后的元素结算（批六丁）：按攻击模组给玩家挂减速或累积冻结条。
+    // 冻结满 100 时立即锁定玩家（不可移动/攻击）、取消横扫并进入 1.5s 冻结；
+    // 冻结结束由 update 的 FreezeMeter 推进恢复（抗冻缓冲 2s 内不再累积）
+    void applyAttackElement(const Monster& monster);
 
     // ---- 法术（批五B：六法术、自动施法）----
 
@@ -913,6 +923,12 @@ private:
     // 仅 Playing 状态递减——暂停/过场时冻结（批五A：静默计时，
     // 不再有任何渲染表现；批六乙：复活完成后重置为 2s）
     float m_playerInvincibleLeft = 0.0f;
+
+    // ---- 冰霜元素状态（批六丁；restart/死亡复活复位）----
+    // 减速与冻结条都是纯逻辑小类（game/ElementStatus.h）：本场景负责
+    // 计时推进、移速重注入、玩家锁定/HUD 显示与日志
+    SlowStatus m_playerSlow;   // 冰史莱姆减速计时（x0.8 / 3s，刷新不叠乘）
+    FreezeMeter m_freezeMeter; // 冻结条（0~100；满 100 冻结 1.5s；衰减 10/s；2s 缓冲）
 
     // ---- 分区运行时（批六甲；restart 复位）----
     // 当前所在区：ZoneId::Count = 尚未判定（进局/重开后首个 Playing 固定步

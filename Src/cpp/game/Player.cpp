@@ -222,6 +222,21 @@ void Player::update(const UpdateContext& ctx)
         m_hitTintLeft = std::max(m_hitTintLeft - ctx.deltaTime, 0.0f);
     }
 
+    // 冻结锁定（批六丁）：不可移动（输入与击退全部停用）、只保留站立动画。
+    // 冻结时长由场景的 FreezeMeter 推进；本类只消费布尔状态——速度/击退
+    // 残余清零，避免解冻瞬间带着冻结前的惯性滑出去
+    if (m_frozen)
+    {
+        m_velocityX = 0.0f;    // 水平速度清零
+        m_velocityY = 0.0f;    // 垂直速度清零
+        m_knockbackVX = 0.0f;  // 击退速度 x 清零
+        m_knockbackVY = 0.0f;  // 击退速度 y 清零
+        m_knockbackLeft = 0.0f; // 击退窗口关闭
+        m_animTime = 0.0f;     // 动画计时清零（站立帧）
+        setAnimationRange(kIdleFrame, kIdleFrame); // 定格站立帧
+        return; // 本步不移动（玩家位置保持不变）
+    }
+
     // 1) 读取输入方向（逐轴独立，取值 -1 / 0 / +1）。
     //    每一轴 = 正方向动作按下（+1）与负方向动作按下（-1）的合成，
     //    同时按下相反方向时两值互相抵消（净输入为 0，视为无输入）。
@@ -408,6 +423,14 @@ void Player::render(SDL_Renderer* renderer, float alpha, const Camera& camera) c
         SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);       // 还原混合模式
     }
 
+    // 冻结裹冰视觉（批六丁）：蓝白冰罩盖在本体之上；冻结时横扫已取消，
+    // 画完直接结束（不再绘制武器）
+    if (m_frozen)
+    {
+        renderFreezeOverlay(renderer, alpha, camera); // 半透明冰罩 + 白边 + 冰纹
+        return; // 冻结期间没有武器表现
+    }
+
     // 只有「横扫表现期内」且武器纹理已加载时才画剑；其余时刻直接结束
     //（早退不触碰纹理 alpha 状态——上一帧的绘制末尾已恢复 255）
     if (m_swingLeft <= 0.0f || m_weaponTexture == nullptr)
@@ -550,6 +573,39 @@ void Player::renderDrownBody(SDL_Renderer* renderer, float alpha, const Camera& 
     SDL_SetTextureAlphaMod(m_texture, 255); // 还原不透明：防污染后续绘制
 }
 
+// 冻结裹冰视觉（批六丁）：本体之上叠一层「蓝白冰罩」——
+// 半透明冰蓝填充 + 亮白粗边 + 三道斜冰纹；纯 SDL 图元、无新素材。
+// 位置与本体共用插值公式，快速位移/相机滚动都不脱离。
+void Player::renderFreezeOverlay(SDL_Renderer* renderer, float alpha, const Camera& camera) const
+{
+    const float renderX = m_prevX + (m_x - m_prevX) * alpha; // 插值左上角 x
+    const float renderY = m_prevY + (m_y - m_prevY) * alpha; // 插值左上角 y
+    const Vec2 screen = camera.worldToScreen(renderX, renderY); // 世界 -> 屏幕
+    const SDL_FRect block{ screen.x - 3.0f, screen.y - 3.0f, // 冰罩：向外扩 3px
+                           m_w + 6.0f, m_h + 6.0f }; // 覆盖整个精灵
+    const SDL_FRect inner{ block.x + 3.0f, block.y + 3.0f, // 内层亮边
+                           block.w - 6.0f, block.h - 6.0f }; // 与本体同尺寸
+
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND); // 半透明叠加
+    SDL_SetRenderDrawColor(renderer, 140, 205, 255, 105); // 冰蓝填充（约四成不透明）
+    SDL_RenderFillRect(renderer, &block); // 冰罩主体
+
+    SDL_SetRenderDrawColor(renderer, 232, 248, 255, 235); // 近白亮边
+    SDL_RenderRect(renderer, &block); // 外框
+    SDL_RenderRect(renderer, &inner); // 内框（双线冰壳观感）
+
+    // 三道斜冰纹：从左上到右下贯穿冰罩，读作「冰层里的裂纹」
+    SDL_SetRenderDrawColor(renderer, 220, 242, 255, 190); // 冰白半透明
+    SDL_RenderLine(renderer, block.x + block.w * 0.18f, block.y + 2.0f, // 第一道起点
+                   block.x + block.w * 0.42f, block.y + block.h - 2.0f); // 第一道终点
+    SDL_RenderLine(renderer, block.x + block.w * 0.46f, block.y + 2.0f, // 第二道起点
+                   block.x + block.w * 0.70f, block.y + block.h - 2.0f); // 第二道终点
+    SDL_RenderLine(renderer, block.x + block.w * 0.74f, block.y + 2.0f, // 第三道起点
+                   block.x + block.w * 0.94f, block.y + block.h - 2.0f); // 第三道终点
+
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
+}
+
 // 受击击退（批五A）：沿「伤害来源 -> 玩家」方向被推开 + 红染 + 输入抑制
 //（契约见头文件；PlayScene 在怪物攻击命中时调用）
 void Player::applyHitKnockback(float fromCenterX, float fromCenterY)
@@ -607,6 +663,7 @@ void Player::reset(float x, float y)
     // 落水表现清零（批六乙）：重开/复活归位后本体恢复完整可见
     m_drownSinkY = 0.0f;    // 下沉偏移归零
     m_drownAlpha = 255;     // 不透明度恢复 255
+    m_frozen = false;       // 冻结锁定解除（新一局/复活不带旧状态）
 
     // 挥砍朝向回初始（向右）：新一局的第一个固定步会按鼠标位置重新
     // 决定朝向与瞄准方向，这里只是把状态归到与构造时一致的起点

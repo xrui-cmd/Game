@@ -1,5 +1,6 @@
 #include "game/Monster.h"
 #include "game/MonsterLevel.h" // scaledMonsterHp / monsterCoinDrop：等级数值缩放（批六丙纯逻辑）
+#include "game/Zone.h"      // ZoneId / zoneAtWorld：生成分表按出生点所在区选变体（批六丁）
 #include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
 #include "engine/Camera.h"  // Camera：渲染时「世界坐标 -> 屏幕坐标」的换算
 #include "engine/Rect.h"    // rectsOverlap：攻击接触范围（碰撞盒 + 余量）的 AABB 判定
@@ -33,9 +34,11 @@ struct VariantSpec
 
 // 变体数值表（下标 = MonsterType 枚举值，顺序必须与枚举一致）。
 // 数值为「代码常量、硬编码并注释」——本批定案不走配置文件：
-//   - 史莱姆：慢而脆（生命 20 / 速度 90 / 掉落金币 1）
-//   - 哥布林：基准线（生命 30 / 速度 110 / 掉落金币 2，与旧单怪时代数值一致）
-//   - 骷髅  ：快而脆（生命 18 / 速度 140 / 掉落金币 1，追逐压力来源）
+//   - 史莱姆系：慢而脆（生命 20 / 速度 90 / 掉落金币 1）
+//   - 哥布林系：基准线（生命 30 / 速度 110 / 掉落金币 2）
+//   - 骷髅系  ：快而脆（生命 18 / 速度 140 / 掉落金币 1，追逐压力来源）
+// 雪山三型 = 同族原色版的冰霜重染色外观（compose_sprites.ps1 产线），
+// 数值完全沿用原色版——差异只在进攻模组附加的元素效果（AttackModule）。
 // 颜色取自各素材的主色系（回退方块与变体观感相近，一眼能认出是哪只）
 constexpr VariantSpec kVariants[] = {
     // 史莱姆（swampy）：绿色软泥怪，慢吞吞的低压目标（赏金 1 枚）
@@ -47,6 +50,15 @@ constexpr VariantSpec kVariants[] = {
     // 骷髅（skelet）：白骨骷髅，快而脆（赏金 1 枚）
     { "骷髅", "assets/monster_skelet_sheet.png", "assets/monster_skelet.png",
       18, 140.0f, 1, SDL_Color{230, 228, 210, 255} },
+    // 冰史莱姆（swampy 冰霜重染色）：雪山低级目标；数值同史莱姆，命中减速
+    { "冰史莱姆", "assets/monster_ice_slime_sheet.png", "assets/monster_ice_slime.png",
+      20, 90.0f, 1, SDL_Color{118, 190, 232, 255} },
+    // 霜哥布林（goblin 冰霜重染色）：雪山基准目标；数值同哥布林，命中 +25 冻结条
+    { "霜哥布林", "assets/monster_frost_goblin_sheet.png", "assets/monster_frost_goblin.png",
+      30, 110.0f, 2, SDL_Color{80, 154, 170, 255} },
+    // 霜骷髅（skelet 冰霜重染色）：雪山快速目标；数值同骷髅，命中 +20 冻结条
+    { "霜骷髅", "assets/monster_frost_skelet_sheet.png", "assets/monster_frost_skelet.png",
+      18, 140.0f, 1, SDL_Color{208, 230, 244, 255} },
 };
 
 // 变体枚举 -> 数值表下标（Count 哨兵值不在表内，做一个防御性夹取）
@@ -80,6 +92,22 @@ float easeOutLunge(float p)
     return 1.0f - inv * inv;    // 缓出后的位移分配比例
 }
 
+// 跳跃位移的平滑缓动（批六丁）：smoothstep 3p²-2p³——
+// 起跳与落地速度都归零，配合正弦纵向弧线读作「蹲 -> 跃 -> 落」。
+// 边界防御与 easeOutLunge 同款：非正按 0、达到/超过 1 按 1。
+float smoothJump(float p)
+{
+    if (!(p > 0.0f)) // 未开始（含 NaN）：停在起点
+    {
+        return 0.0f; // 位移分配为 0
+    }
+    if (p >= 1.0f) // 已完成：停在终点
+    {
+        return 1.0f; // 位移分配为满
+    }
+    return p * p * (3.0f - 2.0f * p); // smoothstep 曲线
+}
+
 } // 匿名命名空间结束
 
 // 变体名查询：日志展示用（「怪物出现（第 1 只，骷髅）」这类文案）
@@ -87,6 +115,29 @@ const char* monsterTypeName(MonsterType type)
 {
     // 查表返回变体名；越界情形由 variantIndex 夹取保护（见上）
     return kVariants[variantIndex(type)].name;
+}
+
+// 生成分表（批六丁）：草地原色三型 / 雪山冰霜三型，区内等权。
+// roll 由调用方以 SDL_rand(3) 等权产生；越界夹到 0..2（防御）。
+MonsterType monsterVariantForZone(ZoneId zone, int roll)
+{
+    const int safeRoll = std::clamp(roll, 0, 2); // roll 夹到三型范围
+    if (zone == ZoneId::Snow) // 雪山：冰霜版三型
+    {
+        static constexpr MonsterType kSnowVariants[3] = {
+            MonsterType::IceSlime,    // 0 冰史莱姆
+            MonsterType::FrostGoblin, // 1 霜哥布林
+            MonsterType::FrostSkelet, // 2 霜骷髅
+        };
+        return kSnowVariants[safeRoll]; // 按等权下标取雪山变体
+    }
+    // 草地（含未判定哨兵/世界外兜底）：原色三型
+    static constexpr MonsterType kGrassVariants[3] = {
+        MonsterType::Slime,  // 0 史莱姆
+        MonsterType::Goblin, // 1 哥布林
+        MonsterType::Skelet, // 2 骷髅
+    };
+    return kGrassVariants[safeRoll]; // 按等权下标取草地变体
 }
 
 // 按指定变体加载/重载纹理
@@ -299,7 +350,7 @@ void Monster::knockback(float fromX, float fromY, float distance)
 }
 
 // ============================================================
-// 攻击（批四·蓄力前扑）：状态机与结算
+// 攻击（批六丁·六型模组）：状态机与结算
 // ============================================================
 
 // 设置攻击冷却：配置驱动的入口（对应 monster_attack_cooldown，默认 1.2s）
@@ -349,14 +400,19 @@ void Monster::beginWindup()
         m_attackDirY = 0.0f; // 水平方向
     }
 
-    m_attackPhase = AttackPhase::Windup;      // 进入蓄力（本步起常规移动被接管）
-    m_attackPhaseLeft = kAttackWindupSeconds; // 蓄力倒计时（0.35s——批五A 加长，警示与后倾更从容）
-    m_lungeMoved = 0.0f;                      // 前扑位移进度清零（进 Lunge 后按曲线重新分配）
-    clearLungeGhosts();                       // 清旧残影（连续出招时不留上一轮的影）
-    m_attackPulseLeft = kAttackPulseSeconds;  // 出招瞬间染色脉冲（0.1s）
+    // 本次出招的模组快照（蓄力期间类型不会变；三型参数全部来自数据表）
+    const AttackModule& module = attackModule(); // 当前变体的进攻模组
+    m_attackKind = module.kind;                  // 攻击方式（跳跃/前扑/突刺）
+    m_attackPhase = AttackPhase::Windup;         // 进入蓄力（本步起常规移动被接管）
+    m_attackPhaseLeft = module.windupSeconds;    // 蓄力倒计时（模组数据驱动）
+    m_strikeMoved = 0.0f;                        // 攻击位移进度清零（进入位移后按曲线分配）
+    clearLungeGhosts();                          // 清旧残影（连续出招时不留上一轮的影）
+    m_attackPulseLeft = kAttackPulseSeconds;     // 出招瞬间染色脉冲（0.1s）
+    m_landingFxLeft = 0.0f;                      // 新动作不带上一轮的落地冰环
 
-    // 冒烟观测点：出招日志（含变体名——自动化测试断言「接触才出招」）
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "怪物出招（%s）", monsterTypeName(m_type));
+    // 冒烟观测点：出招日志（追加模组名——六型攻击的区分依据）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "怪物出招（%s：%s）",
+                monsterTypeName(m_type), module.name);
 }
 
 // 玩家是否处于接触范围（双方碰撞盒触接 + 小余量）：出招与命中共用判据
@@ -378,65 +434,183 @@ bool Monster::playerInContactRange() const
     return rectsOverlap(expanded, collisionRect()); // 与自身脚盒相交 = 在范围内
 }
 
-// 攻击状态机单步推进：蓄力（后倾）-> 前扑（快出慢收冲量 + 残影）->
-// Hit/Miss 结算 -> 落空收势（批五A 升级版）
+// 玩家是否处于「落点圆形范围」（跳跃砸击的 40px 判定）：
+// 圆心 = 怪物中心，半径 = radius；与玩家碰撞盒最近点比较（含边界）。
+bool Monster::playerInHitRadius(float radius) const
+{
+    if (!m_hasTarget || radius <= 0.0f) // 无目标/非法半径（防御）：不命中
+    {
+        return false; // 明确视为范围外
+    }
+    const float centerX = m_x + m_w * 0.5f; // 怪物中心 x（世界坐标）
+    const float centerY = m_y + m_h * 0.5f; // 怪物中心 y
+    // 玩家碰撞盒上离怪物中心最近的点（逐轴夹取到盒区间）
+    const float nearestX = std::clamp(centerX, m_targetBox.x,
+                                      m_targetBox.x + m_targetBox.w); // 最近点 x
+    const float nearestY = std::clamp(centerY, m_targetBox.y,
+                                      m_targetBox.y + m_targetBox.h); // 最近点 y
+    const float dx = centerX - nearestX; // 圆心到最近点的横向差
+    const float dy = centerY - nearestY; // 纵向差
+    return dx * dx + dy * dy <= radius * radius; // 平方比较（含边界）
+}
+
+// 跳跃弧线纵向偏移：仅「跳跃位移阶段」返回负值（屏幕坐标向上为负）。
+// sin(pi x 进度) 在起跳/落地为 0、中途为峰值——只看画面，不参与判定。
+float Monster::jumpVisualOffsetY() const
+{
+    if (m_attackPhase != AttackPhase::Strike || m_attackKind != AttackKind::JumpSmash)
+    {
+        return 0.0f; // 非跳跃位移：没有弧线偏移
+    }
+    const float duration = attackModule().duration; // 模组位移时长（秒）
+    if (!(duration > 0.0f)) // 异常模组（防御）：不加偏移
+    {
+        return 0.0f; // 保持地面位置
+    }
+    const float progress = 1.0f - std::max(m_attackPhaseLeft, 0.0f) / duration; // 进度 [0,1]
+    constexpr float kPi = 3.14159265358979323846f; // 圆周率（避免平台 M_PI 差异）
+    return -std::sin(progress * kPi) * kJumpArcHeight; // 向上为负：抛物线视觉
+}
+
+// 按当前动作的视觉姿态绘制本体：普通状态与 Entity::render 同帧同插值；
+// 跳跃蓄力做深蹲压扁（底边锚定）、跳跃位移叠加纵向弧线偏移。
+// 前扑/突刺残影不调用本函数（残影保持记录点原样）。
+void Monster::drawBody(SDL_Renderer* renderer, float alpha, const Camera& camera,
+                       float offsetY, float scaleX, float scaleY) const
+{
+    if (m_texture == nullptr) // 纹理未加载（防御）：无可绘制内容
+    {
+        return; // 安全跳过
+    }
+
+    const float renderX = m_prevX + (m_x - m_prevX) * alpha; // 插值左上角 x
+    const float renderY = m_prevY + (m_y - m_prevY) * alpha + offsetY; // 插值左上角 y + 姿态偏移
+    const Vec2 screenPos = camera.worldToScreen(renderX, renderY); // 世界 -> 屏幕（含偏移）
+
+    // 缩放锚点：水平居中、底边保持原位（压扁时脚不离地）
+    const float drawW = m_w * scaleX; // 绘制宽
+    const float drawH = m_h * scaleY; // 绘制高
+    const SDL_FRect dst{ screenPos.x + (m_w - drawW) * 0.5f, // 水平居中
+                         screenPos.y + (m_h - drawH),       // 底边锚定
+                         drawW, drawH };                     // 绘制尺寸
+    const int frameIndex = (m_frameTime > 0.0f) // 帧时长有效才换算帧号
+        ? static_cast<int>(m_animTime / m_frameTime) % std::max(m_frameCount, 1) // 循环帧号
+        : 0; // 异常帧时长（防御）：停在首帧
+    const SDL_FRect src{ static_cast<float>(frameIndex) * m_w, 0.0f, m_w, m_h }; // 精灵表当前帧
+    SDL_RenderTexture(renderer, m_texture, &src, &dst); // 绘制本体（单帧裁切）
+}
+
+// 攻击状态机单步推进（批六丁：三型共用；差异全部来自 AttackModule）：
+//   蓄力 -> 攻击位移（跳跃/前扑/突刺）-> 命中结算 -> 收势 -> 回归 AI。
+// 位移统一走 applyAttackMotion（墙 + 玩家盒滑动），不参与卡死检测/侧滑。
 void Monster::advanceAttack(float dt)
 {
+    const AttackModule& module = attackModule(); // 当前变体的模组（参数唯一来源）
+
     if (m_attackPhase == AttackPhase::Windup)
     {
-        // 蓄力：移速归零（常规移动已被本状态接管）+ 后倾——沿出招反方向
-        // 以恒低速后退（总位移 ≈ kAttackLeanDistance 8px / 0.35s）。
-        // 后倾是真实位移（经碰撞滑动；贴墙时会被挡住——可接受的边界），
-        // 「视觉后倾与逻辑同一位置」由此保证
-        const float leanSpeed = kAttackLeanDistance / kAttackWindupSeconds; // 后倾速度（px/s）
-        applyAttackMotion(-m_attackDirX * leanSpeed * dt,  // 反向 x 位移
-                          -m_attackDirY * leanSpeed * dt); // 反向 y 位移
+        // 蓄力：移速归零（常规移动已被本状态接管）。
+        // 前扑/突刺沿出招反方向后倾（真实位移，经碰撞滑动；总位移 8px）；
+        // 跳跃砸击改为「原地深蹲」——位移为零，视觉压扁在 render 侧完成。
+        if (m_attackKind == AttackKind::Lunge || m_attackKind == AttackKind::Thrust)
+        {
+            const float leanSpeed = kAttackLeanDistance / module.windupSeconds; // 后倾速度（px/s）
+            applyAttackMotion(-m_attackDirX * leanSpeed * dt,  // 反向 x 位移
+                              -m_attackDirY * leanSpeed * dt); // 反向 y 位移
+        }
 
         m_attackPhaseLeft -= dt; // 蓄力倒计时（固定步递减，暂停时冻结）
         if (m_attackPhaseLeft <= 0.0f)
         {
-            m_attackPhase = AttackPhase::Lunge;      // 蓄力结束 -> 前扑
-            m_attackPhaseLeft = kAttackLungeSeconds; // 前扑时长（0.12s 固定窗口）
-            m_lungeMoved = 0.0f;                     // 位移进度归零（曲线分配的起点）
-            recordLungeGhost();                      // 第 1 重残影：后倾终点（扑出前的站位）
+            m_attackPhase = AttackPhase::Strike;      // 蓄力结束 -> 攻击位移
+            m_attackPhaseLeft = module.duration;      // 位移时长（模组数据）
+            m_strikeMoved = 0.0f;                     // 位移进度归零（曲线分配起点）
+            recordLungeGhost();                       // 第 1 重残影：出招起点站位
         }
         return; // 本步只走蓄力阶段
     }
 
-    if (m_attackPhase == AttackPhase::Lunge)
+    if (m_attackPhase == AttackPhase::Strike)
     {
-        // ---- 前扑：朝锁定方向冲量，「快出慢收」曲线分配 24px 位移 ----
-        // 每步的位移增量 = 曲线在本步末的累计位移 - 上一步末的累计位移。
-        // 初速为平均速度的 2 倍（快出）、末速归零（收势）——见 easeOutLunge
-        m_attackPhaseLeft -= dt; // 前扑倒计时先走（本步按新剩余量换算进度）
-        const float remaining = std::max(m_attackPhaseLeft, 0.0f);              // 剩余时长（夹到 0，防负）
-        const float progress = 1.0f - remaining / kAttackLungeSeconds;          // 归一化进度 [0,1]
-        const float targetMoved = kAttackLungeDistance * easeOutLunge(progress); // 本步末应累计的位移
-        const float step = targetMoved - m_lungeMoved;                           // 本步位移增量（像素）
+        // ---- 攻击位移：按模组曲线分配预算距离 ----
+        // 每步增量 = 曲线在本步末的累计位移 - 上一步末的累计位移。
+        // 前扑/突刺用「快出慢收」；跳跃用 smoothstep（起跳/落地都缓）。
+        m_attackPhaseLeft -= dt; // 位移倒计时先走（本步按新剩余量换算进度）
+        const float remaining = std::max(m_attackPhaseLeft, 0.0f); // 剩余时长（夹到 0）
+        const float progress = (module.duration > 0.0f) // 归一化进度（防御除零）
+            ? 1.0f - remaining / module.duration // 正常：0 -> 1
+            : 1.0f; // 零时长（异常模组）：直接完成
+        const float eased = (m_attackKind == AttackKind::JumpSmash) // 跳跃：平滑起落
+            ? smoothJump(progress) // smoothstep 曲线
+            : easeOutLunge(progress); // 前扑/突刺：快出慢收
+        const float targetMoved = module.distance * eased; // 本步末应累计的位移
+        const float step = targetMoved - m_strikeMoved;    // 本步位移增量（像素）
 
-        applyAttackMotion(m_attackDirX * step,  // 朝锁定方向前冲（经碰撞滑动）
+        const float beforeX = m_x; // 位移前精灵左上角 x（撞墙判据）
+        const float beforeY = m_y; // 位移前精灵左上角 y
+        applyAttackMotion(m_attackDirX * step, // 朝锁定方向推进（经碰撞滑动）
                           m_attackDirY * step);
+        const float actualStep = std::sqrt((m_x - beforeX) * (m_x - beforeX) +
+                                           (m_y - beforeY) * (m_y - beforeY)); // 实际位移长度
         // 进度落定：按「曲线分配量」而非实际位移记——被墙/玩家盒截停时
-        // 实际位移更短，但曲线不停（时长尾段用于收势，不会突然补冲）
-        m_lungeMoved = targetMoved;
+        // 实际位移更短，但曲线不停（不会突然补冲）
+        m_strikeMoved = targetMoved;
 
-        // 第 2 重残影：进度过半时记录在当前位置（前扑路径的两个自然采样点，
-        // 与残影寿命共同构成「1~2 重渐隐拖尾」）
+        // 第 2 重残影：进度过半时记录在当前位置（位移路径的自然采样点）
         if (progress >= kLungeGhostSample)
         {
             recordLungeGhost(); // 内部自带录满检查：两重后为无操作
         }
 
-        // 时长走完：一次出招结束 -> 就地结算命中（固定 0.12s 窗口制；
-        // 被挡到挪不动也按时收招——动作时长稳定、可预期）
+        if (m_attackKind == AttackKind::JumpSmash)
+        {
+            // 跳跃砸击：落地瞬间结算「落点 40px 范围」并进入收势。
+            // 冰史莱姆的落地冰环是纯视觉：无论命中与否都亮一圈（规格表现）
+            if (m_attackPhaseLeft <= 0.0f)
+            {
+                if (module.frostVisual) // 冰霜系（冰史莱姆）：落地冰环
+                {
+                    m_landingFxLeft = kLandingFxSeconds; // 特效计时置满
+                }
+                // 落点范围判定：玩家碰撞盒最近点距怪物中心 <= hitRadius 即命中
+                m_attackResult = playerInHitRadius(module.hitRadius)
+                    ? MonsterAttackResult::Hit   // 范围内：命中
+                    : MonsterAttackResult::Miss; // 范围外：落空
+                m_attackPhase = AttackPhase::Recovery;      // 落地后固定收势
+                m_attackPhaseLeft = kAttackRecoverySeconds; // 收势窗口（0.2s）
+                m_attackCooldownLeft = m_attackCooldown;    // 出招后进入冷却
+            }
+            return; // 本步只走跳跃位移
+        }
+
+        if (m_attackKind == AttackKind::Thrust)
+        {
+            // 突刺冲锋：撞墙/命中即止 -> 收势。
+            // 命中优先于撞墙（贴着玩家时 applyAttackMotion 被玩家盒截停，
+            // 实际位移也会变小；此时应结算 Hit 而不是 Miss）。
+            const bool hitNow = playerInContactRange(); // 本步是否已撞上玩家
+            const bool wallStopped = step > 0.01f &&
+                actualStep < step * kThrustWallStopRatio; // 实际位移远小于期望 = 撞墙/被挡
+            if (hitNow || wallStopped || m_attackPhaseLeft <= 0.0f)
+            {
+                m_attackResult = hitNow
+                    ? MonsterAttackResult::Hit   // 命中：立即止步
+                    : MonsterAttackResult::Miss; // 撞墙/走完未命中：落空
+                m_attackPhase = AttackPhase::Recovery;      // 收势（撞墙/命中即止）
+                m_attackPhaseLeft = kAttackRecoverySeconds; // 收势窗口（0.2s）
+                m_attackCooldownLeft = m_attackCooldown;    // 出招后进入冷却
+            }
+            return; // 本步只走突刺位移
+        }
+
+        // ---- 前扑（哥布林系，既有行为）：位移走完就地结算 ----
         if (m_attackPhaseLeft <= 0.0f)
         {
-            // 结算：玩家是否仍在接触范围（碰撞盒触接 + 余量）——「蓄力落空
-            // （玩家已离开）」与命中由此区分；是否真扣血由场景按无敌状态裁决
+            // 结算：玩家是否仍在接触范围（碰撞盒触接 + 余量）
             if (playerInContactRange())
             {
                 m_attackResult = MonsterAttackResult::Hit; // 命中：直接回归常规 AI
-                m_attackPhase = AttackPhase::None;
+                m_attackPhase = AttackPhase::None;         // 命中不进收势
             }
             else
             {
@@ -449,9 +623,9 @@ void Monster::advanceAttack(float dt)
         return; // 本步只走前扑阶段
     }
 
-    // ---- Recovery（落空收势，批五A）：原地收招 0.2s 再回追击 ----
-    // 移速归零（常规移动被本状态接管）、只走倒计时——扑空后的动作停顿
-    // 让「躲开」获得可读的代价窗口（与蓄力窗口对称的节奏感）
+    // ---- Recovery（收势）：原地收招 0.2s 再回追击 ----
+    // 移速归零（常规移动被本状态接管）、只走倒计时——落空/落地/撞墙后的
+    // 动作停顿，让「躲开」获得可读的代价窗口
     m_attackPhaseLeft -= dt; // 收势倒计时（固定步递减）
     if (m_attackPhaseLeft <= 0.0f)
     {
@@ -583,6 +757,12 @@ void Monster::update(const UpdateContext& ctx)
     if (m_attackPulseLeft > 0.0f)
     {
         m_attackPulseLeft = std::max(m_attackPulseLeft - ctx.deltaTime, 0.0f);
+    }
+
+    // 落地冰环计时递减（批六丁）：与其余战斗特效用同一条固定步门控
+    if (m_landingFxLeft > 0.0f)
+    {
+        m_landingFxLeft = std::max(m_landingFxLeft - ctx.deltaTime, 0.0f); // 夹到 0
     }
 
     // 怪物中心（世界坐标）：AI 判定的自身位置基准
@@ -949,72 +1129,148 @@ void Monster::refreshSlideSide(float stepDX, float stepDY)
     m_slideHoldLeft = kSlideHoldSeconds; // 刷新维持窗口（新方向又维持一段）
 }
 
-// 覆写渲染：前扑残影 + 常规帧 + 出招脉冲 + 受击红染 + 蓄力警示「!」+
-// 头顶血条（均经相机世界->屏幕换算）
+// 覆写渲染（批六丁扩展）：残影 -> 落地冰环 -> 冰爪/冰痕 -> 本体
+//（跳跃弧线/深蹲）-> 出招脉冲 -> 受击红染 -> 蓄力警示 -> 血条。
+// 均经相机世界->屏幕换算；冰霜系视觉只在霜变体上出现。
 void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) const
 {
-    // ---- 前扑残影（批五A）：1~2 重渐隐副本先画（压在本体之下）----
-    // 残影 = 记录位置的半透明副本（复用武器残影思路）：透明度随剩余寿命
-    // 线性衰减（越旧越淡）。源矩形取精灵表第 0 帧——高速残影下与当前帧
-    // 的差异不可辨，换来实现简单（不与基类帧号换算重复）
+    // 跳跃姿态参数：深蹲压扁只在蓄力阶段，弧线偏移只在位移阶段
+    float drawScaleX = 1.0f; // 本体绘制宽缩放（普通状态 = 1）
+    float drawScaleY = 1.0f; // 本体绘制高缩放（普通状态 = 1）
+    if (m_attackPhase == AttackPhase::Windup && m_attackKind == AttackKind::JumpSmash)
+    {
+        const float windup = attackModule().windupSeconds; // 深蹲总时长（模组）
+        const float progress = (windup > 0.0f) // 进度（防御除零）
+            ? 1.0f - std::max(m_attackPhaseLeft, 0.0f) / windup // 0 -> 1
+            : 1.0f; // 异常模组：直接蹲到底
+        drawScaleY = 1.0f - (1.0f - kJumpCrouchScaleY) * progress; // 高度逐渐压扁
+        drawScaleX = 1.0f + (kJumpCrouchScaleX - 1.0f) * progress; // 宽度逐渐撑开
+    }
+    const float jumpOffsetY = jumpVisualOffsetY(); // 跳跃位移的纵向弧线偏移（否则 0）
+
+    // ---- 残影（批五A；批六丁：霜系染成青蓝）----
+    // 残影 = 记录位置的半透明副本：透明度随剩余寿命线性衰减；源矩形取第 0 帧
     if (m_texture != nullptr)
     {
-        bool anyGhost = false; // 本帧是否画过残影（决定是否需要还原 alpha 状态）
+        const bool frostGhost = monsterTypeIsFrost(m_type); // 霜系残影：青蓝调
+        if (frostGhost) // 只对霜系改色（草地原色保持原样）
+        {
+            SDL_SetTextureColorMod(m_texture, 160, // 压红：残影偏青
+                                   static_cast<Uint8>(kFrozenGhostGreenBlue), // 保留绿
+                                   static_cast<Uint8>(kFrozenGhostGreenBlue)); // 提蓝
+        }
+        bool anyGhost = false; // 本帧是否画过残影（决定是否需要还原纹理状态）
         for (const LungeGhost& ghost : m_lungeGhosts)
         {
-            if (ghost.left <= 0.0f)
+            if (ghost.left <= 0.0f) // 已熄灭的残影槽位
             {
-                continue; // 已熄灭的残影槽位：跳过
+                continue; // 跳过
             }
-            // 记录点（世界坐标左上角）经相机换算到屏幕——与本体同一条换算
-            const Vec2 screen = camera.worldToScreen(ghost.x, ghost.y);
+            const Vec2 screen = camera.worldToScreen(ghost.x, ghost.y); // 记录点 -> 屏幕
             const SDL_FRect dst{ screen.x, screen.y, m_w, m_h }; // 整帧矩形（同尺寸）
             const SDL_FRect src{ 0.0f, 0.0f, m_w, m_h };         // 精灵表第 0 帧
             const float ratio = ghost.left / kLungeGhostLifeSeconds; // 剩余寿命比例 [0,1]
-            SDL_SetTextureAlphaMod(m_texture, static_cast<Uint8>(kLungeGhostStartAlpha * ratio)); // 渐隐
+            SDL_SetTextureAlphaMod(m_texture, // 渐隐：按剩余寿命调透明度
+                                   static_cast<Uint8>(kLungeGhostStartAlpha * ratio)); // 0~115
             SDL_RenderTexture(renderer, m_texture, &src, &dst); // 半透明副本
-            anyGhost = true; // 标记：纹理 alpha 已被改写
+            anyGhost = true; // 标记：纹理状态已被改写
         }
-        if (anyGhost)
+        if (anyGhost || frostGhost) // 有残影或改过色：必须还原
         {
-            SDL_SetTextureAlphaMod(m_texture, 255); // 还原不透明（防污染本体与后续绘制）
+            SDL_SetTextureAlphaMod(m_texture, 255); // 还原不透明
+            SDL_SetTextureColorMod(m_texture, 255, 255, 255); // 还原原色
         }
     }
 
-    // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
-    //（基类内部完成世界坐标 -> 屏幕坐标的相机换算）
-    Entity::render(renderer, alpha, camera);
+    // ---- 落地冰环（冰史莱姆）：画在本体之下，从 0.55 倍展开到 1.15 倍并淡出 ----
+    if (m_landingFxLeft > 0.0f && m_frostNovaTexture != nullptr)
+    {
+        const float progress = 1.0f - std::clamp(m_landingFxLeft / kLandingFxSeconds, // 特效进度
+                                                 0.0f, 1.0f); // 0 = 刚落地，1 = 结束
+        const float scale = kLandingFxStartScale + // 起始缩放
+            (kLandingFxEndScale - kLandingFxStartScale) * progress; // 展开到结束缩放
+        const float diameter = attackModule().hitRadius * 2.0f * scale; // 绘制直径（相对 40px 判定半径）
+        const float interpX = m_prevX + (m_x - m_prevX) * alpha; // 插值左上角 x
+        const float interpY = m_prevY + (m_y - m_prevY) * alpha; // 插值左上角 y
+        const Vec2 screen = camera.worldToScreen(interpX + m_w * 0.5f, // 落点中心 x
+                                                 interpY + m_h * 0.5f); // 落点中心 y
+        const SDL_FRect dst{ screen.x - diameter * 0.5f, // 左上角 x（居中）
+                             screen.y - diameter * 0.5f, // 左上角 y
+                             diameter, diameter };       // 冰环绘制尺寸
+        SDL_SetTextureAlphaMod(m_frostNovaTexture, // 淡出：结束前线性衰减
+                               static_cast<Uint8>((1.0f - progress) * 235.0f)); // 0~235
+        SDL_RenderTexture(renderer, m_frostNovaTexture, nullptr, &dst); // 整张冰环贴图
+        SDL_SetTextureAlphaMod(m_frostNovaTexture, 255); // 还原不透明（防污染后续绘制）
+    }
 
-    // 出招染色脉冲（批四）：出招瞬间 0.1s 内把同一帧以「偏红加色」再画
-    // 一遍——出招信号的视觉电报（素材复用，不加新图）。与红染同一套
-    // 「叠加混合」技巧：ADD 混合 + 颜色调制压掉大部分绿蓝通道 = 红光脉冲
+    // ---- 冰爪 / 冰痕（纯代码线条，无新素材）----
+    // 霜哥布林前扑期间在正前方画三道冰爪；霜骷髅突刺期间在身后画冰痕。
+    if (m_attackPhase == AttackPhase::Strike && attackModule().frostVisual)
+    {
+        const float interpX = m_prevX + (m_x - m_prevX) * alpha; // 插值左上角 x
+        const float interpY = m_prevY + (m_y - m_prevY) * alpha; // 插值左上角 y
+        const Vec2 center = camera.worldToScreen(interpX + m_w * 0.5f, // 本体中心屏幕 x
+                                                 interpY + m_h * 0.5f); // 本体中心屏幕 y
+        const float perpX = -m_attackDirY; // 方向垂直分量 x（用于三道平行线）
+        const float perpY = m_attackDirX;  // 方向垂直分量 y
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND); // 半透明线条
+        SDL_SetRenderDrawColor(renderer, 205, 245, 255, 210); // 冰白偏青
+        if (m_attackKind == AttackKind::Lunge) // 冰爪：三道平行短线在正前方
+        {
+            for (int i = -1; i <= 1; ++i) // 三道：-1 / 0 / +1
+            {
+                const float offset = static_cast<float>(i) * 9.0f; // 横向错开 9px
+                const float startX = center.x + m_attackDirX * 18.0f + perpX * offset; // 起点 x
+                const float startY = center.y + m_attackDirY * 18.0f + perpY * offset; // 起点 y
+                const float endX = center.x + m_attackDirX * 44.0f + perpX * offset * 1.4f; // 终点 x
+                const float endY = center.y + m_attackDirY * 44.0f + perpY * offset * 1.4f; // 终点 y
+                SDL_RenderLine(renderer, startX, startY, endX, endY); // 一道冰爪
+                SDL_RenderLine(renderer, startX + 1.0f, startY, // 加粗第二笔（x 偏移）
+                               endX + 1.0f, endY); // 同一条线右移 1px
+            }
+        }
+        else if (m_attackKind == AttackKind::Thrust) // 冰痕：三道拖尾在身后
+        {
+            for (int i = -1; i <= 1; ++i) // 三道：-1 / 0 / +1
+            {
+                const float offset = static_cast<float>(i) * 7.0f; // 横向错开 7px
+                const float startX = center.x - m_attackDirX * 8.0f + perpX * offset; // 起点 x
+                const float startY = center.y - m_attackDirY * 8.0f + perpY * offset; // 起点 y
+                const float endX = center.x - m_attackDirX * 34.0f + perpX * offset; // 终点 x
+                const float endY = center.y - m_attackDirY * 34.0f + perpY * offset; // 终点 y
+                SDL_RenderLine(renderer, startX, startY, endX, endY); // 一道冰痕
+            }
+        }
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
+    }
+
+    // 本体绘制：跳跃蓄力压扁、跳跃位移叠加弧线；其余状态与基类同款
+    drawBody(renderer, alpha, camera, jumpOffsetY, drawScaleX, drawScaleY);
+
+    // 出招染色脉冲：出招瞬间 0.1s 内再画一遍偏红加色（与红染同一套 ADD 技法）
     if (m_attackPulseLeft > 0.0f && m_texture != nullptr)
     {
         SDL_SetTextureColorMod(m_texture, 255, 60, 60);        // 偏红：只留少量绿蓝参与加色
         SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD); // 叠加混合：在底色上「加光」
-        Entity::render(renderer, alpha, camera);               // 第二次绘制：红光脉冲
-        // 还原纹理状态（颜色调制回全白、混合回默认）——防污染后续绘制
-        SDL_SetTextureColorMod(m_texture, 255, 255, 255);
-        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
+        drawBody(renderer, alpha, camera, jumpOffsetY, drawScaleX, drawScaleY); // 第二次绘制
+        SDL_SetTextureColorMod(m_texture, 255, 255, 255);      // 还原颜色调制
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND); // 还原混合模式
     }
 
-    // 受击红染（批五A，替换旧版白闪）：红染计时内把同一帧以「红光叠加」
-    // 再画一遍——与玩家红染同款同色（ADD + 绿蓝通道压到 kHitTintGreenBlue）。
-    // 旧白闪的「整体提亮」读作治疗感，红色明确读作「掉血了」
+    // 受击红染：红染计时内再画一遍红光叠加（与玩家同款）
     if (m_hitTintLeft > 0.0f && m_texture != nullptr)
     {
-        SDL_SetTextureColorMod(m_texture, 255,
-                               static_cast<Uint8>(kHitTintGreenBlue),
-                               static_cast<Uint8>(kHitTintGreenBlue)); // 偏红：只留少量绿蓝参与加色
-        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD);         // 叠加混合：在底色上「加光」
-        Entity::render(renderer, alpha, camera);                       // 第二次绘制：红光叠加
-        // 还原纹理状态：残留 ADD/颜色调制会污染后续绘制
-        SDL_SetTextureColorMod(m_texture, 255, 255, 255);
-        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureColorMod(m_texture, 255, // 偏红：只留少量绿蓝参与加色
+                               static_cast<Uint8>(kHitTintGreenBlue), // 绿通道压低
+                               static_cast<Uint8>(kHitTintGreenBlue)); // 蓝通道压低
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_ADD); // 叠加混合
+        drawBody(renderer, alpha, camera, jumpOffsetY, drawScaleX, drawScaleY); // 第二次绘制
+        SDL_SetTextureColorMod(m_texture, 255, 255, 255);      // 还原颜色调制
+        SDL_SetTextureBlendMode(m_texture, SDL_BLENDMODE_BLEND); // 还原混合模式
     }
 
-    // ---- 蓄力警示「!」（批五A）：蓄力期间显示、前扑开始消失 ----
-    // 阶段判据即规格：只有 Windup 阶段绘制（进 Lunge 自然消失）；
+    // ---- 蓄力警示「!」（批五A）：蓄力期间显示、攻击位移开始消失 ----
+    // 阶段判据即规格：只有 Windup 阶段绘制（进 Strike 自然消失）；
     // 画在怪物头顶上方（底边高于血条区，同屏不重叠）。纹理由场景注入
     // 共享（nullptr = 加载失败：警示缺失、其余表现照常）
     if (m_attackPhase == AttackPhase::Windup && m_alertTexture != nullptr)
