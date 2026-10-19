@@ -466,8 +466,9 @@ private:
     // 「画到哪、打到哪」由结构性共享保证
     void advanceSwingSweep(const SDL_FRect& playerRect);
 
-    // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位
-    void dropGemAt(float x, float y);
+    // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位，
+    // 并写入本颗宝石的经验值（xpValue——批六丙由怪物等级缩放后传入）
+    void dropGemAt(float x, float y, int xpValue);
 
     // 掉落 count 枚金币到 (x, y) 周围（批三）：数量按变体（Monster::coinDrop()），
     // 多枚时绕掉落中心小半径散开（避免完全重叠、一眼可见数量）
@@ -538,6 +539,11 @@ private:
     // 绘制两座神龛（世界层；按激活状态选「暗/亮」帧——批六乙）。
     // 只画与相机视口相交的项；素材缺失时静默跳过（纯视觉，不影响玩法）
     void renderShrines() const;
+
+    // 绘制怪物等级小字「Lv.n」（批六丙；屏幕空间，血条旁）。
+    // 位置与血条同锚点（插值头顶 + 同样的间隙/高度常量）；血条满血隐藏时
+    // 等级仍显示——玩家在交手前就能读出威胁等级。字体复用 m_smallFont
+    void renderMonsterLevel(const Monster& monster, float alpha) const;
 
     // 绘制水花特效（世界层；Drowning 前 0.4s——缩放 + 淡出）
     void renderSplashFx() const;
@@ -643,9 +649,17 @@ private:
     // 1e-6 = (0.001 像素)²，远小于任何真实瞄准距离
     static constexpr float kAimEpsilonSquared = 1e-6f;
 
-    // 每颗经验宝石的经验值（代码常量，不进配置）：10 点 = 默认曲线第 1 级
-    // 需求（30）的三分之一——升到 2 级需要拾取 3 颗
+    // 每颗经验宝石的「基础」经验值（代码常量，不进配置）：10 点 = 默认曲线
+    // 第 1 级需求（30）的三分之一——升到 2 级需要拾取 3 颗。
+    // 批六丙起实际宝石经验 = round(kGemXpValue x (1 + 10% x (lv-1)))，
+    // 按掉落源怪物等级缩放（纯函数见 game/MonsterLevel.h）
     static constexpr int kGemXpValue = 10;
+
+    // ---- 怪物等级显示（批六丙）：血条旁「Lv.n」小字 ----
+    // 与 Monster::kHpBarWidth/kHpBarHeight/kHpBarGapY 同锚点：文字画在
+    // 血条右缘外 4px、底边与血条底边对齐（满血无血条时同一位置仍显示）
+    static constexpr float kMonsterLevelTextGap = 4.0f; // 文字与血条右缘间隙（像素）
+    static constexpr float kMonsterLevelTextYOffset = -1.0f; // 文字纵向微调（像素；视觉居中）
 
     // 金币掉落的散开半径（像素；批三）：同一次掉落的多枚金币绕中心
     // 均匀分布在这个半径上（2 枚时左右各一、更容易数清）；单枚直接落中心

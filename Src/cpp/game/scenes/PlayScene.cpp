@@ -1,6 +1,7 @@
 #include "game/scenes/PlayScene.h"
 #include "game/scenes/MenuScene.h" // MenuScene：暂停界面按 M 时切换回主菜单（批六乙战绩静默结算后）
 #include "game/Separation.h"       // computeSeparation：重叠兜底与怪怪软分离的最小分离量（批四）
+#include "game/MonsterLevel.h"     // 怪物等级与缩放纯函数（批六丙：梯度/生命/伤害/经验/金币）
 #include "game/CardLayout.h"       // cardPanelRectAt / cardPanelHitTest：卡面板布局共享计算（批五A）
 #include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
 #include "engine/Input.h"          // Input：ctx.input->pressed 查询暂停/重开/回菜单边缘
@@ -1288,12 +1289,16 @@ void PlayScene::update(const UpdateContext& ctx)
                                           (playerBoxNow.y + playerBoxNow.h * 0.5f); // 垂直差
                     const float spawnDistance = std::sqrt(spawnDX * spawnDX + spawnDY * spawnDY); // 距离
 
-                    // 冒烟观测点：怪物出现日志（含变体名与出生距离——批六乙
-                    // 环带配平断言：距离应恒在 520~900；等权随机仍可断言）
+                    // 冒烟观测点：怪物出现日志（批六丙追加等级与区名；
+                    // 含变体名与出生距离——批六乙环带配平断言：距离应恒在
+                    // 520~900；等级/区名供等级梯度与跨区断言）
+                    const ZoneId logZone = zoneAtWorld(
+                        spawnBox.x + spawnBox.w * 0.5f, // 出生点（脚盒）中心 x
+                        spawnBox.y + spawnBox.h * 0.5f); // 出生点（脚盒）中心 y
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "怪物出现（第 %d 只，%s，距玩家 %.0f px）",
+                                "怪物出现（第 %d 只，%s Lv.%d，%s，距玩家 %.0f px）",
                                 m_monsterSpawnedTotal, monsterTypeName(monster.type()),
-                                spawnDistance);
+                                monster.level(), zoneDef(logZone).name, spawnDistance);
                 }
                 break; // 本步至多生成一只（无论成功与否）
             }
@@ -1372,7 +1377,9 @@ void PlayScene::update(const UpdateContext& ctx)
                 // 1) 先盾后血（批五B）：护盾点数先抵扣本次伤害，余量才进入
                 //    扣血；有吸收即打「护盾吸收」日志（冒烟断言点——先盾后血
                 //    的观测顺序：护盾吸收日志先于/取代 扣血日志）
-                int remainingDamage = m_monsterDamage; // 待结算伤害（先盾后血的中间量）
+                // 待结算伤害（先盾后血的中间量）：基础伤害按本怪等级缩放
+                //（伤害 x(1+6%/级)，批六丙；等级 1 = 配置原值）
+                int remainingDamage = scaledMonsterDamage(m_monsterDamage, monster.level());
                 if (m_playerShield > 0 && remainingDamage > 0) // 有盾才走吸收
                 {
                     const int absorbed = std::min(m_playerShield, remainingDamage); // 可吸收量（盾与伤害取小）
@@ -1387,10 +1394,11 @@ void PlayScene::update(const UpdateContext& ctx)
                 {
                     // 2) 扣生命（夹到 0：日志展示永远不为负；扣除量 = 余量）
                     m_playerHp = std::max(m_playerHp - remainingDamage, 0);
-                    // 冒烟观测点：攻击命中（含变体名与扣血明细——断言点）
+                    // 冒烟观测点：攻击命中（批六丙追加等级——高等级怪扣血更多，
+                    // 供「数值缩放随级」断言）
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "怪物攻击命中（%s，扣 %d 点生命，剩余 %d/%d）",
-                                monsterTypeName(monster.type()),
+                                "怪物攻击命中（%s Lv.%d，扣 %d 点生命，剩余 %d/%d）",
+                                monsterTypeName(monster.type()), monster.level(),
                                 remainingDamage, m_playerHp, m_playerMaxHp);
 
                     // 3) 打击音效（低频闷响）：受击反馈的听觉层（视觉 = 击退 + 红染）
@@ -1479,18 +1487,21 @@ void PlayScene::update(const UpdateContext& ctx)
 
             // 经验结算：进度累计 + 按曲线循环结算 + 升级反馈与卡牌欠账
             //（可能连升多级——grantXp 内部循环处理）。
-            // M2：经验值经「慧眼」卡乘算（1 + 20% x 层数，四舍五入；层数 0
-            // 时原值——纯函数见 UpgradeCard.h，选择面板里选到慧眼后立即生效）
-            grantXp(cardInsightXpValue(kGemXpValue, m_cardLevels[static_cast<int>(CardId::Insight)]));
+            // 批六丙：基础经验来自本颗宝石（掉落时按怪物等级定稿）；
+            // M2：最终经验再经「慧眼」卡乘算（1 + 20% x 层数，四舍五入；
+            // 层数 0 时原值——纯函数见 UpgradeCard.h）
+            const int absorbedXp = cardInsightXpValue(
+                gem.xpValue(), m_cardLevels[static_cast<int>(CardId::Insight)]); // 本颗实际吸收经验
+            grantXp(absorbedXp); // 并入进度并处理升级
 
             // 吸收音效沿用 coin.wav（与旧金币收集同一听觉反馈）
             m_audio->play(SoundId::Coin);
 
-            // 冒烟观测点：吸收日志（批四口径：由「拾取经验宝石」改为
-            // 「经验被吸收」——自动吸收语义；进度/需求/等级字段不变）
+            // 冒烟观测点：吸收日志（批六丙追加本颗经验值——经验随级断言；
+            // 进度/需求/等级字段保持原口径）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "经验被吸收（进度 %d/%d，等级 %d）",
-                        m_xp, m_levelCurve.needed(m_level), m_level);
+                        "经验被吸收（经验 %d，进度 %d/%d，等级 %d）",
+                        absorbedXp, m_xp, m_levelCurve.needed(m_level), m_level);
         }
     }
     // 统一清理已被吸收的宝石（保持其余元素的地址不变）
@@ -1964,13 +1975,17 @@ void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
     }
 }
 
-// 掉落一颗经验宝石到 (x, y)：两个坐标指「怪物中心」，内部换算为宝石左上角
-void PlayScene::dropGemAt(float x, float y)
+// 掉落一颗经验宝石到 (x, y)：两个坐标指「怪物中心」，内部换算为宝石左上角。
+// xpValue 为本颗宝石的经验值（批六丙：场景按怪物等级缩放后传入）
+void PlayScene::dropGemAt(float x, float y, int xpValue)
 {
     // 在链表尾部原位构造（节点式容器：插入不搬动既有元素，
     // 实体持有的纹理指针绝不会因扩容被复制——这是选 std::list 的原因）
     m_gems.emplace_back();
     XpGem& gem = m_gems.back(); // 引用新宝石：完成加载与落位
+
+    // 写入经验值（吸收时读它结算；随掉落源等级，不随场上滞留时间变化）
+    gem.setXpValue(xpValue);
 
     // 纹理加载（三级回退在实体内部；失败只记录不中断——该宝石渲染时跳过）
     if (!gem.load(m_renderer))
@@ -2231,17 +2246,24 @@ int PlayScene::findNearestMonster(float centerX, float centerY, float radius,
 void PlayScene::resolveMonsterDeath(Monster& monster, float centerX, float centerY)
 {
     // 击杀结算：计数 +1、原地掉落经验宝石与金币（批三双掉落）。
-    // 金币数按变体查表（史莱姆 1 / 哥布林 2 / 骷髅 1）
+    // 批六丙：宝石经验按掉落源等级缩放（10 x(1+10%/级)）；
+    // 金币数 = 变体基础 + floor((lv-1)/10)（Monster::coinDrop 已含等级）
     ++m_killCount; // 本局击杀 +1（HUD/结算使用）
-    dropGemAt(centerX, centerY);              // 掉落宝石：坐标即怪物中心
-    const int coinCount = monster.coinDrop(); // 本变体的金币掉落数
+    const int gemXp = monsterXpValue(kGemXpValue, monster.level()); // 本颗宝石经验（随级）
+    dropGemAt(centerX, centerY, gemXp);       // 掉落宝石：坐标即怪物中心 + 经验值
+    const int coinCount = monster.coinDrop(); // 本变体的金币掉落数（含等级加成）
     dropCoinsAt(centerX, centerY, coinCount); // 掉落金币（散开可见）
 
     // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
-    // 冒烟观测点：金币掉落日志（数量按变体——冒烟对照断言用）
+    // 冒烟观测点：宝石经验日志（批六丙：经验随怪物等级——冒烟对照断言用）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                "金币掉落（%d 枚，%s）", coinCount, monsterTypeName(monster.type()));
+                "宝石掉落（经验 %d，%s Lv.%d）",
+                gemXp, monsterTypeName(monster.type()), monster.level());
+    // 冒烟观测点：金币掉落日志（批六丙追加等级——数量随级断言用）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "金币掉落（%d 枚，%s Lv.%d）",
+                coinCount, monsterTypeName(monster.type()), monster.level());
 }
 
 // 法术伤害结算（契约见头文件）：与横扫结算同款但飘字颜色区分、不带击退
@@ -3088,13 +3110,18 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
             continue; // 环带外（理论不可达）：换一个候选
         }
 
-        // 全部校验通过：等权随机变体 -> 槽位换皮 -> 落位生成。
-        // 落点同时登记为「巢」（spawnAt 内部写入 AI）——出生点即巢，
-        // 怪物自此绕它巡逻、以它为栓绳圆心
+        // 全部校验通过：等权随机变体 -> 定等级 -> 槽位换皮 -> 落位生成。
+        // 等级（批六丙）：由「出生点所在区 + 出生点到本区神龛距离」决定，
+        // 与玩家当前所在区无关（跨区边界刷怪时等级跟着落点走）；抖动
+        // -1..+1 打散同距离怪物的完美圆环感（公式见 game/MonsterLevel.h）
+        const ZoneId spawnZone = zoneAtWorld(spawnCenterX, spawnCenterY); // 出生点所属区
+        const int levelJitter = static_cast<int>(SDL_rand(3)) - 1; // 等概率 -1/0/+1
+        const int spawnLevel = monsterLevelForSpawn(spawnZone, spawnCenterX, spawnCenterY,
+                                                    levelJitter); // 本只怪等级（已夹区区间）
         const auto variant = static_cast<MonsterType>(
             SDL_rand(static_cast<int>(MonsterType::Count))); // 等权三变体（各 1/3）
         monster.loadVariant(m_renderer, variant);            // 复用槽位换皮（先释放旧纹理）
-        monster.spawnAt(spawnCenterX, spawnCenterY);         // 落位（写生命+巢，快照防拉丝）
+        monster.spawnAt(spawnCenterX, spawnCenterY, spawnLevel); // 落位（写等级+生命+巢，快照防拉丝）
         return true; // 生成成功：调用方接着写日志/累计
     }
 
@@ -3380,6 +3407,7 @@ void PlayScene::render(float alpha)
             continue; // 激活窗口外：跳过绘制
         }
         monster.render(m_renderer, alpha, m_camera); // 存活且激活：绘制（含残影/警示/红染叠加）
+        renderMonsterLevel(monster, alpha);          // 批六丙：血条旁「Lv.n」小字（屏幕空间）
     }
 
     // 法术世界层特效（批五B）：火球/爆炸/冰环/闪电/治疗——画在怪物之后
@@ -3435,6 +3463,55 @@ void PlayScene::render(float alpha)
     // 复活渐暗渐亮（批六乙）：放在最后一层——0.6s 内黑幕 0 -> 255 -> 0，
     // 中点瞬移被全黑遮住；过场期间 HUD 也一起被覆盖，观感是完整的一幕
     renderReviveFade();
+}
+
+// 绘制怪物等级小字「Lv.n」（批六丙）：屏幕空间绘制，锚点与血条完全一致——
+// 头顶插值位置 -> 血条顶边 -> 血条右缘外 4px、底边对齐。血条满血隐藏时
+// 等级仍照常显示（交手前先读等级）。字体复用 16pt 小字号；未加载则跳过
+void PlayScene::renderMonsterLevel(const Monster& monster, float alpha) const
+{
+    // 字体未就绪（加载失败）：静默跳过——玩法不受影响
+    if (!m_smallFont.isLoaded())
+    {
+        return;
+    }
+
+    // 与血条同一条插值位置公式：怪物左上角经 alpha 插值后再取中心
+    const SDL_FPoint topLeft = monster.interpolatedTopLeft(alpha); // 插值左上角（世界坐标）
+    const float barCenterX = topLeft.x + monster.width() * 0.5f;   // 血条水平中心 = 怪物中心
+    const float barTopY = topLeft.y - Monster::kHpBarGapY - Monster::kHpBarHeight; // 血条顶边 y
+
+    // 世界 -> 屏幕换算：等级文字与血条一样按屏幕像素绘制（无缩放相机）
+    const Vec2 screen = m_camera.worldToScreen(barCenterX, barTopY);
+
+    // 等级文本（缓冲足够容纳 "Lv." + 两位数等级）
+    char text[16]; // 文本缓冲
+    SDL_snprintf(text, sizeof(text), "Lv.%d", monster.level()); // 例：Lv.12
+
+    // 文字尺寸由字体实测（中英混排宽度不定，不能按字符数估算）
+    const SDL_FPoint textSize = m_smallFont.measure(text); // 文本像素尺寸
+    if (textSize.x <= 0.0f || textSize.y <= 0.0f) // 字体异常（未加载/空文本）
+    {
+        return; // 防御：不画空纹理
+    }
+
+    // 文字锚点：血条右缘 + 间隙；底边与血条底边对齐（纵向 -1px 视觉微调）
+    const float textX = screen.x + Monster::kHpBarWidth * 0.5f + kMonsterLevelTextGap; // 左边界
+    const float textY = screen.y + Monster::kHpBarHeight - textSize.y + kMonsterLevelTextYOffset; // 上边界
+
+    // 深色半透明小底：亮色文字在雪地/深色地板上都可读（矩形填充，开销低）
+    SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND); // 打开混合（半透明底）
+    SDL_SetRenderDrawColor(m_renderer, 20, 16, 16, 170);         // 近黑 + 约 2/3 不透明
+    const SDL_FRect background{ textX - 2.0f,      // 左右各留 2px 内边距
+                                textY - 1.0f,      // 上下各留 1px 内边距
+                                textSize.x + 4.0f, // 底宽 = 文本宽 + 两侧内边距
+                                textSize.y + 2.0f }; // 底高 = 文本高 + 上下内边距
+    SDL_RenderFillRect(m_renderer, &background); // 绘制底板
+    SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE); // 恢复默认混合（防污染）
+
+    // 文字颜色：浅金色（等级是战斗信息，暖色比纯白更醒目且不抢 HUD）
+    SDL_SetRenderDrawColor(m_renderer, 255, 230, 120, 255); // 字体绘制读取渲染器颜色
+    m_smallFont.draw(m_renderer, text, textX, textY);       // 屏幕空间绘制「Lv.n」
 }
 
 // 绘制两座神龛（批六乙）：世界坐标 -> 相机换算；激活态用亮帧（源 x=64）、

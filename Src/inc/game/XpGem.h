@@ -2,6 +2,7 @@
 #define __XPGEM_H__
 
 #include "engine/Entity.h" // Entity：实体基类（空间/纹理/帧动画公共能力）
+#include <algorithm>       // std::max：经验值注入的非负夹取（批六丙）
 
 // ============================================================
 // XpGem：经验宝石实体（怪物掉落、玩家拾取、旋转帧动画）
@@ -66,6 +67,15 @@ public:
     // 三级回退（精灵表 -> 单帧图 -> 程序化纯色）流程全部收敛在基类
     bool load(SDL_Renderer* renderer);
 
+    // 注入本颗宝石的经验值（批六丙）：怪物死亡时由场景按「基础经验 x
+    // 等级缩放」算好后写入（公式见 game/MonsterLevel.h）。吸收时场景读它
+    // 结算——经验随掉落源等级走，宝石在场上的滞留时间不影响价值。
+    // 负值防御：按 0 处理（调用方错误不产生倒扣经验）
+    void setXpValue(int value) { m_xpValue = std::max(0, value); }
+
+    // 本颗宝石的经验值（吸收结算读取；默认 0 = 未注入，防御路径不涨经验）
+    int xpValue() const { return m_xpValue; }
+
     // 标记为「已被拾取」：场景在碰撞结算后调用，随后的统一清理会移除本对象。
     // 用「标记 + 延迟清理」而不是结算当场析构：避免在遍历集合的过程中
     // 删除元素造成迭代器失效
@@ -96,6 +106,7 @@ private:
     static constexpr int kFrameCount = 4;   // 旋转精灵表总帧数（4 帧 x 18px = 72px 宽）
 
     bool m_picked = false; // 是否已被玩家拾取（拾取后等待场景清理）
+    int m_xpValue = 0;     // 本颗宝石经验值（批六丙：掉落时按怪物等级注入；0 = 未注入）
 
     // ---- 自动吸收运行时（批四）----
     float m_homingSpeed = kHomingSpeedStart; // 当前追踪速度（像素/秒；加速到封顶为止）
