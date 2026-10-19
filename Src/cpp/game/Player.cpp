@@ -327,9 +327,11 @@ void Player::update(const UpdateContext& ctx)
         // 批四：除墙体之外，场景注入的「实心盒」（存活怪物们）同样实心——
         // 玩家撞上怪物滑停、不可重合（额外实心判据由回调提供）
         const SDL_FRect col = collisionRect(); // 本步起点的碰撞盒（世界坐标）
-        const SDL_FPoint moved = m_world->slideMoveEx(col.x, col.y, col.w, col.h,
-                                                      stepDX, stepDY,
-                                                      &Player::solidBlockedCallback, this);
+        // 批六乙：玩家专用入口——水域可通行（入水由场景触发落水），
+        // 墙与怪物实心判据完全不变
+        const SDL_FPoint moved = m_world->slideMovePlayer(col.x, col.y, col.w, col.h,
+                                                          stepDX, stepDY,
+                                                          &Player::solidBlockedCallback, this);
         m_x += moved.x - col.x; // 落定：盒的位移量直接作用于精灵左上角（偏移恒定）
         m_y += moved.y - col.y; // 同上（y 轴）
     }
@@ -378,6 +380,14 @@ void Player::update(const UpdateContext& ctx)
 //（主体剑 + 3 道渐隐残影；扫程位置走共享缓出曲线，与判定同一相位）
 void Player::render(SDL_Renderer* renderer, float alpha, const Camera& camera) const
 {
+    // 落水表现期（批六乙）：下沉 + 淡出的专用绘制——不画武器与受击红染
+    //（死亡过场优先于战斗反馈；alpha 归零后玩家完全不可见）
+    if (m_drownAlpha < 255 || m_drownSinkY > 0.0f)
+    {
+        renderDrownBody(renderer, alpha, camera); // 本体按落水视觉参数绘制
+        return;                                   // 落水过场期间不再叠加武器/红染
+    }
+
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
     //（基类内部完成世界坐标 -> 屏幕坐标的相机换算）
     Entity::render(renderer, alpha, camera);
@@ -476,6 +486,70 @@ void Player::render(SDL_Renderer* renderer, float alpha, const Camera& camera) c
     drawBlade(bladeAngleRad, 255);
 }
 
+// 设置落水表现（批六乙）：参数夹取到合法区间后写入纯渲染状态。
+// 下沉量不允许为负（向上浮起没有落水语义）；不透明度夹到 [0,1]。
+// 复活/重开/进入新对局时调用 setDrownVisual(0.0f, 1.0f) 复位
+void Player::setDrownVisual(float sinkPixels, float opacity01)
+{
+    m_drownSinkY = std::max(0.0f, sinkPixels); // 下沉偏移：负值按 0（不向上浮）
+    m_drownAlpha = static_cast<Uint8>(
+        std::clamp(opacity01, 0.0f, 1.0f) * 255.0f + 0.5f); // 不透明度 -> 8 位 alpha
+}
+
+// 立即取消横扫表现（批六乙）：只清表现计时，战斗数值/冷却/方向不动
+void Player::cancelSwingVisual()
+{
+    m_swingLeft = 0.0f; // 横扫表现窗口关闭：下一帧 render 不再画剑/残影
+}
+
+// 落水表现期的本体绘制（批六乙）：与 Entity::render 同一帧号/插值/翻转
+// 算法，额外叠加「世界坐标下沉偏移」与「纹理 alpha」。只在 Drowning 期间
+// 由 render 分支调用；绘制结束后恢复纹理 alpha（防污染后续绘制）
+void Player::renderDrownBody(SDL_Renderer* renderer, float alpha, const Camera& camera) const
+{
+    // 纹理未加载（极端降级）：没有可画内容
+    if (m_texture == nullptr)
+    {
+        return;
+    }
+
+    // 插值位置 + 下沉偏移：先按固定步插值，再让画面整体向下没入水中。
+    // 逻辑位置 m_x/m_y 不变——碰撞/落水判定仍按水面位置执行
+    const float renderX = m_prevX + (m_x - m_prevX) * alpha;      // 插值后的世界 x
+    const float renderY = m_prevY + (m_y - m_prevY) * alpha + m_drownSinkY; // 插值 y + 下沉量
+
+    // 世界 -> 屏幕换算：与基类绘制同一条相机路径
+    const Vec2 screenPos = camera.worldToScreen(renderX, renderY); // 屏幕绘制点
+
+    // 目标矩形：完整精灵（与 Entity::render 的视觉口径一致）
+    const SDL_FRect dst{ screenPos.x, screenPos.y, m_w, m_h }; // 左上角 + 完整尺寸
+
+    // 帧号换算：防御性夹取子区间（与 Entity::render 逐行同式）
+    const int firstFrame = std::clamp(m_animFirst, 0, m_frameCount - 1); // 区间起点
+    const int lastFrame = (m_animLast < 0)
+        ? m_frameCount - 1
+        : std::clamp(m_animLast, firstFrame, m_frameCount - 1); // 区间终点
+    const int rangeLength = lastFrame - firstFrame + 1; // 子区间长度（含两端）
+    const int frameIndex =
+        firstFrame + static_cast<int>(m_animTime / m_frameTime) % rangeLength; // 当前帧号
+
+    // 源矩形：从精灵表裁出当前帧（单帧图/程序化纹理同样适用）
+    const SDL_FRect src{ static_cast<float>(frameIndex) * m_w, 0.0f, m_w, m_h };
+
+    // 纹理透明度调制：落水淡出只作用于本体（不改变其他实体纹理状态）
+    SDL_SetTextureAlphaMod(m_texture, m_drownAlpha);
+    if (m_flipped) // 朝向翻转：与基类同一路径（旋转 0 度 + 水平镜像）
+    {
+        SDL_RenderTextureRotated(renderer, m_texture, &src, &dst, 0.0, nullptr,
+                                 SDL_FLIP_HORIZONTAL);
+    }
+    else // 常规朝向：快路径直接绘制
+    {
+        SDL_RenderTexture(renderer, m_texture, &src, &dst);
+    }
+    SDL_SetTextureAlphaMod(m_texture, 255); // 还原不透明：防污染后续绘制
+}
+
 // 受击击退（批五A）：沿「伤害来源 -> 玩家」方向被推开 + 红染 + 输入抑制
 //（契约见头文件；PlayScene 在怪物攻击命中时调用）
 void Player::applyHitKnockback(float fromCenterX, float fromCenterY)
@@ -529,6 +603,10 @@ void Player::reset(float x, float y)
     m_knockbackVY = 0.0f;   // 击退速度 y 清零
     m_knockbackLeft = 0.0f; // 击退窗口关闭（输入不再被抑制）
     m_hitTintLeft = 0.0f;   // 红染熄灭
+
+    // 落水表现清零（批六乙）：重开/复活归位后本体恢复完整可见
+    m_drownSinkY = 0.0f;    // 下沉偏移归零
+    m_drownAlpha = 255;     // 不透明度恢复 255
 
     // 挥砍朝向回初始（向右）：新一局的第一个固定步会按鼠标位置重新
     // 决定朝向与瞄准方向，这里只是把状态归到与构造时一致的起点

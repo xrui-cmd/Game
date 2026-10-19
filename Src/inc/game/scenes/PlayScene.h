@@ -21,9 +21,12 @@
 #include "game/ShopLayout.h"    // ShopLayout：商店九宫格布局（渲染与鼠标命中共享，防坐标漂移）
 #include "game/Spell.h"         // Spell：法术池（六法术表/逐层参数/三抽抽取；纯逻辑，tests/spell_test.cpp 直测）
 #include "game/SaveData.h"      // SaveData / BestRecord：最佳战绩的读取、比较与写盘
+#include "game/Shrine.h"        // Shrine：复活点表 / 最近激活点 / 交互范围（批六乙）
+#include "game/RespawnRules.h"  // RespawnRules：升级历史栈与死亡惩罚数学（批六乙，纯逻辑）
 #include <array>                // std::array：本扫程命中记录（按怪物池槽位的定长布尔表）
 #include <list>                 // std::list：经验宝石与漂浮文字集合（节点式容器，迭代稳定）
-#include <vector>               // std::vector：怪物对象池
+#include <string>               // std::string：激活键提示文案（config 的 bind_activate 键名）
+#include <vector>               // std::vector：怪物对象池 / 升级历史栈
 
 // ============================================================
 // PlayScene：对局场景（Roguelike 战斗核心）
@@ -71,8 +74,9 @@
 //        （bladeAngleAt / isAngleInSweep 等，单测覆盖边界）；
 //      - 怪物三变体等权随机刷新（史莱姆 20/90、哥布林 30/110、骷髅 18/140
 //        ——生命/基础速度，数值常量见 Monster.cpp 变体表）；批三正式版
-//        出生规则：在「相机激活区块窗口内」随机 walkable 位置生成、
-//        离玩家 >= 500px；出生点即「巢」——怪物绕巢巡逻（monster_patrol
+//        出生规则；批六乙按甲批观察改为「玩家周围 520~900px 环带」采样
+//        （要求 walkable、避水、激活区块内——恢复遭遇率，其余节奏不变）；
+//        出生点即「巢」——怪物绕巢巡逻（monster_patrol
 //        _radius）、玩家进入仇恨半径（monster_aggro_radius）才追击、
 //        离巢超过栓绳半径（monster_leash_radius）回巢（AI 状态机见
 //        MonsterAi.h，实体执行见 Monster；回巢回血 monster_return_heal
@@ -129,10 +133,19 @@
 //        「金币: N」与各项「层数/上限、价格」；悬停高亮、鼠标点击或
 //        数字键 1~9 购买；金币不足/满层灰显 + 提示；B 或 ESC 关闭；
 //        生效沿用 applyCardEffects 既有路径（与 M2 同一套加成代码）
-//      - 生命归零 -> GameOver；结算最佳战绩（最高击杀/最高等级/最长存活，
-//        仅完整对局比较更新并立即写盘；任一项被破播 record 音效 +「新纪录！」）；
-//      - ESC 暂停/恢复、R 重开、M 回主菜单（输入系统 pressed 边缘，可改键；
-//        中途 M 退出不计战绩——只有生命归零的完整对局参与纪录）。
+//      - 生命归零与落水共用**死亡复活流**（批六乙，GameOver 界面退役）：
+//        惩罚（金币 /2、等级 >1 时 -1 并丢失最近一次升级所得技能、该级
+//        经验清零）-> 渐暗渐亮 0.6s -> 复活于距死亡地点最近的已激活神龛
+//        -> 2s 无敌（静默、无闪烁）；死亡与 M 回菜单都会静默比较并写盘
+//        最佳战绩（仅日志，不再弹「新纪录」界面）；
+//      - 神龛（批六乙）：草地中心默认激活/发亮、雪山靠草地一侧未激活/
+//        灰暗；走近约 64px 显示「按 E 激活」（bind_activate 可改键），
+//        激活后发亮 + 音效 + 日志，本局保持；R 已无触发场景（绑定保留）；
+//      - 海洋开放（批六乙）：玩家可进入水域（怪物仍视为实心）；玩家碰撞盒
+//        与水格重叠 -> Drowning：输入锁定 + 水花 0.4s + 下沉淡出 0.5s
+//        （期间无敌）-> 统一死亡处理；
+//      - ESC 暂停/恢复、M 回主菜单（输入系统 pressed 边缘，可改键）；
+//        落水/复活过场期间暂停与回菜单不响应（输入锁定）。
 //   4. 音效：拾取播 coin、被撞播 hit、生命归零播 gameover、
 //      ESC 暂停/恢复播 pause、破纪录播 record（经 onEnter 注入的 AudioSystem；
 //      降级环境安全空操作）、升级播 levelup（LevelupSfx 游戏层直读，
@@ -156,8 +169,9 @@
 //      F3 切换显隐）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
-// 数据成员的默认值就是初始状态；onEnter 把玩家与怪物池布置到位，
-// R 重开走 restart 复位运行时状态
+// 数据成员的默认值就是初始状态；onEnter 把玩家与怪物池布置到位。
+// restart() 保留为完整复位入口（批六乙 GameOver 退役后按 R 不再触发，
+// 神龛/历史栈等复位逻辑仍保留供未来重开入口复用）
 //
 // 状态机（PlayState）：
 //   Playing  ：接受输入、推进战斗、检测碰撞与刷新、存活时间正计时
@@ -171,8 +185,11 @@
 //              消费，价格随层递增），B 或 ESC 关闭回 Playing（F3 照常；
 //              R/M 不响应——防误触）
 //   Paused   ：世界冻结（含存活计时与飘字动画），ESC 恢复、M 回主菜单
-//   GameOver ：世界冻结（仅因玩家生命归零触发），显示本局等级/击杀/存活与三项最佳战绩，
-//              被破项旁标「新纪录！」并播 record 音效；等待 R 重开或 M 回主菜单
+//               （M 退出前静默比较并写盘本局战绩；旧「中途退出不计」退役）
+//   Drowning ：落水过场（批六乙）：输入锁定、水花 0.4s + 下沉淡出 0.5s、
+//               期间无敌；计时结束进入统一死亡处理（不再有 GameOver 界面）
+//   Reviving ：复活过场（批六乙）：渐暗渐亮共 0.6s；中点把玩家瞬移到
+//               最近已激活神龛并 snapTo 相机；结束回 Playing + 2s 无敌
 // ============================================================
 
 // 对局状态机：用枚举而不是布尔标志，状态互斥关系一眼可见
@@ -182,7 +199,8 @@ enum class PlayState
     LevelUp,  // 升级三选一：世界冻结，仅响应 1/2/3（F3 走事件通道独立生效）
     Shop,     // 商店（批五B）：世界冻结，鼠标/1~9 购买，B/ESC 关闭（F3 照常）
     Paused,   // 暂停：世界冻结，ESC 恢复、M 回主菜单
-    GameOver  // 本局结束：世界冻结，等待玩家按 R 重开或按 M 回主菜单
+    Drowning, // 落水过场（批六乙）：输入锁定、水花/下沉，结束后统一死亡
+    Reviving  // 复活过场（批六乙）：渐暗渐亮、中点神龛复活，结束回 Playing
 };
 
 class PlayScene : public Scene
@@ -203,10 +221,10 @@ public:
     // 暂停/重开/回菜单已迁移为 update 中的 pressed 动作边缘（见 handleInputEdges）
     void handleEvent(const SDL_Event& event) override;
 
-    // 每帧更新：先处理输入动作边缘（暂停/重开/回菜单，任何状态都响应），
-    // 再仅 Playing 状态推进战斗（Paused/GameOver 冻结）。
+    // 每帧更新：先处理输入动作边缘（按状态判据响应），再仅 Playing 状态
+    // 推进战斗（Paused/LevelUp/Shop/Drowning/Reviving 冻结世界本体）。
     // 冻结时会把各实体的插值快照对齐到当前位置，保证画面完全静止不漂移；
-    // 相机只在 Playing 分支推进（暂停/结束自动冻结——规格要求）
+    // 相机只在 Playing 分支推进（暂停/过场自动冻结——规格要求）
     void update(const UpdateContext& ctx) override;
 
     // 每帧渲染：清屏、世界区块（地板/墙/装饰，经相机）、玩家（含横扫表现
@@ -223,12 +241,46 @@ private:
     void restart();
 
     // 输入动作的按下边缘处理：暂停/恢复（Playing <-> Paused）、
-    // 重开（GameOver 下 R）、回菜单（Paused/GameOver 下 M）。
+    // 回菜单（Paused 下 M；退出前静默结算战绩）、神龛激活（Playing 下 E）。
     // pressed 在整帧的所有固定步都为 true，用「本帧已处理」标记去重，
     // 保证每次按下恰好触发一次（行为与事件式完全一致）。
-    // 说明（M2）：LevelUp 状态下三个动作都不响应（防误触）——各分支的
-    // 状态判据天然排除 LevelUp，无需额外分支
+    // 说明（M2/批六乙）：LevelUp/Shop/Drowning/Reviving 下这些动作不响应
+    //（防误触/输入锁定）；R（restart）自 GameOver 退役后无触发分支
     void handleInputEdges(const UpdateContext& ctx);
+
+    // ---- 落水与死亡复活流（批六乙）----
+
+    // 死亡原因：统一死亡处理只用它决定日志文案（惩罚/复活动线完全共用）
+    enum class DeathCause
+    {
+        HpZero,  // 生命归零（怪物攻击结算后）
+        Drowning // 落水（Drowning 过场结束）
+    };
+
+    // 进入落水状态（玩家碰撞盒首次与水格重叠时调用）：
+    //   状态切 Drowning -> 清空提示/扫程 -> 记录水花位置 -> 置满「期间无敌」
+    //   -> 重置玩家下沉表现 -> 快照防拉丝；实际计时推进在 updateDrowning
+    void enterDrowning();
+
+    // 落水过场推进（每固定步）：
+    //   0~0.4s 水花（splashLeft 递减）；0.4~0.9s 下沉/淡出
+    //   （Player::setDrownVisual）；结束调用 beginDeath(Drowning)
+    void updateDrowning(const UpdateContext& ctx);
+
+    // 统一死亡处理（HP 归零与落水共用入口）：
+    //   日志「死亡：生命归零/落水」-> 死亡音 -> 静默结算战绩（比较写盘）
+    //   -> 惩罚（金币减半 / 等级 -1 / 升级历史栈出栈 / 经验清零）
+    //   -> 选最近已激活神龛 -> 切 Reviving（渐暗渐亮 0.6s）
+    // 防重：已处于 Reviving 时直接返回（同帧多次触发只处理一次）
+    void beginDeath(DeathCause cause);
+
+    // 复活过场推进（每固定步）：计时 + 中点（0.3s）瞬移复活 + 终点回
+    // Playing 并给 2s 无敌（静默、无闪烁）
+    void updateReviving(const UpdateContext& ctx);
+
+    // 把玩家瞬移到指定神龛（复活中点调用）：中心对齐神龛、生命回满、
+    // 相机 snapTo、立即刷新激活区块窗口、打「复活于（xxx）」日志
+    void respawnPlayerAtShrine(int shrineIndex);
 
     // 打开（或再弹）升级三选一面板（M2；批五B：抽取对象改为法术池）：
     // 抽一组法术（三张不重复、排除已满层、池不足按实际）-> 有选项则进入
@@ -429,6 +481,9 @@ private:
     // 释放攻击反馈纹理（批五A：alert/hit_fx）并置空（析构兜底；幂等）
     void releaseFeedbackTextures();
 
+    // 释放批六乙事件纹理（shrine/splash）并置空（析构兜底；幂等）
+    void releaseEventTextures();
+
     // 经验结算（拾取宝石时调用）：按升级曲线循环结算，并逐级发放强化与反馈
     // （生命上限+回血、攻击伤害、移速、日志、「升级！」飘字、HUD 瞬闪、音效）。
     // 曲线计算走 LevelCurve 纯函数——本函数只负责把结果落实到局面
@@ -439,9 +494,12 @@ private:
     void spawnFloatingText(const char* text, float centerX, float topY, SDL_Color color,
                            float lifeSeconds = FloatingText::kDefaultLifeSeconds);
 
-    // 最佳战绩结算（生命归零进入 GameOver 时调用一次）：比较三项纪录、
-    // 更新内存快照并立即写盘、记录各项「新纪录」标记（结束界面展示用）。
-    // 仅完整对局走到这里——中途 M 退出（Paused 分支）不会调用本函数
+    // 最佳战绩结算（批六乙口径：死亡时 + M 回菜单时各调用一次）：
+    // 比较三项纪录、更新内存快照，若有新纪录则立即写盘并打日志。
+    // 「静默」= 不再播 record 音效、不弹「新纪录！」界面（GameOver 退役）；
+    // 中途 M 退出同样参与比较写盘（旧「中途退出不计」口径退役）。
+    // 注意：死亡路径在惩罚之前调用——纪录保留死亡瞬间已达成的等级/击杀/
+    // 存活，而不是被惩罚后的等级（调平口径，见批六乙报告）
     void settleRecords();
 
     // 当前存活的怪物数（对象池中 alive 的槽位数；刷新上限的门控依据）
@@ -454,14 +512,14 @@ private:
     // 下限 1s
     float currentSpawnInterval() const;
 
-    // 为指定空槽位寻找落点并生成怪物（批三正式版出生规则）：
-    // 变体等权随机；落点在「相机激活区块窗口」内均匀随机，需同时满足：
-    //   1. 处于当前激活区块窗口内（采样区域即窗口——非激活区不生怪）；
-    //   2. 怪物矩形可走（walkable——不生进墙里）；
-    //   3. 离玩家中心 >= kMonsterSpawnMinPlayerDistance（防贴脸刷新）。
-    // 落点重试上限内找不到（极少：窗口内可走区域被占满等）返回 false，
-    // 本步不生；成功则 loadVariant（换皮）-> spawnAt（落位、出生点即巢）
-    // 并返回 true
+    // 为指定空槽位寻找落点并生成怪物（批三出生规则 + 批六乙配平）：
+    // 变体等权随机；落点采样改为「玩家周围 520~900px 环带」（均匀角度 +
+    // 按面积均匀的半径），需同时满足：
+    //   1. 处于当前激活区块窗口内（非激活区不生怪）；
+    //   2. 怪物碰撞盒可走（isRectWalkable 含墙+水——不生进墙里/水里）；
+    //   3. 圆心距落在 [520,900]（环带采样天然满足，防御校验保留）。
+    // 落点重试上限内找不到（极少：环带被墙/水占满等）返回 false，本步不生；
+    // 成功则 loadVariant（换皮）-> spawnAt（落位、出生点即巢）并返回 true
     bool spawnMonsterAtSlot(Monster& monster);
 
     // 把与玩家碰撞盒重叠的怪物按最小分离量推出（批四·体积碰撞兜底）：
@@ -474,8 +532,18 @@ private:
     void separateOverlappingMonsters();
 
     // 绘制 HUD 文字/条（生存 HUD：HP 条、等级+经验条、击杀/存活；
-    // FPS 调试行；暂停/结束叠层与结算界面）
+    // FPS 调试行；暂停/升级/商店叠层；神龛激活提示）
     void renderHud();
+
+    // 绘制两座神龛（世界层；按激活状态选「暗/亮」帧——批六乙）。
+    // 只画与相机视口相交的项；素材缺失时静默跳过（纯视觉，不影响玩法）
+    void renderShrines() const;
+
+    // 绘制水花特效（世界层；Drowning 前 0.4s——缩放 + 淡出）
+    void renderSplashFx() const;
+
+    // 绘制复活渐暗渐亮遮罩（Reviving 期间；0.6s 内 alpha 0->1->0）
+    void renderReviveFade() const;
 
     // 采样本渲染帧的间隔时间并做 EMA 平滑（render 每帧开头调用）。
     // FPS 反映的是渲染性能，与固定步长逻辑无关，暂停时也照常采样
@@ -529,6 +597,18 @@ private:
     // 受击的可读反馈由玩家的击退与红染承担（见 Player::applyHitKnockback）
     static constexpr float kPlayerInvincibleSeconds = 0.8f;
 
+    // ---- 落水与死亡复活流（批六乙；代码常量，不进配置）----
+    static constexpr float kDrownSplashSeconds = 0.4f; // 水花时长（秒；规格约 0.4）
+    static constexpr float kDrownSinkSeconds = 0.5f;   // 下沉/淡出时长（秒；规格约 0.5）
+    static constexpr float kDrownSinkPixels = 28.0f;   // 下沉总位移（像素；观感值）
+    static constexpr float kDrownSplashSize = 64.0f;   // splash.png 绘制基准边长（像素）
+    static constexpr float kReviveFadeSeconds = 0.6f;  // 渐暗渐亮合计时长（秒；规格）
+    static constexpr float kReviveInvincibleSeconds = 2.0f; // 复活后无敌时长（秒；规格）
+    static constexpr float kShrineDrawWidth = 64.0f;   // 神龛绘制宽（像素；素材每帧宽）
+    static constexpr float kShrineDrawHeight = 80.0f;  // 神龛绘制高（像素；素材帧高）
+    static constexpr float kShrineDrawLift = 64.0f;    // 神龛绘制的纵向抬升（像素；底部贴近落点）
+    static constexpr float kShrinePromptYRatio = 0.82f; // 激活提示纵位置（屏高比例）
+
     // ---- 区名横幅（批六甲·双区世界）----
     // 玩家过区（含进局/重开后的首次判定）时区名大字浮现的时长与淡入淡出
     // 包络：总 1.5s = 淡入 0.3s + 保持 + 淡出 0.6s；透明度经渲染绘制色
@@ -547,13 +627,16 @@ private:
     // 在窗口矩形内均匀随机取点——「世界里的怪从世界里冒出来」，
     // 而不是围着玩家画环形。窗口已由 World 回钳在世界内，取点不会出界
 
-    // 与玩家的最小中心距离（像素）：规格硬要求——出生点不可近于 500px，
-    // 防止「贴脸刷新」（玩家没有反应时间）；重试上限内取不到就本步不生
-    static constexpr float kMonsterSpawnMinPlayerDistance = 500.0f;
+    // 刷新环带（批六乙配平；像素）：落点距玩家中心 520~900。
+    // 规格「玩家周围 520~900px 环带」——下界防贴脸、上界保证遇敌节奏；
+    // 采样要求 walkable、避水、激活区块内（见 spawnMonsterAtSlot）
+    static constexpr float kMonsterSpawnRingMin = 520.0f; // 环带内径（像素）
+    static constexpr float kMonsterSpawnRingMax = 900.0f; // 环带外径（像素）
 
-    // 找落点的重试上限（次）：随机撞墙/撞近距离的放弃阈值——
-    // 上限内找不到就本步不生（下一刷新时刻再试），不会死循环
-    static constexpr int kMonsterSpawnAttempts = 30;
+    // 找落点的重试上限（次）：环带采样可能撞墙/撞水/出激活窗口——
+    // 上限内找不到就本步不生（下一刷新时刻再试），不会死循环。
+    // 批六乙由 30 提到 64：环带面积比整窗口小，保持同样的生成成功率
+    static constexpr int kMonsterSpawnAttempts = 64;
 
     // 瞄准零向量的判定阈值（像素²）：鼠标与玩家中心的距离比它更近时视为
     // 零向量（没有方向可言），攻击方向回退到玩家面向（见 resolvePlayerAttack）。
@@ -584,7 +667,7 @@ private:
     static constexpr float kLevelupTextLifeSeconds = 1.2f;
 
     static constexpr float kHudPtSize = 32.0f;  // HUD/提示文字字号（像素高，小数需求清晰）
-    static constexpr float kBigPtSize = 64.0f;  // 暂停/结束标题字号（大号观感）
+    static constexpr float kBigPtSize = 64.0f;  // 暂停标题/区名横幅字号（大号观感）
     static constexpr float kCardPtSize = 24.0f; // 面板小字字号（升级卡描述/层数；M2/批五B）
     static constexpr float kSmallPtSize = 16.0f; // 商店效果描述小字（静态效果/数值对比/层数/价格；批六甲）
 
@@ -657,7 +740,7 @@ private:
 
     // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
     Font m_hudFont;  // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
-    Font m_bigFont;  // 大号标题（暂停 / 游戏结束 / 区名横幅）
+    Font m_bigFont;  // 大号标题（暂停 / 区名横幅）
     Font m_cardFont; // 升级三选一面板的小字号文字（卡描述/层数标注；M2）
     Font m_smallFont; // 商店效果描述小字号（静态/对比/层数/价格；批六甲·第四笔）
 
@@ -690,6 +773,12 @@ private:
     // 加载失败只警告、对应表现跳过（游戏照常）
     SDL_Texture* m_alertTexture = nullptr;        // 蓄力警示「!」（alert.png）
     SDL_Texture* m_monsterHitFxTexture = nullptr; // 命中爪痕（monster_hit_fx.png）
+
+    // 批六乙事件纹理（场景自持，析构释放——renderer 尚在时安全）：
+    // shrine.png 两帧横向（暗/亮），splash.png 单帧；两者均为可选增强，
+    // 加载失败只警告、对应表现跳过（玩法照常）
+    SDL_Texture* m_shrineTexture = nullptr; // 神龛两态表（每帧 64x80；亮帧发亮）
+    SDL_Texture* m_splashTexture = nullptr; // 落水水花（64x64；代码做缩放+淡出）
 
     // 升级音效播放器（游戏层直读 assets/sounds/levelup.wav）：
     // 引擎 AudioSystem 是固定 6 音效的强类型枚举、没有 LevelUp，而本批
@@ -725,6 +814,11 @@ private:
     float m_monsterAttackCooldown = kDefaultMonsterAttackCooldown; // 怪物攻击冷却（monster_attack_cooldown，秒）
     float m_coinMagnetRadius = kDefaultCoinMagnetRadius;  // 金币磁吸半径（coin_magnet_radius，像素）
 
+    // 神龛激活键名（批六乙）：读取 config 的 bind_activate（默认 "E"），
+    // 只用于提示文案「按 X 激活」——实际按键绑定由 GameDev 的输入系统完成。
+    // 整局沿用（配置在启动时读取；R 重开不重读）
+    std::string m_activateKeyLabel = "E";
+
     // 怪物生态参数（批三；AI 状态机的决策半径与回血——onEnter 读取后
     // 注入每个怪物槽位的 MonsterAi；整局沿用，R 重开不重读）
     float m_monsterPatrolRadius = kDefaultMonsterPatrolRadius; // 巡逻半径（monster_patrol_radius，像素）
@@ -742,7 +836,7 @@ private:
     LevelCurve m_levelCurve; // 经验曲线（base/growth 从 xp_* 键注入）
 
     // ---- 战斗运行时状态（restart 复位）----
-    int m_playerHp = kDefaultPlayerHp;   // 玩家当前生命（归零 -> GameOver）
+    int m_playerHp = kDefaultPlayerHp;   // 玩家当前生命（归零 -> 统一死亡复活流）
     int m_killCount = 0;                 // 本局累计击杀数（击杀日志/HUD/结算使用）
     int m_coinCount = 0;                 // 局内货币：本局累计金币数（批三掉落；批五B 起由商店消费）
     int m_level = 1;                     // 当前等级（restart 复位为 1；升级只增不减）
@@ -774,6 +868,10 @@ private:
     //（逐帧清理，容量自然稳定）。素材纹理由本类自持（析构释放，幂等）
     int m_spellLevels[kSpellCount] = {};         // 各法术层数（下标与 SpellId 一一对应；R 重开清零）
     float m_spellCooldownLeft[kSpellCount] = {}; // 各法术剩余冷却（秒；独立计时、仅 Playing 递减）
+    // 升级历史栈（批六乙）：每次三选一确认入栈（法术 + 选择后层数快照）；
+    // 死亡且等级 > 1 时出栈最近一笔——该法术层数 -1，归零即停止施法/图标消失。
+    // 出栈数学抽在 game/RespawnRules.h（纯函数，tests/respawn_test.cpp 直测）
+    std::vector<UpgradeChoiceRecord> m_upgradeHistory;
     int m_playerShield = 0;                      // 当前护盾点数（先盾后血；HUD 显示；R 重开清零）
     std::vector<Fireball> m_fireballs;           // 飞行中的火球（命中/到点爆炸后移除）
     std::vector<FireballBlastFx> m_fireballBlasts; // 火球爆炸特效（0.3s 渐隐）
@@ -790,19 +888,16 @@ private:
     bool m_cardClickHandled = false;     // 左键按下边缘去重标记（同帧多固定步只响应一次）
 
     // ---- 最佳战绩（onEnter 读档快照；restart 不重读——本局比较基准从头到尾一致）----
-    BestRecord m_best;             // 开赛时的历史最佳；GameOver 结算后就地更新为最新纪录
-    bool m_newKillRecord = false;  // 本局破最高击杀（结束界面「新纪录！」标记；restart 清）
-    bool m_newLevelRecord = false; // 本局破最高等级（同上）
-    bool m_newTimeRecord = false;  // 本局破最长存活（同上）
+    BestRecord m_best; // 开赛时的历史最佳；死亡/M 退出结算后就地更新为最新纪录
+                       //（批六乙起不再有 GameOver 界面与「新纪录」标记）
 
-    // 本局存活时间（秒）：仅 Playing 正计时（暂停/结束冻结），restart 清零。
-    // 从「倒计时」改为「正向累积」——GameOver 仅由生命归零触发，存活时间
-    // 成为结算展示的成就性数据（mm:ss 格式在 HUD/结束界面呈现）
+    // 本局存活时间（秒）：仅 Playing 正计时（暂停/面板/落水/复活过场冻结），
+    // restart 清零。正向累积——死亡时参与最佳战绩比较（mm:ss 在 HUD 呈现）
     float m_survivalSeconds = 0.0f;
 
     // 玩家剩余无敌时间（秒；0 = 未处于无敌）；受击时重置为满值，
-    // 仅 Playing 状态递减——暂停/结束时冻结（批五A：静默计时，
-    // 不再有任何渲染表现——受击反馈由击退与红染承担）
+    // 仅 Playing 状态递减——暂停/过场时冻结（批五A：静默计时，
+    // 不再有任何渲染表现；批六乙：复活完成后重置为 2s）
     float m_playerInvincibleLeft = 0.0f;
 
     // ---- 分区运行时（批六甲；restart 复位）----
@@ -812,6 +907,19 @@ private:
     // 暂停/商店/升级面板下横幅随世界一起冻结
     ZoneId m_currentZone = ZoneId::Count; // 玩家中心当前所属区（未判定哨兵）
     float m_zoneBannerLeft = 0.0f;        // 区名横幅剩余时长（秒；0 = 不显示）
+
+    // ---- 神龛运行时（批六乙；restart 复位）----
+    bool m_shrineActive[kShrineCount] = { true, false }; // 各神龛激活状态（草地亮/雪山暗）
+    int m_shrinePromptIndex = -1;   // 当前可激活神龛下标（-1 = 无提示）
+    bool m_activateHandled = false; // 激活键按下边缘去重标记（同帧多固定步只响应一次）
+
+    // ---- 落水与死亡复活运行时（批六乙；restart 复位）----
+    float m_drownElapsed = 0.0f;      // 落水过场已进行时长（秒）
+    float m_splashLeft = 0.0f;        // 水花剩余时长（秒；0 = 不画）
+    SDL_FPoint m_splashPos{};         // 水花中心（世界坐标；进入落水时记录）
+    float m_reviveTimer = 0.0f;       // 复活过场已进行时长（秒）
+    bool m_reviveTeleported = false;  // 是否已到中点完成瞬移（防重复瞬移）
+    int m_reviveShrineIndex = -1;     // 本次复活选中的神龛下标（死亡时确定）
 
     // ---- 怪物刷新运行时（restart 复位）----
     float m_monsterElapsed = 0.0f;       // 局内已过秒数（仅 Playing 递增；难度计时基准）
@@ -831,9 +939,8 @@ private:
     // pressed 在整帧的所有固定步都为 true（引擎按渲染帧采样），若不做去重，
     // 一帧内补多个固定步会让暂停这类切换动作被响应多次；该标记把响应
     // 折叠为「每个上升沿恰好一次」。动作松开后标记随采样自然复位
-    bool m_pauseHandled = false;   // 暂停/恢复动作本帧是否已处理
-    bool m_restartHandled = false; // 重开动作本帧是否已处理
-    bool m_menuHandled = false;    // 回菜单动作本帧是否已处理
+    bool m_pauseHandled = false; // 暂停/恢复动作本帧是否已处理
+    bool m_menuHandled = false;  // 回菜单动作本帧是否已处理
 
     // ---- FPS / 帧时间显示 ----
     // 显示内容：左下角 "FPS: 59.9 | 16.7 ms"。数值来自渲染帧间隔的

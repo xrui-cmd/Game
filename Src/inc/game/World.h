@@ -27,10 +27,11 @@ class Camera;
 //   2. 确定性生成：地板变体 / 墙体布局 / 装饰全部由「格坐标 + 世界种子」
 //      哈希产生——同样的种子逐格一致（同一局内卸载再载入内容不变），
 //      不同种子得到不同布局（0 种子 = 每局随机，由调用方换一个非 0 种子）；
-//   3. 墙体规则（批六甲·区块放大后按面积调整；海洋边界为批六甲第二笔）：
-//      - 世界最外 2 圈格恒为海洋水域（取代原一圈边界墙：外观与几何先落，
-//        通行语义等同旧墙——玩家与怪物都不可进入；「玩家可入水 + 落水
-//        动画 + 死亡复活」归批六乙）；
+//   3. 墙体规则（批六甲·区块放大后按面积调整；海洋边界为批六甲第二笔；
+//      批六乙起海洋对玩家开放）：
+//      - 世界最外 2 圈格恒为海洋水域（取代原一圈边界墙）。批六乙起：
+//        玩家可进入水域（碰撞盒与水格重叠 -> PlayScene 的 Drowning），
+//        怪物仍视水域为实心（isRectWalkable 保持墙+水双判据）；
 //      - 每区块确定性随机生成 6~10 个「短墙段 / 直角块 / 2x2 块」结构
 //        （线段 3~7 格；32 格区块的密度观感与旧 16 格区块 3~5 个相当），
 //        密度适中不堵死；
@@ -43,8 +44,10 @@ class Camera;
 //      雪山区用冰霜重染色版（批六甲第三笔）；滑出窗口的区块释放纹理。
 //      实体（怪物）是否更新/渲染由场景按 isPointInActiveChunks 门控——
 //      非激活区暂停但不删除；
-//   5. 格级碰撞：isRectWalkable 查「矩形覆盖的全部格是否无墙且非水域」；
-//      slideMove 提供「分轴位移 + 撞墙滑动」的纯函数——玩家与怪物共用。
+//   5. 格级碰撞：isRectWalkable 查「矩形覆盖的全部格是否无墙且非水域」
+//      （怪物/刷新/落点校验口径）；玩家自批六乙起走 slideMovePlayer：
+//      墙仍实心、水可通行（入水即由场景进入落水流）。两者共用同一套
+//      「分轴位移 + 撞墙滑动 + 子步防穿透」实现（仅水判据不同）。
 //
 // 坐标约定（与 Camera 一致）：
 //   - 世界坐标（像素）：世界左上角为原点，y 向下；格索引 = floor(像素 / 48)；
@@ -78,8 +81,13 @@ public:
     static constexpr int kSpawnSafeRadius = 3;
 
     // 海洋边界厚度（格）：世界最外 kWaterRingCells 圈格恒为水域（批六甲·
-    // 海洋边界——取代原 1 圈边界墙；通行语义同旧墙：实体不可进入）
+    // 海洋边界——取代原 1 圈边界墙）。批六乙：玩家可进入、怪物不可进入
     static constexpr int kWaterRingCells = 2;
+
+    // 神龛保护区半径（格）：两座复活点（草地/雪山）周围 ±kShrineSafeRadius
+    // 的方形区域内不放随机墙与装饰——保证复活落点永远可走、可接近
+    //（批六乙；雪山神龛不在出生保护区内，必须单独保护）
+    static constexpr int kShrineSafeRadius = 3;
 
     World() = default;
 
@@ -111,7 +119,8 @@ public:
 
     // 指定格是否海洋水域（批六甲·海洋边界：最外 kWaterRingCells 圈格）。
     // 越界/未生成恒 false（水域只在世界内部；世界外由 wallAt 兜底）。
-    // 注意：水域对碰撞的语义见 isRectWalkable——墙与水域都不可走
+    // 注意：水域对碰撞的语义见 isRectWalkable（怪物/刷新：不可走）与
+    // isRectWalkableEx(allowWater=true)（玩家：可入水，由场景触发落水）
     bool waterAt(int cellX, int cellY) const;
 
     // 指定格的地板变体索引（0..7，对应 tiles_floor.png 的 8 帧）。
@@ -125,10 +134,22 @@ public:
 
     // 矩形（世界坐标）是否可走：其覆盖的全部格都不是墙、也不是水域。
     // 边界贴合不算碰撞（右/下边缘减 0.01px 的亚像素容差——与引擎
-    // rectsOverlap 的「刚好贴合不算碰撞」同一约定）。世界外视为墙
+    // rectsOverlap 的「刚好贴合不算碰撞」同一约定）。世界外视为墙。
+    // 口径 = 怪物/出生/落点校验（水域是实心障碍）
     bool isRectWalkable(const SDL_FRect& rect) const;
 
-    // 单点是否可走（出生/掉落落点的快速校验）
+    // 带「水是否可走」开关的完整可走查询（批六乙）：
+    //   - allowWater = false：墙与水域都不可走（等价 isRectWalkable）；
+    //   - allowWater = true ：仅墙不可走（玩家移动口径——水可进入，
+    //     是否落水由场景按「碰撞盒与水格重叠」另行判定）。
+    // 世界外仍恒不可走；容差约定与 isRectWalkable 完全一致
+    bool isRectWalkableEx(const SDL_FRect& rect, bool allowWater) const;
+
+    // 矩形是否与任一水格重叠（批六乙·落水判定）：按矩形覆盖的格范围
+    // 逐格查水域，命中任一即 true。世界外/未生成恒 false（水域只在世界内）
+    bool rectTouchesWater(const SDL_FRect& rect) const;
+
+    // 单点是否可走（出生/掉落落点的快速校验；水与墙都不可走）
     bool isPointWalkable(float x, float y) const;
 
     // 分轴位移 + 撞墙滑动（纯函数，不改内部状态）：
@@ -153,6 +174,14 @@ public:
     // extraSolid 传 nullptr = 只查世界墙体（等价于 slideMove）
     SDL_FPoint slideMoveEx(float x, float y, float w, float h, float dx, float dy,
                            ExtraSolidFn extraSolid, void* context) const;
+
+    // 玩家版分轴位移（批六乙）：与 slideMoveEx 同一套子步/分轴/额外实心
+    // 算法，唯一差异是「水域可通行」（allowWater = true）。玩家因此可以
+    // 走进海洋；进入后由场景按 rectTouchesWater 切换 Drowning。
+    // 怪物仍使用 slideMoveEx（水是实心）——两者的通行差异只在调用入口，
+    // 不靠任何全局开关，避免状态污染
+    SDL_FPoint slideMovePlayer(float x, float y, float w, float h, float dx, float dy,
+                               ExtraSolidFn extraSolid, void* context) const;
 
     // ---- 区块索引与激活窗口 ----
 
@@ -216,12 +245,22 @@ private:
     void generateChunkStructures();
 
     // 尝试把格 (cellX, cellY) 设为随机墙：跳过世界水圈/区块边缘一圈/
-    // 出生保护区（这些区域的通行性是硬保证），其余情形置墙（已墙则无操作）
+    // 出生保护区/神龛保护区（这些区域的通行性是硬保证），其余情形置墙
+    // （已墙则无操作）
     void setRandomWall(int cellX, int cellY);
 
     // 是否处于出生保护区（出生中心格 ±kSpawnSafeRadius；批六甲起中心为
     // 草地区中心，见 spawnCenter）
     bool inSpawnSafeZone(int cellX, int cellY) const;
+
+    // 是否处于任一神龛保护区（两座复活点 ±kShrineSafeRadius 格；批六乙）：
+    // 随机墙/装饰生成时跳过——复活落点与近旁永远可走（雪山神龛尤其需要）
+    bool inShrineSafeZone(int cellX, int cellY) const;
+
+    // 分轴位移的统一实现（批六乙抽出）：allowWater 决定水是否实心，
+    // 其余算法与既有 slideMove/slideMoveEx 逐行一致（无行为回归）
+    SDL_FPoint slideMoveInternal(float x, float y, float w, float h, float dx, float dy,
+                                 bool allowWater, ExtraSolidFn extraSolid, void* context) const;
 
     // 出生中心点（世界坐标）：= 草地区复活点（zoneDef(Grass).respawn），
     // 经「保护区半径 + 2 格」的边距夹到世界内部（自定义小世界防御——

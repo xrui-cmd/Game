@@ -1,5 +1,6 @@
 #include "game/World.h"
 #include "game/Zone.h"            // ZoneDef / zoneDef：出生点（草地区中心）与分区数值来源（批六甲）
+#include "game/Shrine.h"           // kShrineDefs：神龛保护区（复活点周围不生成墙/装饰；批六乙）
 #include "engine/Camera.h"        // Camera：激活窗口跟随相机视图中心（position/viewport 查询）
 #include <SDL3_image/SDL_image.h> // IMG_LoadTexture：加载世界素材（地砖/墙/装饰）
 #include <algorithm>              // std::clamp / std::min / std::max：尺寸防御与窗口夹取
@@ -245,9 +246,10 @@ void World::generateChunkStructures()
                 // 跳过与否只影响本格，不影响后续随机序列的推进顺序）
                 const uint8_t decorType = static_cast<uint8_t>(1 + nextRandom() % 2);
 
-                // 出生保护区不放装饰（出生点近旁保持干净）、墙上与水域
+                // 出生保护区/神龛保护区不放装饰（近旁保持干净）、墙上与水域
                 // 不放（装饰只摆在地板上）；其余照摆
-                if (inSpawnSafeZone(cellX, cellY) || wallAt(cellX, cellY) || waterAt(cellX, cellY))
+                if (inSpawnSafeZone(cellX, cellY) || inShrineSafeZone(cellX, cellY) ||
+                    wallAt(cellX, cellY) || waterAt(cellX, cellY))
                 {
                     continue; // 本装饰作废（随机序列已正常推进，确定性不受影响）
                 }
@@ -257,7 +259,7 @@ void World::generateChunkStructures()
     }
 }
 
-// 尝试把格 (cellX, cellY) 设为随机墙（带三重豁免）
+// 尝试把格 (cellX, cellY) 设为随机墙（带四重豁免：水圈/区块边缘/出生/神龛）
 void World::setRandomWall(int cellX, int cellY)
 {
     // 豁免一：世界最外 kWaterRingCells 圈（海洋边界由独立步骤恒置，
@@ -290,6 +292,13 @@ void World::setRandomWall(int cellX, int cellY)
         return; // 保护区内：不参与随机结构
     }
 
+    // 豁免四（批六乙）：神龛保护区——两座复活点周围同样不放随机墙，
+    // 否则雪山复活点可能被随机墙覆盖/围死，复活落点将不可走
+    if (inShrineSafeZone(cellX, cellY))
+    {
+        return; // 神龛保护区内：不参与随机结构
+    }
+
     // 通过全部豁免：置墙（已是墙则重复写入，无副作用）
     m_walls[static_cast<size_t>(cellY) * static_cast<size_t>(cellsX()) + static_cast<size_t>(cellX)] = 1;
 }
@@ -302,6 +311,30 @@ bool World::inSpawnSafeZone(int cellX, int cellY) const
            cellX <= m_spawnCellX + kSpawnSafeRadius &&
            cellY >= m_spawnCellY - kSpawnSafeRadius &&
            cellY <= m_spawnCellY + kSpawnSafeRadius;
+}
+
+// 是否处于任一神龛保护区（两座复活点 ±kShrineSafeRadius 格的方形区域）。
+// 自定义小世界：神龛坐标可能落在世界外，此时对应的格区间不会命中任何
+// 生成格，函数自然返回 false——不需要额外夹取（防御由「无交集」保证）
+bool World::inShrineSafeZone(int cellX, int cellY) const
+{
+    // 逐座神龛判断：任一命中即属于保护区
+    for (int i = 0; i < kShrineCount; ++i)
+    {
+        const ShrineDef& shrine = kShrineDefs[i]; // 本座神龛定义（世界坐标）
+        const int shrineCellX = cellFloored(shrine.x); // 神龛中心所在格 x
+        const int shrineCellY = cellFloored(shrine.y); // 神龛中心所在格 y
+
+        // 两轴闭区间都在保护半径内：本格属于该神龛保护区
+        if (cellX >= shrineCellX - kShrineSafeRadius &&
+            cellX <= shrineCellX + kShrineSafeRadius &&
+            cellY >= shrineCellY - kShrineSafeRadius &&
+            cellY <= shrineCellY + kShrineSafeRadius)
+        {
+            return true; // 命中任一座神龛保护区
+        }
+    }
+    return false; // 两座神龛的保护区都未命中
 }
 
 // ============================================================
@@ -376,6 +409,13 @@ int World::decorAt(int cellX, int cellY) const
 // ============================================================
 bool World::isRectWalkable(const SDL_FRect& rect) const
 {
+    // 便捷入口：allowWater = false（墙 + 水都不可走）——怪物/刷新/落点口径
+    return isRectWalkableEx(rect, false);
+}
+
+// 带「水是否可走」开关的完整可走查询（批六乙抽出；见头文件契约）
+bool World::isRectWalkableEx(const SDL_FRect& rect, bool allowWater) const
+{
     // 亚像素容差：右/下边缘恰好压在格线上时不算「碰到下一格」——与引擎
     // rectsOverlap「刚好贴合不算碰撞」的约定一致（否则贴墙站位会有半像素
     // 级的伪碰撞，滑动观感变差）
@@ -387,20 +427,54 @@ bool World::isRectWalkable(const SDL_FRect& rect) const
     const int maxCellX = cellFloored(rect.x + rect.w - kEdgeEpsilon); // 右边界格（含）
     const int maxCellY = cellFloored(rect.y + rect.h - kEdgeEpsilon); // 下边界格（含）
 
-    // 覆盖区域内任一格是墙或是水域 -> 不可走（全部无墙且非水域才可走）。
-    // 批六甲：海洋边界与墙同为硬障碍（本批水域语义 = 旧边界墙——玩家与
-    // 怪物都进不去；「玩家入水」归批六乙）
+    // 覆盖区域内任一格是墙 -> 不可走；水域按 allowWater 决定是否阻挡。
+    // 批六乙：怪物走 isRectWalkable（水实心）；玩家走 slideMovePlayer
+    // （水可通行）——两者的差异只在这一个布尔开关
     for (int cellY = minCellY; cellY <= maxCellY; ++cellY)
     {
         for (int cellX = minCellX; cellX <= maxCellX; ++cellX)
         {
-            if (wallAt(cellX, cellY) || waterAt(cellX, cellY))
+            if (wallAt(cellX, cellY)) // 墙体：任何实体都不可走
             {
-                return false; // 命中墙体或水域：矩形不可走
+                return false; // 命中墙体：矩形不可走
+            }
+            if (!allowWater && waterAt(cellX, cellY)) // 水：仅在禁止入水时阻挡
+            {
+                return false; // 命中水域且水不可走：矩形不可走
             }
         }
     }
-    return true; // 覆盖范围全部无墙且非水域：可走
+    return true; // 覆盖范围通过全部判据：可走
+}
+
+// 矩形是否与任一水格重叠（批六乙·落水判定入口）
+bool World::rectTouchesWater(const SDL_FRect& rect) const
+{
+    // 未生成：没有水域可言（防御——与 waterAt 的未生成分支同口径）
+    if (m_water.empty())
+    {
+        return false;
+    }
+
+    // 与可走查询同一套边界容差：刚好贴合格线不算重叠（避免岸边误判落水）
+    constexpr float kEdgeEpsilon = 0.01f;
+    const int minCellX = cellFloored(rect.x);                        // 左边界格
+    const int minCellY = cellFloored(rect.y);                        // 上边界格
+    const int maxCellX = cellFloored(rect.x + rect.w - kEdgeEpsilon); // 右边界格（含）
+    const int maxCellY = cellFloored(rect.y + rect.h - kEdgeEpsilon); // 下边界格（含）
+
+    // 逐格查水：任一格是水即视为「碰撞盒与水格重叠」
+    for (int cellY = minCellY; cellY <= maxCellY; ++cellY)
+    {
+        for (int cellX = minCellX; cellX <= maxCellX; ++cellX)
+        {
+            if (waterAt(cellX, cellY)) // 本格是水域
+            {
+                return true; // 命中任一水格：触发落水判定
+            }
+        }
+    }
+    return false; // 覆盖范围内没有水格
 }
 
 // 单点可走查询（出生/掉落落点的快速校验）
@@ -417,12 +491,28 @@ bool World::isPointWalkable(float x, float y) const
 SDL_FPoint World::slideMove(float x, float y, float w, float h, float dx, float dy) const
 {
     // 直接转发完整版：extraSolid = nullptr = 只查世界墙体（旧调用点零改动）
-    return slideMoveEx(x, y, w, h, dx, dy, nullptr, nullptr);
+    return slideMoveInternal(x, y, w, h, dx, dy, false, nullptr, nullptr);
 }
 
 // 分轴位移 + 撞墙滑动（带「额外实心体」的完整版，见头文件契约）
 SDL_FPoint World::slideMoveEx(float x, float y, float w, float h, float dx, float dy,
                               ExtraSolidFn extraSolid, void* context) const
+{
+    // 怪物/既有调用口径：水是实心（allowWater = false）
+    return slideMoveInternal(x, y, w, h, dx, dy, false, extraSolid, context);
+}
+
+// 玩家版分轴位移（批六乙）：与 slideMoveEx 同一算法，仅水域可通行
+SDL_FPoint World::slideMovePlayer(float x, float y, float w, float h, float dx, float dy,
+                                  ExtraSolidFn extraSolid, void* context) const
+{
+    // 玩家口径：水可通行（allowWater = true）——入水后由场景触发落水流
+    return slideMoveInternal(x, y, w, h, dx, dy, true, extraSolid, context);
+}
+
+// 分轴位移的统一实现（批六乙抽出；allowWater 决定水是否实心）
+SDL_FPoint World::slideMoveInternal(float x, float y, float w, float h, float dx, float dy,
+                                    bool allowWater, ExtraSolidFn extraSolid, void* context) const
 {
     // 零位移快速路径：不产生任何查询
     if (dx == 0.0f && dy == 0.0f)
@@ -449,7 +539,7 @@ SDL_FPoint World::slideMoveEx(float x, float y, float w, float h, float dx, floa
         const SDL_FRect nextX{ x + stepX, y, w, h }; // X 轴候选矩形
         // 墙判据 + 额外实心判据（extraSolid 为空 = 只查墙；短路顺序：
         // 先查墙——墙是静态数据、查询更便宜）
-        const bool blockedX = !isRectWalkable(nextX) ||
+        const bool blockedX = !isRectWalkableEx(nextX, allowWater) ||
                               (extraSolid != nullptr && extraSolid(context, nextX));
         if (!blockedX)
         {
@@ -460,7 +550,7 @@ SDL_FPoint World::slideMoveEx(float x, float y, float w, float h, float dx, floa
         // 天然产生「贴墙滑动」的手感（撞墙后沿墙滑行而不是原地卡死）
         const SDL_FRect nextY{ x, y + stepY, w, h }; // Y 轴候选矩形
         // 判据同 X 轴：墙 + 额外实心体（两条件都过才推进）
-        const bool blockedY = !isRectWalkable(nextY) ||
+        const bool blockedY = !isRectWalkableEx(nextY, allowWater) ||
                               (extraSolid != nullptr && extraSolid(context, nextY));
         if (!blockedY)
         {

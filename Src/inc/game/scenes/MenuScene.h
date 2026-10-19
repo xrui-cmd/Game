@@ -75,7 +75,7 @@ private:
 
     // 最佳战绩快照：onEnter 时经 SaveData 读档一次（文件缺失/损坏自动按
     // 无记录处理，永不失败）。菜单只做只读展示——纪录的比较与写盘
-    // 全部发生在对局侧（PlayScene 的 GameOver 结算），菜单不写档
+    // 全部发生在对局侧（PlayScene 的死亡/M 退出静默结算），菜单不写档
     BestRecord m_best;
 };
 

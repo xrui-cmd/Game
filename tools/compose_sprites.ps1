@@ -1058,7 +1058,123 @@ Save-Png -bitmap $waterBmp -path (Join-Path $assetsDir "tiles_water.png")
 $waterBmp.Dispose()
 
 # ============================================================
-# 10) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
+# 10) 批六乙事件素材：复活点神龛（两态）与落水水花
+# ============================================================
+# 说明：素材包内没有神龛/水花帧，沿用批五A/五B 的「程序化绘制」口径。
+#   shrine.png : 2 帧横向（暗/亮），每帧 64x80；左 = 未激活、右 = 已激活。
+#                PlayScene 按激活状态选源帧（亮帧更亮 + 青色宝石光晕）。
+#   splash.png : 单帧 64x64 水面飞溅；运行时由代码做放大 + 淡出（约 0.4s）。
+# 两者都走 Save-Png（幂等覆盖），尺寸在文末自检中核对。
+
+# ---- 10.1 shrine.png：两帧横向（128x80）----
+$shrineBmp = New-Canvas -width 128 -height 80
+$shrineG = [System.Drawing.Graphics]::FromImage($shrineBmp)
+try {
+    # 逐帧绘制：f=0 未激活（灰暗）/ f=1 已激活（发亮）
+    for ($f = 0; $f -lt 2; $f++) {
+        $ox = $f * 64 # 本帧横向起点（像素）
+        $lit = ($f -eq 1) # 是否亮态帧
+
+        # 颜色分档：亮态整体提亮，暗态偏冷灰
+        if ($lit) {
+            $stoneBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 116, 132, 158)) # 石柱亮部
+            $stoneDark = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 72, 84, 106))  # 石柱暗部
+            $gemBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 150, 245, 255))   # 宝石亮青
+            $glowBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(90, 90, 220, 255))   # 光晕
+        } else {
+            $stoneBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 66, 72, 86))  # 石柱暗部
+            $stoneDark = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 44, 50, 62))  # 石柱更深
+            $gemBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 64, 82, 96))    # 宝石灰蓝
+            $glowBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(0, 0, 0, 0))        # 暗态无光晕
+        }
+        $outlinePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 24, 28, 38), 2)          # 外轮廓
+        $baseBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 50, 56, 70))       # 底座
+        $runePen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 255, 214, 120), 2)          # 亮态符文
+
+        try {
+            # 光晕（仅亮态）：宝石中心的半透明大圆——激活后「发亮」的主信号
+            $shrineG.FillEllipse($glowBrush, $ox + 10, 0, 44, 44)
+
+            # 底座：宽 52 / 高 14，贴帧底（y=64）
+            $shrineG.FillRectangle($baseBrush, $ox + 6, 64, 52, 14)
+            $shrineG.DrawRectangle($outlinePen, $ox + 6, 64, 52, 14)
+
+            # 石柱：宽 28 / 高 42（从 y=24 到 y=66；底部略压住底座上缘）
+            $shrineG.FillRectangle($stoneBrush, $ox + 18, 24, 28, 42)
+            # 柱身左侧暗部：4px 竖条（体积感）
+            $shrineG.FillRectangle($stoneDark, $ox + 18, 24, 6, 42)
+            $shrineG.DrawRectangle($outlinePen, $ox + 18, 24, 28, 42)
+
+            # 柱顶宝石：中心 (32,20)，半径 10
+            $shrineG.FillEllipse($gemBrush, $ox + 22, 10, 20, 20)
+            $shrineG.DrawEllipse($outlinePen, $ox + 22, 10, 20, 20)
+
+            # 亮态符文：柱身中段一条竖线 + 两颗小点（暗态不画）
+            if ($lit) {
+                $shrineG.DrawLine($runePen, $ox + 32, 34, $ox + 32, 56) # 竖向符文
+                $shrineG.FillEllipse($runePen.Brush, $ox + 29, 38, 6, 6) # 上符文点
+                $shrineG.FillEllipse($runePen.Brush, $ox + 29, 48, 6, 6) # 下符文点
+            }
+        } finally {
+            # 本帧画刷/画笔释放（GDI 句柄）
+            $stoneBrush.Dispose()
+            $stoneDark.Dispose()
+            $gemBrush.Dispose()
+            $glowBrush.Dispose()
+            $outlinePen.Dispose()
+            $baseBrush.Dispose()
+            $runePen.Dispose()
+        }
+    }
+} finally {
+    # 释放神龛画布 Graphics
+    $shrineG.Dispose()
+}
+# 保存神龛两态表（幂等覆盖）并释放画布
+Save-Png -bitmap $shrineBmp -path (Join-Path $assetsDir "shrine.png")
+$shrineBmp.Dispose()
+
+# ---- 10.2 splash.png：单帧 64x64 水面飞溅 ----
+$splashBmp = New-Canvas -width 64 -height 64
+$splashG = [System.Drawing.Graphics]::FromImage($splashBmp)
+try {
+    # 颜色：中心水花亮青白、外圈水蓝、水滴深蓝（透明底）
+    $coreBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(235, 225, 250, 255)) # 中心亮白
+    $ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(220, 130, 210, 245), 3)       # 外环水蓝
+    $dropBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(230, 150, 225, 255)) # 飞溅水滴
+    $innerPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200, 90, 170, 225), 2)        # 内环
+    try {
+        # 中心水花：扁椭圆（水面爆开的核）
+        $splashG.FillEllipse($coreBrush, 24, 28, 16, 10)
+        # 外环：横向椭圆（波浪扩散）
+        $splashG.DrawEllipse($ringPen, 8, 30, 48, 14)
+        # 内环：略小的第二圈
+        $splashG.DrawEllipse($innerPen, 18, 32, 28, 9)
+
+        # 飞溅水滴：左右各 3 条斜向外的小水滴（椭圆）
+        $splashG.FillEllipse($dropBrush, 12, 12, 7, 10)  # 左上水滴
+        $splashG.FillEllipse($dropBrush, 45, 10, 7, 11)  # 右上水滴
+        $splashG.FillEllipse($dropBrush, 4, 24, 6, 9)    # 左中水滴
+        $splashG.FillEllipse($dropBrush, 54, 24, 6, 9)   # 右中水滴
+        $splashG.FillEllipse($dropBrush, 20, 4, 6, 9)    # 中上水滴
+        $splashG.FillEllipse($dropBrush, 38, 3, 6, 9)    # 中上偏右水滴
+    } finally {
+        # 画刷/画笔释放（GDI 句柄）
+        $coreBrush.Dispose()
+        $ringPen.Dispose()
+        $dropBrush.Dispose()
+        $innerPen.Dispose()
+    }
+} finally {
+    # 释放水花画布 Graphics
+    $splashG.Dispose()
+}
+# 保存水花贴图（幂等覆盖）并释放画布
+Save-Png -bitmap $splashBmp -path (Join-Path $assetsDir "splash.png")
+$splashBmp.Dispose()
+
+# ============================================================
+# 11) 生成后自检：重新读盘校验全部成品 PNG 的尺寸
 # ============================================================
 # 与代码常量的对应关系（任一处改动必须两边同步）：
 #   player_sheet: 5 帧 x 48 宽 = 240，高 84（Player 的 m_w=48 / m_h=84）
@@ -1126,6 +1242,10 @@ Assert-PngSize -path (Join-Path $assetsDir "icon_chain_lightning.png") -expected
 Assert-PngSize -path (Join-Path $assetsDir "icon_heal.png") -expectedWidth 40 -expectedHeight 40
 Assert-PngSize -path (Join-Path $assetsDir "icon_burn_aura.png") -expectedWidth 40 -expectedHeight 40
 Assert-PngSize -path (Join-Path $assetsDir "icon_shield.png") -expectedWidth 40 -expectedHeight 40
+
+#   批六乙事件素材：神龛两帧横向（2 x 64 = 128 宽，80 高）；水花 64x64
+Assert-PngSize -path (Join-Path $assetsDir "shrine.png") -expectedWidth 128 -expectedHeight 80
+Assert-PngSize -path (Join-Path $assetsDir "splash.png") -expectedWidth 64 -expectedHeight 64
 
 # 全部完成提示
 Write-Host "全部成品素材组装并校验完成。"

@@ -33,6 +33,8 @@ class Camera;
 //      自批二起：位置推进改为「分轴位移 + 撞墙滑动」（World::slideMove），
 //      取代旧版「窗口边框 clamp」——玩家活动范围 = 世界边界（由边界墙
 //      自然形成），碰撞判定在实体内部、按注入的 World 执行。
+//      批六乙：玩家改走 World::slideMovePlayer——水域可通行（入水后由
+//      PlayScene 切换 Drowning/落水流），墙与怪物仍为实心。
 //      自批四起（碰撞体积与视觉解耦）：滑动判定改用「脚部碰撞盒」
 //      （宽 32 x 高 26、底部内收 4px，构造时 setCollisionBox 设置）——
 //      精灵身体（48x84 全身像）可以自然叠压墙脚，脚盒不穿透；渲染/
@@ -172,8 +174,21 @@ public:
     // 覆写渲染：本体按基类插值绘制（世界坐标 -> 相机换算）之后，
     // 横扫表现期内叠加绘制武器（绕玩家中心从 −60° 扫到 +60°；
     // 武器锚点与本体共用同一条插值位置公式，再经同一相机换算——
-    // 快速移动不脱节、相机跟随不漂移）
+    // 快速移动不脱节、相机跟随不漂移）。
+    // 批六乙：落水表现期（m_drownAlpha < 255 或 m_drownSinkY > 0）改走
+    // 「下沉 + 淡出」的本体绘制（不画武器/受击红染——死亡过场优先）
     void render(SDL_Renderer* renderer, float alpha, const Camera& camera) const override;
+
+    // 设置落水表现（批六乙）：sinkPixels = 相对逻辑位置的下沉像素（>=0），
+    // opacity01 = 本体不透明度 [0,1]。场景在 Drowning 每步按进度调用；
+    // 复活/重开时传 (0, 1) 复位。参数越界自动夹取，纯渲染层状态——
+    // 碰撞/位置/判定一律不受影响
+    void setDrownVisual(float sinkPixels, float opacity01);
+
+    // 立即取消横扫表现（批六乙·落水/死亡过场）：把表现计时清零——武器与
+    // 残影下一帧起不再绘制，避免世界冻结后挥砍画面永久停留在屏幕上。
+    // 只影响表现，不改冷却/方向/命中记录（场景侧扫程状态另行复位）
+    void cancelSwingVisual();
 
     // 重开归位：把玩家瞬间移动到 (x, y) 并清零速度与攻击状态
     //（内部委托基类 setPosition，同时同步插值快照）；保留这个语义化名字
@@ -247,6 +262,11 @@ private:
     // 候选矩形与任一实心盒重叠即不可推进——「怪物盒为实心」的实现
     static bool solidBlockedCallback(void* context, const SDL_FRect& rect);
 
+    // 落水表现期的本体绘制（批六乙）：与 Entity::render 同一帧号/插值/
+    // 翻转算法，额外叠加「下沉像素」与纹理 alpha 调制；调用后恢复 alpha，
+    // 不污染后续绘制。只在 m_drownAlpha < 255 或 m_drownSinkY > 0 时走这里
+    void renderDrownBody(SDL_Renderer* renderer, float alpha, const Camera& camera) const;
+
     // 当前速度（像素/秒），逐轴独立渐近：斜向输入时两轴各取自己的目标，
     // 与既有「未归一化直驱」的斜向速度语义保持一致（合速度约 1.41 倍）
     float m_velocityX = 0.0f; // 水平速度：正右负左
@@ -300,6 +320,12 @@ private:
     float m_knockbackVY = 0.0f;   // 击退速度 y（同上）
     float m_knockbackLeft = 0.0f; // 击退剩余时长（秒；>0 = 击退窗口，输入被抑制）
     float m_hitTintLeft = 0.0f;   // 红染剩余时长（秒；>0 时 render 叠加红光）
+
+    // ---- 落水表现（批六乙；纯渲染层，reset 清零）----
+    // 下沉：绘制位置在逻辑位置上再向下偏移（玩家看似没入水中）；
+    // 淡出：纹理 alpha 从 255 递减到 0。碰撞/位置/判定完全不受影响
+    float m_drownSinkY = 0.0f;    // 下沉偏移（像素；0 = 无）
+    Uint8 m_drownAlpha = 255;     // 本体不透明度（255 = 正常；0 = 完全淡出）
 
     SDL_Texture* m_weaponTexture = nullptr; // 武器纹理（assets/weapon.png；加载失败为 nullptr，横扫跳过）
 

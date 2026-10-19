@@ -1,5 +1,5 @@
 #include "game/scenes/PlayScene.h"
-#include "game/scenes/MenuScene.h" // MenuScene：GameOver 按 M 时要切换回主菜单
+#include "game/scenes/MenuScene.h" // MenuScene：暂停界面按 M 时切换回主菜单（批六乙战绩静默结算后）
 #include "game/Separation.h"       // computeSeparation：重叠兜底与怪怪软分离的最小分离量（批四）
 #include "game/CardLayout.h"       // cardPanelRectAt / cardPanelHitTest：卡面板布局共享计算（批五A）
 #include "engine/DebugText.h"      // DebugText：仅用于左下角 FPS/帧时间调试行（ASCII）
@@ -37,6 +37,23 @@ PlayScene::~PlayScene()
 {
     releaseFeedbackTextures(); // 攻击反馈纹理释放（幂等；见实现）
     releaseSpellTextures();    // 法术素材释放（批五B；幂等；见实现）
+    releaseEventTextures();    // 神龛/水花素材释放（批六乙；幂等）
+}
+
+// 释放批六乙事件纹理（shrine/splash）：先判空、再销毁、最后置空——幂等，
+// 供析构兜底调用（renderer 销毁前必然已执行）
+void PlayScene::releaseEventTextures()
+{
+    if (m_shrineTexture != nullptr) // 神龛两态表：持有才销毁
+    {
+        SDL_DestroyTexture(m_shrineTexture); // 释放神龛纹理
+        m_shrineTexture = nullptr;           // 置空：重复调用安全
+    }
+    if (m_splashTexture != nullptr) // 水花贴图：持有才销毁
+    {
+        SDL_DestroyTexture(m_splashTexture); // 释放水花纹理
+        m_splashTexture = nullptr;           // 置空：重复调用安全
+    }
 }
 
 // 释放攻击反馈纹理（批五A）：先判空、再销毁、最后置空——幂等，
@@ -177,6 +194,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_cameraSmoothTime =
         std::max(0.0f, config.getFloat("camera_smooth_time", kDefaultCameraSmoothTime));
 
+    // 批六乙：神龛激活键名（仅用于「按 X 激活」提示文案；实际绑定由
+    // GameDev::bindInputActions 按同一个 bind_activate 键写入输入系统）。
+    // 缺键时 getString 回退 "E"——提示与实际默认绑定一致
+    m_activateKeyLabel = config.getString("bind_activate", "E");
+
     // 「基准值」= 配置里的初始值（M2：卡牌效果从「基准 + 层数」重算——
     // applyCardEffects 是唯一入口；restart 清层数后重算即复位）。
     // 「当前值」先行置为基准：让随后「生命回满」等流程读到合法初值；
@@ -210,8 +232,8 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
 
     // 5) 生成世界（批二核心；批六甲：区块 32 格、8x4 = 12288x6144，config 可调）。
     //    确定性生成：同一 (种子, 区块) 永远得到同一布局；world_seed=0 时
-    //    每局换新随机种子（R 重开不换——整个对局共享同一张图，「走远再
-    //    回头内容一致」由此保证）。素材（地砖/墙/装饰）加载失败只降级为
+    //    每局换新随机种子（同一局内重开不换——整个对局共享同一张图，「走远
+    //    再回头内容一致」由此保证）。素材（地砖/墙/装饰）加载失败只降级为
     //    纯色色块，不阻塞可玩性（World::loadAssets 内部逐张警告）
     const char* basePath = SDL_GetBasePath(); // exe 目录：字体等素材路径的基准
     m_world.generate(worldChunksX, worldChunksY, worldSeed);
@@ -341,6 +363,46 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
         }
     }
 
+    // 7.7) 批六乙事件素材（可选增强）：神龛两态表与落水水花——与前述
+    //      可选素材同一加载模式（IMG_LoadTexture + 最近邻），失败只警告、
+    //      对应表现跳过（玩家仍可激活神龛/落水死亡，玩法逻辑不受影响）
+    if (basePath != nullptr)
+    {
+        const std::string shrinePath = std::string(basePath) + "assets/shrine.png"; // 神龛素材绝对路径
+        m_shrineTexture = IMG_LoadTexture(m_renderer, shrinePath.c_str()); // 读文件 -> 纹理
+        if (m_shrineTexture != nullptr) // 加载成功：设置最近邻采样
+        {
+            SDL_SetTextureScaleMode(m_shrineTexture, SDL_SCALEMODE_NEAREST); // 像素风
+        }
+        else
+        {
+            // 素材缺失/解码失败：警告后继续（神龛不显示，激活逻辑照常）
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "加载神龛素材 %s 失败（%s），神龛将跳过绘制",
+                        shrinePath.c_str(), SDL_GetError());
+        }
+
+        const std::string splashPath = std::string(basePath) + "assets/splash.png"; // 水花素材绝对路径
+        m_splashTexture = IMG_LoadTexture(m_renderer, splashPath.c_str()); // 同一加载路径
+        if (m_splashTexture != nullptr) // 加载成功：最近邻采样
+        {
+            SDL_SetTextureScaleMode(m_splashTexture, SDL_SCALEMODE_NEAREST); // 像素风
+        }
+        else
+        {
+            // 水花缺失：警告后继续（落水流程照常，只是没有水花画面）
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "加载水花素材 %s 失败（%s），落水水花将跳过",
+                        splashPath.c_str(), SDL_GetError());
+        }
+    }
+
+    // 7.8) 神龛激活状态复位（批六乙）：草地默认激活/发亮、雪山默认未激活；
+    //      每次进入场景都是新一局——即使来自菜单的重新进入也从头开始
+    resetShrineActivation(m_shrineActive); // 按神龛表的默认状态写回
+    m_shrinePromptIndex = -1;              // 初始无「按 E 激活」提示
+    m_activateHandled = false;             // 激活键去重标记初值
+
     // 8) 注入玩家配置：加减速/动画节奏/扫程时长（不受卡牌影响的四项），
     //    受卡牌影响的数值（移速/攻击冷却/扫角）与其余卡效果走统一入口
     //    applyCardEffects 重算注入。必须在 load 之后设置——load 会把内置
@@ -438,29 +500,46 @@ void PlayScene::handleEvent(const SDL_Event& event)
 }
 
 // 输入动作的按下边缘处理（每个上升沿恰好响应一次）。
-// 调用位置：update 的最开头——暂停/重开/回菜单/商店在任何状态下都要能响应
-//（包括 Paused/GameOver 的冻结分支；PlayScene 世界冻结但输入始终可用）
-// 例外（M2/批五B）：LevelUp（升级三选一面板）期间暂停/重开/回菜单不响应
-//（防误触）——各分支的状态判据（Playing/Paused/GameOver）天然排除 LevelUp，
-// 无需额外分支；去重标记照常记录，面板期间按下的键不会在回到 Playing 后
-// 迟到触发。批五B 新增 shop 动作：Playing 按 B 打开商店、Shop 中 B/ESC
-// 关闭（ESC 的语义在暂停分支内按 Shop 状态分流——见下）
+// 调用位置：update 的最开头——暂停/回菜单/商店/神龛激活都从这里分发；
+// 各分支用状态判据把「什么时候能响应」写清楚（防误触/输入锁定）。
+// 例外（M2/批五B/批六乙）：LevelUp/Shop 下暂停等动作不响应（防误触）；
+// Drowning/Reviving 下全部对局控制都不响应（输入锁定）。去重标记照常
+// 记录，面板/过场期间按下的键不会在回到 Playing 后迟到触发。
+// 批六乙：R（restart）自 GameOver 退役后不再被查询——保留配置绑定但无分支
 void PlayScene::handleInputEdges(const UpdateContext& ctx)
 {
     // 本步的边沿采样（ctx.input 为 nullptr 时按「都没按」安全降级）。
-    // 四个动作的语义与物理键位的对应关系由 config 的 bind_* 决定
+    // 动作与物理键位的对应关系由 config 的 bind_* 决定
     const bool pausePressed = ctx.input != nullptr && ctx.input->pressed("pause");
-    const bool restartPressed = ctx.input != nullptr && ctx.input->pressed("restart");
     const bool menuPressed = ctx.input != nullptr && ctx.input->pressed("menu");
     const bool shopPressed = ctx.input != nullptr && ctx.input->pressed("shop");
+    const bool activatePressed = ctx.input != nullptr && ctx.input->pressed("activate");
+
+    // ---- 神龛激活（批六乙；仅 Playing + 范围内有未激活神龛时响应）----
+    // 提示下标由上一个固定步的玩家位置计算（update 末尾刷新）；按下边缘
+    // 去重与暂停同款——同帧补多个固定步也只激活一次。已激活的神龛
+    // 不再进入提示列表，因此这里无需重复判活（防御再查一次）
+    if (activatePressed && !m_activateHandled && m_state == PlayState::Playing &&
+        m_shrinePromptIndex >= 0 && m_shrinePromptIndex < kShrineCount &&
+        !m_shrineActive[m_shrinePromptIndex])
+    {
+        const int shrineIndex = m_shrinePromptIndex;           // 本次激活的神龛
+        m_shrineActive[shrineIndex] = true;                    // 本局保持激活
+        m_shrinePromptIndex = -1;                              // 激活后提示立即消失
+        m_audio->play(SoundId::Start);                         // 复用现有「开始/确认」上扬音
+        // 冒烟观测点：激活日志（规格文案「复活点已激活（雪山）」）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "复活点已激活（%s）", shrineDef(shrineIndex).name);
+    }
+    m_activateHandled = activatePressed; // 记录本步采样：边沿消失前不再重复处理
 
     // ---- 商店开关（批五B；先于暂停处理：Shop 中 ESC 的语义是「关闭商店」，
     //      须在暂停分支看到它之前先把状态算清楚）----
     // 「随时可开」= 战斗进行中（Playing）按 B 一拍即开（世界因此冻结、同
-    // 暂停语义）；Paused/LevelUp/GameOver 下不响应（防误触——与 LevelUp
-    // 的既有纪律一致）。shopToggled：本步 B 已切换过商店状态——同帧恰好
-    // 又按到 ESC 时暂停分支据此跳过，两个关闭/切换键不互相打架
-    //（单独按 B / 单独按 ESC 各自都能关闭商店——「互不冲突」的口径）
+    // 暂停语义）；Paused/LevelUp/Drowning/Reviving 下不响应（防误触）——
+    // 各分支的状态判据天然排除这些状态。shopToggled：本步 B 已切换过
+    // 商店状态——同帧恰好又按到 ESC 时暂停分支据此跳过，两个关闭/切换键
+    // 不互相打架（单独按 B / 单独按 ESC 各自都能关闭商店）
     bool shopToggled = false; // 本步商店状态是否已由 B 切换
     if (shopPressed && !m_shopHandled)
     {
@@ -477,11 +556,11 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
     }
     m_shopHandled = shopPressed; // 记录本步采样：边沿消失前不再重复处理
 
-    // 暂停/恢复：在 Playing 与 Paused 之间切换（GameOver 下不响应）。
-    // 批五B：Shop 中按 ESC = 关闭商店（不进入暂停——ESC 在商店语境下是
-    // 「退出面板」）；本步 B 已关闭过商店（shopToggled）时整段跳过，
-    // 保证同帧双键也只产生一次关闭。去重标记：同一帧补多个固定步时
-    // pressed 恒 true，只在「首次见到上升沿」的那一步执行切换，
+    // 暂停/恢复：在 Playing 与 Paused 之间切换（落水/复活/升级/商店下
+    // 不响应）。批五B：Shop 中按 ESC = 关闭商店（不进入暂停——ESC 在
+    // 商店语境下是「退出面板」）；本步 B 已关闭过商店（shopToggled）时
+    // 整段跳过，保证同帧双键也只产生一次关闭。去重标记：同一帧补多个
+    // 固定步时 pressed 恒 true，只在「首次见到上升沿」的那一步执行切换，
     // 避免一帧内反复横跳
     if (pausePressed && !m_pauseHandled && !shopToggled)
     {
@@ -512,18 +591,15 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
     }
     m_pauseHandled = pausePressed; // 记录本步采样：边沿消失前不再重复处理
 
-    // 重开：仅 GameOver 下响应（Playing/Paused 按 R 无效果，与旧行为一致）
-    if (restartPressed && !m_restartHandled && m_state == PlayState::GameOver)
+    // 回主菜单：仅 Paused 下按 M 生效（Playing 下不响应；Drowning/Reviving
+    // 输入锁定）。批六乙：退出前静默比较并写盘本局战绩——旧「中途退出
+    // 不计」口径退役。请求只登记，帧末由 SceneManager 结算，避免在自身
+    // 回调里析构自己
+    if (menuPressed && !m_menuHandled && m_state == PlayState::Paused)
     {
-        restart(); // 重开一局（内部重置全部局面数据并打日志）
-    }
-    m_restartHandled = restartPressed; // 记录采样：上升沿去重
-
-    // 回主菜单：Paused 与 GameOver 下按 M 生效（Playing 下不响应）。
-    // 请求只登记，帧末由 SceneManager 结算，避免在自身回调里析构自己
-    if (menuPressed && !m_menuHandled &&
-        (m_state == PlayState::Paused || m_state == PlayState::GameOver))
-    {
+        settleRecords(); // 静默结算：仅日志 + 新纪录时写盘（不播音效/不弹界面）
+        // 冒烟观测点：确认 M 退出路径参与战绩结算
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "返回菜单（本局战绩已静默结算）");
         m_sceneManager->requestScene(std::make_unique<MenuScene>());
     }
     m_menuHandled = menuPressed; // 记录采样：上升沿去重
@@ -686,6 +762,10 @@ void PlayScene::handleCardChoice(const UpdateContext& ctx)
     const int spellIndex = static_cast<int>(id);       // 层数数组下标（与 SpellId 对应）
     const int oldLevel = m_spellLevels[spellIndex];    // 选择前的层数（初学判定用）
     m_spellLevels[spellIndex] = gainSpellLevel(oldLevel); // 层数 +1（统一 5 层封顶）
+
+    // 升级历史入栈（批六乙）：记录「法术 + 选择后层数快照」——死亡降级时
+    // 出栈最近一笔，执行「该法术层数 -1」（归零则移除/停止施法）
+    pushUpgradeChoice(m_upgradeHistory, spellIndex, m_spellLevels[spellIndex]);
 
     // 初学（0 -> 1）：冷却置 0——学到的下一步就具备施放条件（有敌人时立即
     // 打出第一发，成长反馈即时）；已学的叠层不动冷却（不打断既有节奏）。
@@ -965,17 +1045,58 @@ float PlayScene::currentZoneMoveMultiplier() const
     return zoneDef(m_currentZone).moveSpeedMultiplier; // 区表乘区（草 1.0 / 雪 0.85）
 }
 
-// 每帧更新：先处理输入动作边缘（任何状态都响应），再按状态推进战斗。
-// Paused（暂停）与 GameOver（结束）都冻结玩家、怪物、宝石与计时——暂停
-// 由此天然实现了「世界与计时冻结」（实体 update 的统一门控就在本函数）
+// 每帧更新：先处理输入动作边缘（各状态按判据响应），再按状态推进战斗。
+// Paused/LevelUp/Shop/Drowning/Reviving 都冻结世界本体与计时；其中落水与
+// 复活过场只推进各自的演出计时（水花/下沉/渐暗渐亮），结束后再切状态
 void PlayScene::update(const UpdateContext& ctx)
 {
-    // 输入动作边缘：暂停/重开/回菜单（与状态无关，先于冻结分支处理——
-    // 否则暂停后按 ESC/M 将无法恢复/回菜单）。LevelUp 下三个动作不响应
-    //（各分支状态判据天然排除——防误触；见 handleInputEdges 说明）
+    // 输入动作边缘：暂停/回菜单/商店/神龛激活（先于冻结分支处理——
+    // 否则暂停后按 ESC/M 将无法恢复/回菜单；各分支状态判据负责防误触）
     handleInputEdges(ctx);
 
-    // 非 Playing 状态：世界冻结。
+    // 落水过场（批六乙）：只推进水花/下沉计时；世界本体冻结、输入锁定。
+    // 计时结束 -> beginDeath(落水)（内部处理惩罚/选点并切 Reviving）
+    if (m_state == PlayState::Drowning)
+    {
+        updateDrowning(ctx); // 水花递减 + 下沉淡出 + 结束进入统一死亡处理
+        m_player.snapshotPreviousPosition(); // 插值快照对齐（画面完全静止，仅渲染下沉偏移）
+        for (Monster& monster : m_monsters)
+        {
+            monster.snapshotPreviousPosition(); // 怪物插值快照对齐（冻结）
+        }
+        for (XpGem& gem : m_gems)
+        {
+            gem.snapshotPreviousPosition(); // 宝石插值快照对齐（冻结）
+        }
+        for (Coin& coin : m_coins)
+        {
+            coin.snapshotPreviousPosition(); // 金币插值快照对齐（冻结）
+        }
+        return;
+    }
+
+    // 复活过场（批六乙）：渐暗计时；中点瞬移、终点回 Playing。
+    // 世界同样冻结（不会在淡入淡出期间被怪物补刀）
+    if (m_state == PlayState::Reviving)
+    {
+        updateReviving(ctx); // 计时 + 中点复活 + 终点 2s 无敌
+        m_player.snapshotPreviousPosition(); // 插值快照对齐（瞬移后防拉丝）
+        for (Monster& monster : m_monsters)
+        {
+            monster.snapshotPreviousPosition(); // 怪物插值快照对齐（冻结）
+        }
+        for (XpGem& gem : m_gems)
+        {
+            gem.snapshotPreviousPosition(); // 宝石插值快照对齐（冻结）
+        }
+        for (Coin& coin : m_coins)
+        {
+            coin.snapshotPreviousPosition(); // 金币插值快照对齐（冻结）
+        }
+        return;
+    }
+
+    // 其余非 Playing 状态：世界冻结。
     if (m_state != PlayState::Playing)
     {
         // LevelUp（M2 三选一）：先处理 1/2/3 选择——选择可能消费最后一笔
@@ -1114,6 +1235,16 @@ void PlayScene::update(const UpdateContext& ctx)
     // 「区块 (x,y) 加载」）、滑出窗口的区块释放（日志「区块 (x,y) 卸载」）
     m_world.updateActiveChunks(m_renderer, m_camera);
 
+    // ---- 落水判定（批六乙）：玩家碰撞盒（脚盒）与任一水格重叠 ----
+    // 本步玩家已移动完、相机已跟上：立即进入 Drowning（输入锁定、期间
+    // 无敌），并提前返回——本步不再攻击/刷新/结算，避免落水同帧互相抢
+    // 死亡原因。海洋自本批起对玩家开放（怪物仍视水为实心）。
+    if (m_world.rectTouchesWater(m_player.collisionRect()))
+    {
+        enterDrowning(); // 状态切换 + 水花落点 + 无敌 + 快照
+        return;          // 本步剩余战斗逻辑不再执行
+    }
+
     // 主动攻击结算：每个固定步按「左键按住 + 冷却就绪」尝试一次横扫——
     // 方向取鼠标瞄准（不索敌、挥空也出招），命中由扇形判定逐只结算
     resolvePlayerAttack(ctx, playerRect);
@@ -1147,11 +1278,22 @@ void PlayScene::update(const UpdateContext& ctx)
                 {
                     ++m_monsterSpawnedTotal; // 累计生成数 +1（日志编号自增）
 
-                    // 冒烟观测点：怪物出现日志（含变体名，自动化测试据此断言
-                    // 等权随机与三变体生效）
+                    // 距离日志数据（批六乙配平冒烟）：出生点与玩家中心的距离
+                    // 应落在 [520,900] 环带内；取碰撞盒中心（与环带采样同口径）
+                    const SDL_FRect spawnBox = monster.collisionRect();        // 新怪脚盒快照
+                    const SDL_FRect playerBoxNow = m_player.collisionRect();   // 玩家脚盒快照
+                    const float spawnDX = spawnBox.x + spawnBox.w * 0.5f -
+                                          (playerBoxNow.x + playerBoxNow.w * 0.5f); // 水平差
+                    const float spawnDY = spawnBox.y + spawnBox.h * 0.5f -
+                                          (playerBoxNow.y + playerBoxNow.h * 0.5f); // 垂直差
+                    const float spawnDistance = std::sqrt(spawnDX * spawnDX + spawnDY * spawnDY); // 距离
+
+                    // 冒烟观测点：怪物出现日志（含变体名与出生距离——批六乙
+                    // 环带配平断言：距离应恒在 520~900；等权随机仍可断言）
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                "怪物出现（第 %d 只，%s）",
-                                m_monsterSpawnedTotal, monsterTypeName(monster.type()));
+                                "怪物出现（第 %d 只，%s，距玩家 %.0f px）",
+                                m_monsterSpawnedTotal, monsterTypeName(monster.type()),
+                                spawnDistance);
                 }
                 break; // 本步至多生成一只（无论成功与否）
             }
@@ -1292,8 +1434,8 @@ void PlayScene::update(const UpdateContext& ctx)
                     m_playerInvincibleLeft = kPlayerInvincibleSeconds; // 保护窗口照旧
                 }
 
-                // 9) 生命归零：本步提前结束怪物遍历（GameOver 由循环后的
-                //    统一检查收口；后续怪物不再留下会结算的 Hit）
+                // 9) 生命归零：本步提前结束怪物遍历（统一死亡复活流由循环后
+                //    的检查收口；后续怪物不再留下会结算的 Hit）
                 if (m_playerHp <= 0)
                 {
                     break;
@@ -1404,19 +1546,221 @@ void PlayScene::update(const UpdateContext& ctx)
     // 「蓄力前扑」状态机（见上方怪物循环内的结果消费）：接触范围的伤害
     // 不再由「一步一碰」直接结算，而是怪物出招命中才扣血
 
-    // 生命归零：进入 GameOver（唯一入口——GameOver 仅因生命归零触发）
+    // ---- 生命归零：统一死亡复活流（批六乙；GameOver 界面退役）----
+    // 与落水共用 beginDeath：惩罚 -> 静默结算战绩 -> 最近神龛复活。
+    // 防抖：怪物循环在 hp <= 0 时已 break；本块每步至多触发一次，
+    // beginDeath 内部还会拒绝「已处于 Reviving」的重复触发
     if (m_playerHp <= 0)
     {
-        m_state = PlayState::GameOver; // 冻结世界，等待玩家按 R 重开
-        // 播放结束下行音（gameover）：与状态切换一一对应（R 重开不重复触发）
-        m_audio->play(SoundId::GameOver);
-        // 冒烟观测点：日志标记本局结束（自动化测试据此确认 GameOver 已到达）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "生命归零，本局结束");
-
-        // 最佳战绩结算（仅完整对局走到这里）：比较三项纪录，破了就更新并
-        // 立即写盘、播 record 音效。中途 M 退出（Paused 分支）不经过本函数
-        settleRecords();
+        beginDeath(DeathCause::HpZero); // 生命归零死亡（内部完成全部收口）
+        return;                         // 死亡过场接管：本步不再更新提示
     }
+
+    // 神龛激活提示刷新（批六乙）：以玩家完整精灵中心为圆心、64px 为半径，
+    // 找最近的「未激活」神龛；渲染端只读本字段（无输入系统也能正确显示）
+    const SDL_FRect promptRect = m_player.rect(); // 玩家完整精灵矩形快照
+    m_shrinePromptIndex = nearestInactiveShrineInRange(
+        m_shrineActive,
+        promptRect.x + promptRect.w * 0.5f, // 玩家中心 x
+        promptRect.y + promptRect.h * 0.5f, // 玩家中心 y
+        kShrineInteractRadius);              // 交互半径（64px）
+}
+
+// ============================================================
+// 落水与死亡复活流（批六乙）
+// ============================================================
+
+// 进入落水状态（玩家碰撞盒首次与水格重叠时由 update 调用）
+void PlayScene::enterDrowning()
+{
+    // 状态防御：只有 Playing 能进入落水（过场/面板中不重复触发）
+    if (m_state != PlayState::Playing)
+    {
+        return;
+    }
+
+    m_state = PlayState::Drowning; // 输入锁定 + 世界冻结：只推进落水演出
+    m_drownElapsed = 0.0f;         // 落水过场从头计时
+    m_splashLeft = kDrownSplashSeconds; // 水花寿命置满（0.4s 后结束）
+    m_shrinePromptIndex = -1;      // 落水中不显示神龛提示
+
+    // 水花落点 = 玩家脚盒中心（真正与水接触的位置）
+    const SDL_FRect playerBox = m_player.collisionRect(); // 脚部碰撞盒快照
+    m_splashPos = SDL_FPoint{ playerBox.x + playerBox.w * 0.5f, // 接触点 x
+                              playerBox.y + playerBox.h * 0.5f }; // 接触点 y
+
+    // 「期间无敌」：落水计时内即使世界有攻击也不再结算（世界本身冻结，
+    // 这里显式置位是为了语义完整——复活后会重新给 2s 无敌）
+    m_playerInvincibleLeft = kDrownSplashSeconds + kDrownSinkSeconds;
+
+    m_player.cancelSwingVisual();        // 取消挥砍表现（冻结后不会残留武器）
+    m_player.setDrownVisual(0.0f, 1.0f); // 下沉/淡出从未开始状态起算
+    m_player.snapshotPreviousPosition(); // 插值快照对齐：水面位置不拉丝
+
+    // 冒烟观测点：落水事件（后续死亡日志为「死亡：落水」）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "落水：玩家进入水域");
+}
+
+// 落水过场推进（每固定步）：水花 0.4s + 下沉/淡出 0.5s -> 统一死亡处理
+void PlayScene::updateDrowning(const UpdateContext& ctx)
+{
+    m_drownElapsed += ctx.deltaTime; // 过场总计时累加
+
+    // 水花寿命递减（到 0 即不再绘制；渲染端按剩余比例做缩放+淡出）
+    if (m_splashLeft > 0.0f)
+    {
+        m_splashLeft = std::max(m_splashLeft - ctx.deltaTime, 0.0f);
+    }
+
+    // 下沉进度：水花阶段（0~0.4s）保持水面；其后 0.5s 从 0 到 1
+    const float sinkRaw = (m_drownElapsed - kDrownSplashSeconds) / kDrownSinkSeconds;
+    const float sinkProgress = std::clamp(sinkRaw, 0.0f, 1.0f); // 夹到 [0,1]
+
+    // 下沉像素随进度线性增加；本体 alpha 从 1 线性降到 0（完全没入水中）
+    m_player.setDrownVisual(kDrownSinkPixels * sinkProgress, 1.0f - sinkProgress);
+
+    // 两段合计结束：进入统一死亡处理（惩罚/选点/切 Reviving）
+    if (m_drownElapsed >= kDrownSplashSeconds + kDrownSinkSeconds)
+    {
+        beginDeath(DeathCause::Drowning); // 落水死亡（统一入口）
+    }
+}
+
+// 统一死亡处理：HP 归零与落水共用（契约见头文件）
+void PlayScene::beginDeath(DeathCause cause)
+{
+    // 防重：复活过场已开始（同帧多触发/重复调用）时不再处理
+    if (m_state == PlayState::Reviving)
+    {
+        return;
+    }
+
+    // 死亡地点 = 玩家完整精灵中心（两座神龛的最近点比较基准）
+    const SDL_FRect deathRect = m_player.rect(); // 死亡瞬间的玩家矩形
+    const float deathCenterX = deathRect.x + deathRect.w * 0.5f; // 死亡地点 x
+    const float deathCenterY = deathRect.y + deathRect.h * 0.5f; // 死亡地点 y
+
+    // 冒烟观测点：死亡日志（规格「死亡：生命归零/落水」）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "死亡：%s", (cause == DeathCause::Drowning) ? "落水" : "生命归零");
+
+    // 死亡下行音：复用现有 gameover.wav（引擎 SoundId::GameOver，不新增素材）
+    m_audio->play(SoundId::GameOver);
+
+    // 战绩结算（批六乙口径）：在惩罚之前比较写盘——保留死亡瞬间的
+    // 等级/击杀/存活；静默（仅日志，不播 record、不弹「新纪录」界面）
+    settleRecords();
+
+    // ---- 惩罚：金币减半 + 等级 -1（最低 1）+ 升级历史栈出栈 ----
+    const int coinsBefore = m_coinCount; // 惩罚前金币（日志对照）
+    const int levelBefore = m_level;     // 惩罚前等级（日志对照）
+    const DeathPenaltyResult penalty = applyDeathPenalty(
+        m_coinCount, m_level, m_xp, m_upgradeHistory,
+        m_spellLevels, kSpellCount); // 纯函数：不改入参、返回结果
+
+    m_coinCount = penalty.coins; // 写回惩罚后金币（向下取整的一半）
+    m_level = penalty.level;     // 写回惩罚后等级（最低 1）
+    m_xp = penalty.xp;           // 写回惩罚后经验（降级时清零）
+
+    // 丢失技能：层数归零时清掉残留冷却（图标/施法都由层数 > 0 门控，
+    // 归零后自然停止施法与消失；这里清冷却让状态更干净）
+    if (penalty.skillLost && penalty.lostSpellLevelAfter <= 0 &&
+        penalty.lostSpellIndex >= 0 && penalty.lostSpellIndex < kSpellCount)
+    {
+        m_spellCooldownLeft[penalty.lostSpellIndex] = 0.0f; // 冷却清零
+    }
+
+    // 日志技能名：实际丢失时取法术名；无损失（等级 1/历史为空）写「无」
+    const char* lostSkillName = "无"; // 默认：本次没有失去技能
+    if (penalty.skillLost && penalty.lostSpellIndex >= 0 &&
+        penalty.lostSpellIndex < kSpellCount)
+    {
+        lostSkillName = spellDef(static_cast<SpellId>(penalty.lostSpellIndex)).name;
+    }
+
+    // 冒烟观测点：惩罚日志（规格文案「惩罚：金币 x→y；等级 n→m；失去技能：xxx」）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "惩罚：金币 %d→%d；等级 %d→%d；失去技能：%s",
+                coinsBefore, m_coinCount, levelBefore, m_level, lostSkillName);
+
+    // ---- 复活点选择：距死亡地点最近的已激活神龛 ----
+    int shrineIndex = nearestActiveShrine(m_shrineActive, deathCenterX, deathCenterY);
+    if (shrineIndex < 0) // 防御：正常流程草地恒激活，理论不可达
+    {
+        shrineIndex = kShrineFallbackIndex; // 回退草地中心
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "没有已激活的复活点，回退草地中心"); // 防御日志
+    }
+    m_reviveShrineIndex = shrineIndex; // 记录本次复活点（中点瞬移消费）
+
+    // ---- 切复活过场：0.6s 渐暗渐亮；中点瞬移 ----
+    m_state = PlayState::Reviving; // 输入锁定 + 世界冻结
+    m_reviveTimer = 0.0f;          // 过场计时从 0 起
+    m_reviveTeleported = false;    // 中点瞬移尚未发生
+    m_splashLeft = 0.0f;           // 关掉水花（落水演出结束）
+    m_shrinePromptIndex = -1;      // 复活过场不显示激活提示
+
+    // 死亡瞬间的可见性处理：落水死者保持「已沉没/透明」直到瞬移；
+    // 生命归零死者保留原样（0.6s 渐暗只是过场，不额外做消失动画）
+    if (cause == DeathCause::Drowning)
+    {
+        m_player.setDrownVisual(kDrownSinkPixels, 0.0f); // 水下不可见（等复活）
+    }
+    else
+    {
+        m_player.setDrownVisual(0.0f, 1.0f); // 清除可能残留的落水视觉
+    }
+}
+
+// 复活过场推进：渐暗渐亮 0.6s；中点（0.3s）瞬移 + snapTo；终点回 Playing
+void PlayScene::updateReviving(const UpdateContext& ctx)
+{
+    m_reviveTimer += ctx.deltaTime; // 过场计时累加
+
+    // 中点：瞬移到最近已激活神龛（半程时画面全黑，切换不可见）
+    const float half = kReviveFadeSeconds * 0.5f; // 半程时长（0.3s）
+    if (!m_reviveTeleported && m_reviveTimer >= half)
+    {
+        respawnPlayerAtShrine(m_reviveShrineIndex); // 落点/回血/相机/日志
+        m_reviveTeleported = true;                  // 标记：只瞬移一次
+    }
+
+    // 终点：恢复对局并给 2s 无敌（静默、无闪烁；暂停计时在 update 内推进）
+    if (m_reviveTimer >= kReviveFadeSeconds)
+    {
+        m_state = PlayState::Playing;                         // 恢复输入与战斗
+        m_playerInvincibleLeft = kReviveInvincibleSeconds;    // 2s 无敌（规格）
+        // 冒烟观测点：复活完成与无敌时长
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "复活完成（无敌 %.0f 秒）",
+                    kReviveInvincibleSeconds);
+    }
+}
+
+// 把玩家瞬移到指定神龛（复活中点调用）
+void PlayScene::respawnPlayerAtShrine(int shrineIndex)
+{
+    const ShrineDef& shrine = shrineDef(shrineIndex); // 目标神龛定义（含防御回退）
+
+    // 玩家中心对齐神龛中心（左上角 = 中心 - 半尺寸）
+    const float spawnX = shrine.x - m_player.width() * 0.5f;  // 左上角 x
+    const float spawnY = shrine.y - m_player.height() * 0.5f; // 左上角 y
+
+    m_player.reset(spawnX, spawnY);          // 归位：清速度/冷却/击退/落水视觉
+    m_playerHp = m_playerMaxHp;             // 复活回满生命（含体魄加成后的上限）
+    m_playerInvincibleLeft = 0.0f;          // 过场期间先清零；终点再给 2s
+
+    // 相机瞬移对齐：复活是硬切场景点，不做平滑滑动（规格 camera snapTo）
+    SDL_GetWindowSize(m_window, &m_width, &m_height); // 窗口尺寸可能已变化
+    m_camera.setViewport(static_cast<float>(m_width), static_cast<float>(m_height)); // 视口
+    m_camera.snapTo(shrine.x, shrine.y);             // 镜头立即对准神龛中心
+    m_world.updateActiveChunks(m_renderer, m_camera); // 立即刷新 3x3 区块（防首帧空窗）
+
+    // 区状态回「未判定」：下一个 Playing 步骤重新判定区、弹横幅并注入
+    // 对应移速乘区（雪山复活后立即应用 x0.85——与过区同一路径）
+    m_currentZone = ZoneId::Count;
+
+    // 冒烟观测点：复活日志（规格「复活于（草地中心/雪山）」）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "复活于（%s）", shrine.name);
 }
 
 // 主动攻击入口（每个固定步调用一次）：「左键按住 -> 方向 -> 出手 -> 扫程推进」。
@@ -2609,21 +2953,23 @@ void PlayScene::spawnFloatingText(const char* text, float centerX, float topY,
     m_floatingTexts.back().spawn(text, centerX, topY, color, lifeSeconds); // 写入全部字段
 }
 
-// 最佳战绩结算：仅完整对局（生命归零）调用一次。比较三项纪录，任一被破
-// 就更新内存快照并立即写盘、播 record 音效；三项标记供结束界面逐项展示
+// 最佳战绩结算（批六乙口径）：死亡时与 M 回菜单时调用。
+// 比较三项纪录，任一被破就更新内存快照并立即写盘；全程静默——只打日志，
+// 不播 record、不弹「新纪录」界面（GameOver 退役）。菜单下次进入时读盘
+// 自然显示最新值（MenuScene::onEnter 的既有路径）
 void PlayScene::settleRecords()
 {
-    // 存活比较取整秒口径：与 HUD/结算的 mm:ss 展示一致（展示即截断），
-    // 避免「界面还是 01:05、纪录却按 65.9 秒」这类不一致
+    // 存活比较取整秒口径：与 HUD 的 mm:ss 展示一致（展示即截断），
+    // 避免「界面显示 01:05、纪录却按 65.9 秒」这类不一致
     const int survivalSeconds = static_cast<int>(m_survivalSeconds);
 
     // 逐项比较：严格大于才算破纪录（平纪录不算）
-    m_newKillRecord = m_killCount > m_best.kills;        // 破最高击杀？
-    m_newLevelRecord = m_level > m_best.level;           // 破最高等级？
-    m_newTimeRecord = survivalSeconds > m_best.seconds;  // 破最长存活？
+    const bool newKillRecord = m_killCount > m_best.kills;       // 破最高击杀？
+    const bool newLevelRecord = m_level > m_best.level;          // 破最高等级？
+    const bool newTimeRecord = survivalSeconds > m_best.seconds; // 破最长存活？
 
-    // 三项全平/未破：只记一条日志即可，不写盘、不播音效
-    if (!m_newKillRecord && !m_newLevelRecord && !m_newTimeRecord)
+    // 三项全平/未破：只记一条日志，不写盘（静默口径）
+    if (!newKillRecord && !newLevelRecord && !newTimeRecord)
     {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "本局未破最佳战绩（击杀 %d · 等级 %d · 存活 %d 秒）",
@@ -2632,31 +2978,31 @@ void PlayScene::settleRecords()
     }
 
     // 只更新被破的项（未破项保留历史值）；日志先于赋值——能打出旧纪录对照
-    if (m_newKillRecord)
+    if (newKillRecord)
     {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "新纪录！击杀 %d（旧纪录 %d）", m_killCount, m_best.kills);
         m_best.kills = m_killCount; // 写入新纪录
     }
-    if (m_newLevelRecord)
+    if (newLevelRecord)
     {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "新纪录！等级 %d（旧纪录 %d）", m_level, m_best.level);
         m_best.level = m_level; // 写入新纪录
     }
-    if (m_newTimeRecord)
+    if (newTimeRecord)
     {
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                     "新纪录！存活 %d 秒（旧纪录 %d 秒）", survivalSeconds, m_best.seconds);
         m_best.seconds = survivalSeconds; // 写入新纪录
     }
 
-    // 立即写盘（规格硬要求：破纪录即时落盘）。失败只警告并在内存里保留
-    // 新纪录（SaveData::save 内部已记录原因），本局的展示不受影响
+    // 立即写盘（规格：比较后写盘）。失败只警告并在内存里保留新纪录
+    //（SaveData::save 内部已记录原因），本局流程不受影响
     SaveData::save(m_best);
 
-    // 破纪录上行琶音（record，与游戏其他音效同一听觉体系）
-    m_audio->play(SoundId::Record);
+    // 说明：批六乙起不再播 SoundId::Record、不设置「新纪录」标记——
+    // 静默结算口径（旧 GameOver 界面的三项标记已随本批清理）
 }
 
 // 存活怪物计数：刷新上限的门控依据（池最多 12 个槽位，遍历成本可忽略）
@@ -2691,51 +3037,58 @@ float PlayScene::currentSpawnInterval() const
                     kSpawnIntervalFloor);
 }
 
-// 为指定空槽位寻找落点并生成怪物（批三正式版出生规则，契约见头文件）
+// 为指定空槽位寻找落点并生成怪物（批三出生规则 + 批六乙环带配平）
 bool PlayScene::spawnMonsterAtSlot(Monster& monster)
 {
-    // 玩家中心：出生距离校验的圆心（每步重取——玩家在移动，距离随人走）。
+    // 玩家中心：出生环带的圆心（每步重取——玩家在移动，环带随人走）。
     // 批四：取「碰撞盒（脚部）中心」——出生距离与物理判定同一口径
     const SDL_FRect playerBox = m_player.collisionRect();           // 玩家脚盒快照
     const float playerCenterX = playerBox.x + playerBox.w * 0.5f;   // 玩家盒中心 x（世界坐标）
     const float playerCenterY = playerBox.y + playerBox.h * 0.5f;   // 玩家盒中心 y
 
-    // 采样区域 = 激活区块窗口（批三正式版：怪物在激活区块内随机点出生）。
-    // 窗口已由 World 回钳在世界内；「区块索引 -> 像素」换算用区块边长
-    const float areaMinX = static_cast<float>(m_world.activeMinChunkX()) * World::kChunkPixels; // 区域左边界
-    const float areaMinY = static_cast<float>(m_world.activeMinChunkY()) * World::kChunkPixels; // 区域上边界
-    const float areaMaxX = static_cast<float>(m_world.activeMaxChunkX() + 1) * World::kChunkPixels; // 区域右边界（含末区块）
-    const float areaMaxY = static_cast<float>(m_world.activeMaxChunkY() + 1) * World::kChunkPixels; // 区域下边界
+    // 环带面积均匀采样的参数（批六乙）：半径平方在 [min², max²] 均匀，
+    // 再开方得到半径——这样环带内每个面积元被选中的概率相同
+    const float minRadiusSq = kMonsterSpawnRingMin * kMonsterSpawnRingMin; // 内径平方
+    const float maxRadiusSq = kMonsterSpawnRingMax * kMonsterSpawnRingMax; // 外径平方
+    constexpr float kTwoPi = 6.283185307179586f; // 2π（均匀角度）
 
     for (int attempt = 0; attempt < kMonsterSpawnAttempts; ++attempt)
     {
-        // 窗口矩形内均匀取点（x/y 各自独立均匀——矩形上面积均匀）
-        const float spawnCenterX = areaMinX + SDL_randf() * (areaMaxX - areaMinX); // 候选中心 x
-        const float spawnCenterY = areaMinY + SDL_randf() * (areaMaxY - areaMinY); // 候选中心 y
+        // 均匀角度 + 面积均匀半径：候选中心 = 玩家中心 + 极坐标偏移
+        const float angle = SDL_randf() * kTwoPi; // 角度 [0, 2π)
+        const float radiusSq = minRadiusSq + SDL_randf() * (maxRadiusSq - minRadiusSq); // 半径平方
+        const float radius = std::sqrt(radiusSq); // 半径（环带内面积均匀）
+        const float spawnCenterX = playerCenterX + std::cos(angle) * radius; // 候选中心 x
+        const float spawnCenterY = playerCenterY + std::sin(angle) * radius; // 候选中心 y
 
-        // 条件一：离玩家中心 >= kMonsterSpawnMinPlayerDistance（防贴脸刷新；
-        // 平方比较省一次开方）
-        const float dx = spawnCenterX - playerCenterX; // 与玩家的水平差
-        const float dy = spawnCenterY - playerCenterY; // 与玩家的垂直差
-        if (dx * dx + dy * dy <
-            kMonsterSpawnMinPlayerDistance * kMonsterSpawnMinPlayerDistance)
+        // 条件一：候选点必须在激活区块内（非激活区不生怪——批三门控）。
+        // 环带可能超出相机窗口（窗口半宽约 768~），因此必须显式校验
+        if (!m_world.isPointInActiveChunks(spawnCenterX, spawnCenterY))
         {
-            continue; // 离玩家太近：换一个候选
+            continue; // 出激活窗口：换一个候选
         }
 
         // 条件二：怪物「脚部碰撞盒」在候选点必须可走（批四起由整张精灵
-        // 改为碰撞盒口径——与移动判定一致，不会把脚生进墙里；精灵身体
-        // 贴墙叠压属正常画面）。
-        // 说明：采样区域 = 激活窗口，故候选点必在激活区块内（无需另查）
+        // 改为碰撞盒口径；isRectWalkable 同时拒绝墙与水——避水要求）。
+        // 精灵身体贴墙叠压属正常画面，脚盒不穿墙/不入水即可
         const SDL_FRect monsterBox =
             monster.collisionRectAt(spawnCenterX - monster.width() * 0.5f,  // 候选精灵左上角 x
                                     spawnCenterY - monster.height() * 0.5f); // 候选精灵左上角 y
         if (!m_world.isRectWalkable(monsterBox))
         {
-            continue; // 脚盒落点是墙：换一个候选
+            continue; // 脚盒落点是墙/水：换一个候选
         }
 
-        // 两个校验全过：等权随机变体 -> 槽位换皮 -> 落位生成。
+        // 条件三（防御）：圆心距落在环带内（浮点/边界退化时也不破规格）
+        const float dx = spawnCenterX - playerCenterX; // 与玩家的水平差
+        const float dy = spawnCenterY - playerCenterY; // 与玩家的垂直差
+        const float distanceSq = dx * dx + dy * dy;    // 圆心距平方
+        if (distanceSq < minRadiusSq || distanceSq > maxRadiusSq)
+        {
+            continue; // 环带外（理论不可达）：换一个候选
+        }
+
+        // 全部校验通过：等权随机变体 -> 槽位换皮 -> 落位生成。
         // 落点同时登记为「巢」（spawnAt 内部写入 AI）——出生点即巢，
         // 怪物自此绕它巡逻、以它为栓绳圆心
         const auto variant = static_cast<MonsterType>(
@@ -2745,7 +3098,7 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
         return true; // 生成成功：调用方接着写日志/累计
     }
 
-    // 重试耗尽（少见：窗口内可走区域被墙占满等极端情形）：本步不生成。
+    // 重试耗尽（少见：环带被墙/水/窗口边界占满等极端情形）：本步不生成。
     // 刷新时刻表已在调用方推进——下一次刷新时刻自然再试，不会死循环
     return false;
 }
@@ -2813,10 +3166,12 @@ void PlayScene::separateOverlappingMonsters()
     }
 }
 
-// 重开一局：把整局相关的数据全部恢复到初始状态
+// 重开一局：把整局相关的数据全部恢复到初始状态。
+// 批六乙：GameOver 退役后 R 已无触发分支；本函数保留为完整复位入口
+// （神龛/升级历史/落水过场等复位都在这里，供未来重开键或调试复用）
 void PlayScene::restart()
 {
-    // 强化与升级流程状态清零（M2 起源；批五B 拆分口径）：「R 重开清零
+    // 强化与升级流程状态清零（M2 起源；批五B 拆分口径）：「重开清零
     // 全部层数与效果」——九强化层数全清（商店购买从零开始）、欠账清空、
     // 面板选项清空、1/2/3 去重标记复位；抽取随机源不重播种：层数清零后
     // 法术池全开，沿用同一序列即可
@@ -2849,6 +3204,7 @@ void PlayScene::restart()
         handled = false; // 该项采样回「未按」
     }
     m_shopHandled = false;          // B 动作去重标记复位
+    m_activateHandled = false;      // 神龛激活键去重标记复位（批六乙）
 
     // 法术状态复位（批五B）：层数/冷却/护盾/飞行物/全部特效归零——
     // 新一局从零法术、无护盾开始（升级流程重新抽取法术）
@@ -2860,6 +3216,7 @@ void PlayScene::restart()
     {
         cooldown = 0.0f; // 本系冷却归零（新局待敌即施放）
     }
+    m_upgradeHistory.clear();    // 升级历史栈清空（批六乙：不跨局残留）
     m_playerShield = 0;          // 护盾清零（先盾后血的状态不跨局）
     m_fireballs.clear();         // 飞行中的火球清空（纯数据元素，直接清）
     m_fireballBlasts.clear();    // 火球爆炸特效清空
@@ -2887,11 +3244,19 @@ void PlayScene::restart()
     m_currentZone = ZoneId::Count; // 未判定哨兵（首个 Playing 步骤触发「进入区域：草地」）
     m_zoneBannerLeft = 0.0f;       // 横幅计时归零
 
-    // 「新纪录」标记复位：上一局的破纪录展示不带到新一局。
-    //（m_best 快照保留不动——它是整局的比较基准，只在结算成功时更新）
-    m_newKillRecord = false;
-    m_newLevelRecord = false;
-    m_newTimeRecord = false;
+    // 神龛与死亡过场复位（批六乙）：草地恢复激活/雪山恢复未激活；
+    // 提示/落水/复活计时全部清零；玩家下沉视觉恢复完整可见
+    resetShrineActivation(m_shrineActive); // 神龛默认状态写回
+    m_shrinePromptIndex = -1;              // 无激活提示
+    m_drownElapsed = 0.0f;                 // 落水计时清零
+    m_splashLeft = 0.0f;                   // 水花关闭
+    m_reviveTimer = 0.0f;                  // 复活计时清零
+    m_reviveTeleported = false;            // 瞬移标记复位
+    m_reviveShrineIndex = -1;              // 复活点选择清空
+    m_player.setDrownVisual(0.0f, 1.0f);   // 玩家视觉恢复（防残留淡出）
+
+    // 说明（批六乙）：m_best 快照保留不动——它是整局的比较基准，
+    // 只在死亡/M 退出结算时更新；GameOver 的「新纪录」标记已随界面退役
 
     // 怪物刷新计时复位：局内秒清零、首刷时刻回到首刷延迟、累计生成数清零
     m_monsterElapsed = 0.0f;                   // 难度计时重新起算
@@ -2946,7 +3311,7 @@ void PlayScene::restart()
     // 最后切回 Playing，新一局正式开始
     m_state = PlayState::Playing;
 
-    // 冒烟观测点：确认 R 重开真正触发（自动化测试据此断言）
+    // 复位入口日志（当前无按键触发；未来重开入口接入后即冒烟观测点）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "重开一局");
 }
 
@@ -2979,6 +3344,10 @@ void PlayScene::render(float alpha)
     // 背景图自批二起退役（区块地板取代；MenuScene 仍继续使用 background.png）
     m_world.render(m_renderer, m_camera);
 
+    // 神龛（批六乙）：世界层装饰——画在世界之上、玩家/怪物之下。
+    // 激活态选亮帧、未激活选暗帧；相机视口外自动跳过
+    renderShrines();
+
     // 灼烧光环（批五B）：玩家脚下的常驻火环——画在玩家之前（地面层观感），
     // 旋转相位 = 存活秒（暂停/商店冻结时画面完全静止）；未学则不画
     renderBurnAuraFx(alpha);
@@ -2987,6 +3356,9 @@ void PlayScene::render(float alpha)
     // 受击反馈由玩家自身的击退位移与红染（Player::render 内叠加）承担，
     // 每帧连续绘制保证「逐帧无跳隐」的画面（冒烟连拍核验点）
     m_player.render(m_renderer, alpha, m_camera);
+
+    // 水花（批六乙）：落水前 0.4s 的水面飞溅——画在玩家之后（盖住入水点）
+    renderSplashFx();
 
     // 护盾罩（批五B）：有护盾时罩在玩家身上（呼吸缩放 + 按剩余量调透明度）
     //——画在玩家之后（罩在外面）、怪物之前（不遮住逼近的敌人）
@@ -3059,9 +3431,114 @@ void PlayScene::render(float alpha)
 
     // 游戏世界画完后再叠加 HUD 文字
     renderHud();
+
+    // 复活渐暗渐亮（批六乙）：放在最后一层——0.6s 内黑幕 0 -> 255 -> 0，
+    // 中点瞬移被全黑遮住；过场期间 HUD 也一起被覆盖，观感是完整的一幕
+    renderReviveFade();
 }
 
-// 绘制 HUD 文字（左下角 FPS、暂停叠层、结束界面）。
+// 绘制两座神龛（批六乙）：世界坐标 -> 相机换算；激活态用亮帧（源 x=64）、
+// 未激活用暗帧（源 x=0）。素材是 2 帧横向排列（每帧 64x80）。
+// 只画与视口相交的项；素材缺失静默跳过（纯视觉增强）
+void PlayScene::renderShrines() const
+{
+    // 素材缺失（加载失败）：没有可画内容
+    if (m_shrineTexture == nullptr)
+    {
+        return;
+    }
+
+    // 视口尺寸：用于简单的屏幕裁剪（避免为不可见神龛提交绘制）
+    const float viewW = m_camera.viewportWidth();  // 视口宽
+    const float viewH = m_camera.viewportHeight(); // 视口高
+
+    for (int i = 0; i < kShrineCount; ++i) // 逐座神龛绘制
+    {
+        const ShrineDef& shrine = kShrineDefs[i]; // 本座定义（世界坐标）
+        const Vec2 screen = m_camera.worldToScreen(shrine.x, shrine.y); // 中心 -> 屏幕
+
+        // 目标矩形：中心对齐神龛坐标，底部按 kShrineDrawLift 上抬
+        const SDL_FRect dst{ screen.x - kShrineDrawWidth * 0.5f,          // 左上角 x
+                             screen.y - kShrineDrawLift,                  // 左上角 y（底部贴近落点）
+                             kShrineDrawWidth,                            // 绘制宽
+                             kShrineDrawHeight };                         // 绘制高
+
+        // 视口裁剪：完全在屏幕外则跳过
+        if (dst.x + dst.w <= 0.0f || dst.y + dst.h <= 0.0f ||
+            dst.x >= viewW || dst.y >= viewH)
+        {
+            continue; // 不可见：不提交绘制
+        }
+
+        // 源帧：激活 -> 第二帧（亮），未激活 -> 第一帧（暗）
+        const SDL_FRect src{ m_shrineActive[i] ? kShrineDrawWidth : 0.0f, // 帧横向起点
+                             0.0f,                                        // 单行帧表：y 恒 0
+                             kShrineDrawWidth,                            // 帧宽
+                             kShrineDrawHeight };                         // 帧高
+        SDL_RenderTexture(m_renderer, m_shrineTexture, &src, &dst); // 裁帧绘制
+    }
+}
+
+// 绘制水花（批六乙）：寿命内从 0.6 倍放大到 1.5 倍并线性淡出。
+// 寿命 / 位置由 enterDrowning 与 updateDrowning 维护（世界层单实例）
+void PlayScene::renderSplashFx() const
+{
+    // 无素材/水花已结束：跳过
+    if (m_splashTexture == nullptr || m_splashLeft <= 0.0f)
+    {
+        return;
+    }
+
+    // 进度 [0,1]：0 = 刚入水，1 = 水花结束（寿命递减到 0）
+    const float progress = 1.0f - std::clamp(m_splashLeft / kDrownSplashSeconds, 0.0f, 1.0f);
+    const float scale = 0.6f + progress * 0.9f; // 放大：0.6 -> 1.5
+    const float drawSize = kDrownSplashSize * scale; // 当前绘制边长
+    const Vec2 screen = m_camera.worldToScreen(m_splashPos.x, m_splashPos.y); // 水花中心 -> 屏幕
+
+    // 目标矩形：以接触点为中心摆放
+    const SDL_FRect dst{ screen.x - drawSize * 0.5f, // 左上角 x
+                         screen.y - drawSize * 0.5f, // 左上角 y
+                         drawSize,                   // 绘制宽
+                         drawSize };                 // 绘制高
+
+    // 透明度随进度线性淡出；绘制后恢复 255（防污染后续绘制）
+    SDL_SetTextureAlphaMod(m_splashTexture,
+                           static_cast<Uint8>((1.0f - progress) * 255.0f));
+    SDL_RenderTexture(m_renderer, m_splashTexture, nullptr, &dst); // 整张水花绘制
+    SDL_SetTextureAlphaMod(m_splashTexture, 255);                  // 还原不透明
+}
+
+// 绘制复活渐暗渐亮（批六乙）：0.6s 合计——前 0.3s 黑幕 alpha 0->1，
+// 后 0.3s 1->0。中点瞬移发生在全黑瞬间（画面切换不可见）
+void PlayScene::renderReviveFade() const
+{
+    // 只在复活过场中绘制
+    if (m_state != PlayState::Reviving)
+    {
+        return;
+    }
+
+    const float half = kReviveFadeSeconds * 0.5f; // 半程（0.3s）
+    float alpha01 = 0.0f;                        // 黑幕不透明度 [0,1]
+    if (m_reviveTimer < half) // 前半程：渐暗
+    {
+        alpha01 = m_reviveTimer / half; // 0 -> 1
+    }
+    else // 后半程：渐亮
+    {
+        alpha01 = 1.0f - (m_reviveTimer - half) / half; // 1 -> 0
+    }
+    alpha01 = std::clamp(alpha01, 0.0f, 1.0f); // 防御夹取（浮点边界）
+
+    // 混合模式绘制全屏纯黑遮罩（alpha 随过场变化）
+    SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND); // 打开混合
+    SDL_SetRenderDrawColor(m_renderer, 0, 0, 0,
+                           static_cast<Uint8>(alpha01 * 255.0f)); // 黑色 + 当前 alpha
+    SDL_RenderFillRect(m_renderer, nullptr); // 全屏填充
+    SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
+}
+
+// 绘制 HUD 文字（左下角 FPS、暂停叠层、神龛提示）。
 // 游戏文案统一走 Font（TTF 中文字体）：传入屏幕像素坐标，文字颜色由调用
 // 前的 SDL_SetRenderDrawColor 决定；左下角 FPS 调试行例外，仍用 DebugText
 // （SDL 内置调试字体，仅 ASCII，观感与改造前一致）
@@ -3077,12 +3554,12 @@ void PlayScene::renderHud()
     const float screenW = static_cast<float>(outW); // 屏幕宽（像素）
     const float screenH = static_cast<float>(outH); // 屏幕高（像素）
 
-    // Paused / LevelUp / Shop / GameOver 叠层加半透明暗化遮罩：把游戏
-    //世界（区块/玩家/怪物）整体压暗，让叠层文字从画面中浮出来（LevelUp/
-    // Shop 的面板同样悬浮在压暗的世界之上）。绘制顺序：遮罩放在最前——
-    // 之后绘制的 FPS 行与叠层文字都压在遮罩之上，保持全亮
+    // Paused / LevelUp / Shop 叠层加半透明暗化遮罩：把游戏世界（区块/
+    // 玩家/怪物）整体压暗，让叠层文字从画面中浮出来。落水/复活不加这层
+    // 遮罩（落水由水花/下沉表现，复活由 renderReviveFade 的全黑过场）。
+    // 绘制顺序：遮罩放在最前——之后绘制的 FPS 行与叠层文字都压在遮罩之上
     if (m_state == PlayState::Paused || m_state == PlayState::LevelUp ||
-        m_state == PlayState::Shop || m_state == PlayState::GameOver)
+        m_state == PlayState::Shop)
     {
         // 打开混合模式：颜色按 alpha 与画面混合（默认模式会直接覆盖）
         if (!SDL_SetRenderDrawBlendMode(m_renderer, SDL_BLENDMODE_BLEND))
@@ -3104,8 +3581,8 @@ void PlayScene::renderHud()
     }
 
     // ---- 左下角：FPS / 帧时间（灰白色小字，F3 控制显隐）----
-    // 放在状态分支之前：无论 Playing/Paused/GameOver 都显示，方便对比
-    // 三种状态下渲染性能的差异（数值来自 EMA，会逐帧连续变化）。
+    // 放在状态分支之前：无论 Playing/Paused/落水/复活都显示，方便对比
+    // 各状态下渲染性能的差异（数值来自 EMA，会逐帧连续变化）。
     // 这行是调试信息而非游戏 UI 文案，保持 SDL 内置调试字体（ASCII）
     if (m_fpsVisible)
     {
@@ -3153,16 +3630,18 @@ void PlayScene::renderHud()
         SDL_SetRenderDrawColor(m_renderer, 8, 14, 26, alpha8); // 近黑蓝（同透明度）
         m_bigFont.drawCentered(m_renderer, zoneName, bannerCenterX + 3.0f, bannerY + 3.0f);
 
-        // 主体层（近白偏冰蓝）：大号字（m_bigFont，与暂停/结束标题同字号）
+        // 主体层（近白偏冰蓝）：大号字（m_bigFont，与暂停标题同字号）
         SDL_SetRenderDrawColor(m_renderer, 225, 238, 255, alpha8); // 亮冰白
         m_bigFont.drawCentered(m_renderer, zoneName, bannerCenterX, bannerY);
     }
 
-    // ---- 生存 HUD（Playing / LevelUp / Shop / Paused 都显示）----
+    // ---- 生存 HUD（Playing/LevelUp/Shop/Paused/Drowning/Reviving 都显示）----
     // 暂停/升级/商店时保留完整 HUD：玩家能看清冻结时刻的生命/等级/经验/
-    // 击杀/存活（升级与商店面板悬浮其上）；GameOver 不显示（结束界面有自己的排版）
+    // 击杀/存活（升级与商店面板悬浮其上）；落水/复活过场也保留（惩罚后的
+    // 金币/等级变化在复活过程中可见）。GameOver 界面已退役，不在此列
     if (m_state == PlayState::Playing || m_state == PlayState::Paused ||
-        m_state == PlayState::LevelUp || m_state == PlayState::Shop)
+        m_state == PlayState::LevelUp || m_state == PlayState::Shop ||
+        m_state == PlayState::Drowning || m_state == PlayState::Reviving)
     {
         // 条状 HUD 几何常量（左上角第一块内容）
         constexpr float kBarX = 20.0f;    // 条左边界（与后续文字同一条左边线）
@@ -3216,7 +3695,7 @@ void PlayScene::renderHud()
         }
         else
         {
-            SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255); // 白：常规（含窗口结束）
+            SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255); // 白：常规（含瞬闪窗口结束）
         }
         char levelText[48]; // 容纳 "等级: " + 最长数字，绰绰有余
         SDL_snprintf(levelText, sizeof(levelText), "等级: %d", m_level);
@@ -3262,6 +3741,26 @@ void PlayScene::renderHud()
         // 法术 HUD（批五B）：右下角已学法术图标行 + 层数 + 冷却条——
         // 与生存 HUD 同一显示条件（对局进行/冻结中都能看到当前法况）
         renderSpellHud(screenW, screenH);
+
+        // 神龛激活提示（批六乙）：仅 Playing 且半径内存在未激活神龛时显示。
+        // 文案「按 X 激活」——X 取 config 的 bind_activate 键名（默认 E），
+        // 改键后提示与实际绑定保持一致
+        if (m_state == PlayState::Playing && m_shrinePromptIndex >= 0 &&
+            m_shrinePromptIndex < kShrineCount)
+        {
+            char promptText[96]; // 容纳「按 E 激活（雪山）」，绰绰有余
+            SDL_snprintf(promptText, sizeof(promptText), "按 %s 激活（%s）",
+                         m_activateKeyLabel.c_str(),                  // 配置的激活键名
+                         shrineDef(m_shrinePromptIndex).name);         // 神龛名（雪山/草地中心）
+
+            const float promptCenterX = screenW * 0.5f;                // 屏幕水平居中
+            const float promptY = screenH * kShrinePromptYRatio;       // 屏幕下方提示位
+            SDL_SetRenderDrawColor(m_renderer, 8, 14, 26, 255);        // 暗影层：近黑蓝
+            m_hudFont.drawCentered(m_renderer, promptText, promptCenterX + 2.0f, promptY + 2.0f);
+            SDL_SetRenderDrawColor(m_renderer, 255, 236, 160, 255);    // 主体：暖金色
+            m_hudFont.drawCentered(m_renderer, promptText, promptCenterX, promptY);
+            SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);    // 还原白色（后续绘制默认色）
+        }
     }
 
     if (m_state == PlayState::Paused)
@@ -3284,77 +3783,6 @@ void PlayScene::renderHud()
 
         // 回菜单提示（白色，常规 HUD 字号）
         m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, screenH * 0.66f);
-    }
-    else if (m_state == PlayState::GameOver)
-    {
-        // GameOver 界面（结算）：游戏结束 + 本局成绩（等级/击杀/存活）+
-        // 三项最佳战绩（被破项旁标「新纪录！」）+ 两条操作提示，
-        // 全部水平居中、围绕窗口中心排布
-
-        // 水平中心与基准纵坐标：各行文字共用（基准取屏幕中心，行距 44 像素）
-        const float screenCenterX = screenW / 2.0f;
-        const float centerY = screenH / 2.0f;
-
-        // 第一行：游戏结束（白色大号标题）
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_bigFont.drawCentered(m_renderer, "游戏结束", screenCenterX, centerY - 150.0f);
-
-        // 第二行：本局等级（黄色）——冒烟观测点：结束界面的「等级: N」
-        char levelText[48]; // 容纳 "等级: " + 最长数字，绰绰有余
-        SDL_snprintf(levelText, sizeof(levelText), "等级: %d", m_level);
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 0, 255);
-        m_hudFont.drawCentered(m_renderer, levelText, screenCenterX, centerY - 60.0f);
-
-        // 第三行：本局击杀与存活（黄色，mm:ss）——保留旧结算信息
-        char runText[64];      // 容纳 "击杀: 999 · 存活: mm:ss"，绰绰有余
-        char survivalText[48]; // 容纳「存活: mm:ss」，绰绰有余
-        formatSurvivalText(survivalText, sizeof(survivalText), m_survivalSeconds);
-        SDL_snprintf(runText, sizeof(runText), "击杀: %d · %s", m_killCount, survivalText);
-        m_hudFont.drawCentered(m_renderer, runText, screenCenterX, centerY - 10.0f);
-
-        // 第四~六行：三项最佳战绩（白色）；被破的项旁配金色「新纪录！」。
-        // 行内布局：先量正文宽度，正文居中绘制后把标记放在其右缘空 12 像素处
-        // ——「该项旁」的逐项标记（而不是全局一条）
-        const auto drawRecordLine = [&](const char* label, float y, bool newRecord)
-        {
-            // 正文（该项纪录）：白色绘制
-            SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-            m_hudFont.drawCentered(m_renderer, label, screenCenterX, y);
-
-            // 未破的项：不画标记，直接结束本行
-            if (!newRecord)
-            {
-                return;
-            }
-
-            // 量出正文宽度：标记紧贴正文右侧（正文居中的右缘坐标 = 中心 + 半宽）
-            const SDL_FPoint size = m_hudFont.measure(label);
-            SDL_SetRenderDrawColor(m_renderer, 255, 215, 0, 255); // 金色：与升级飘字同一高光色
-            m_hudFont.draw(m_renderer, "新纪录！", screenCenterX + size.x / 2.0f + 12.0f, y);
-        };
-
-        // 最高击杀（纪录值来自 m_best——结算后已更新为最新值）
-        char bestKillText[64]; // 容纳 "最高击杀: " + 最长数字，绰绰有余
-        SDL_snprintf(bestKillText, sizeof(bestKillText), "最高击杀: %d", m_best.kills);
-        drawRecordLine(bestKillText, centerY + 50.0f, m_newKillRecord);
-
-        // 最高等级
-        char bestLevelText[64]; // 容纳 "最高等级: " + 最长数字，绰绰有余
-        SDL_snprintf(bestLevelText, sizeof(bestLevelText), "最高等级: %d", m_best.level);
-        drawRecordLine(bestLevelText, centerY + 94.0f, m_newLevelRecord);
-
-        // 最长存活（整秒 -> mm:ss；与 HUD 的存活展示同口径）
-        char bestTimeText[64]; // 容纳 "最长存活: mm:ss"，绰绰有余
-        SDL_snprintf(bestTimeText, sizeof(bestTimeText), "最长存活: %02d:%02d",
-                     m_best.seconds / 60, m_best.seconds % 60);
-        drawRecordLine(bestTimeText, centerY + 138.0f, m_newTimeRecord);
-
-        // 第七行：重开提示（白色）
-        SDL_SetRenderDrawColor(m_renderer, 255, 255, 255, 255);
-        m_hudFont.drawCentered(m_renderer, "按 R 重新开始", screenCenterX, centerY + 200.0f);
-
-        // 第八行：回菜单提示（白色）。行距与上一行保持一致
-        m_hudFont.drawCentered(m_renderer, "按 M 返回菜单", screenCenterX, centerY + 244.0f);
     }
     else if (m_state == PlayState::LevelUp)
     {

@@ -150,8 +150,14 @@ void GameDev::bindInputActions()
 
     // 对局控制（pressed 边缘：暂停/重开/回菜单）
     bindAction("pause", "bind_pause", "ESC", SDL_SCANCODE_ESCAPE);
+    // 重开：GameOver 退役后已无触发场景（批六乙），绑定保留以兼容旧配置；
+    // 代码侧不再查询该动作——「R 无效果」的最终口径见批六乙报告
     bindAction("restart", "bind_restart", "R", SDL_SCANCODE_R);
     bindAction("menu", "bind_menu", "M", SDL_SCANCODE_M);
+
+    // 神龛激活（批六乙；pressed 边缘：走近未激活复活点后按 E）。
+    // 默认 E、可在 config 用 bind_activate 改键——提示文案也读取同一键名
+    bindAction("activate", "bind_activate", "E", SDL_SCANCODE_E);
 
     // 菜单确认（pressed 边缘：菜单按确认进入对局）
     bindAction("confirm", "bind_confirm", "ENTER", SDL_SCANCODE_RETURN);
