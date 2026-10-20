@@ -10,6 +10,7 @@
 #include "game/Zone.h"          // Zone：世界分区（草地/雪山——区表/查询/移速乘区；批六甲）
 #include "game/Player.h"        // Player：玩家实体（移动 + 主动攻击 + 武器横扫表现）
 #include "game/Monster.h"       // Monster：追击怪物（三变体、对象池、批三 AI 生态）
+#include "game/MonsterRecycle.h" // MonsterRecycle：远处休眠怪回收判据（批六补丁，纯逻辑）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
 #include "game/Coin.h"          // Coin：怪物掉落的金币（批三局内货币）
 #include "game/LevelCurve.h"    // LevelCurve：升级经验曲线（纯逻辑，tests/xp_test.cpp 直测）
@@ -533,6 +534,18 @@ private:
     // 成功则 loadVariant（换皮）-> spawnAt（落位、出生点即巢）并返回 true
     bool spawnMonsterAtSlot(Monster& monster);
 
+    // 远处休眠怪物回收（批六补丁·跨区槽位解锁）：在怪物更新与刷新之前
+    // 每固定步扫描一次对象池（池 <= 12，开销可忽略）——对满足三条件的
+    // 怪物执行 despawn 回池并打日志「回收远处怪物（变体，距玩家 N px）」：
+    //   1. 所在区块非激活（休眠中，不在玩家眼前）；
+    //   2. AI 处于巡逻（未仇恨、未回巢——追击/回巢中的怪不回收）；
+    //   3. 距玩家中心严格大于 1800px（相机 3x3 窗口之外）。
+    // 玩家跨区后的第一个固定步也走同一路径（本函数每步执行），旧区占满
+    // 的 12 槽位会迅速释放，新区刷新门控「存活 < 上限」因此重新通过。
+    // 判据抽为纯函数 shouldRecycleDormantMonster（game/MonsterRecycle.h），
+    // 场景只负责取三输入、执行回收与日志
+    void recycleDormantMonsters(float playerCenterX, float playerCenterY);
+
     // 把与玩家碰撞盒重叠的怪物按最小分离量推出（批四·体积碰撞兜底）：
     // 覆盖正常热更顺序之外的所有重叠来源（击退/瞬移落点、上一帧遗留）；
     // 玩家优先不动——被推的永远是怪物（推不动就原地等下一帧）
@@ -928,7 +941,7 @@ private:
     // 减速与冻结条都是纯逻辑小类（game/ElementStatus.h）：本场景负责
     // 计时推进、移速重注入、玩家锁定/HUD 显示与日志
     SlowStatus m_playerSlow;   // 冰史莱姆减速计时（x0.8 / 3s，刷新不叠乘）
-    FreezeMeter m_freezeMeter; // 冻结条（0~100；满 100 冻结 1.5s；衰减 10/s；2s 缓冲）
+    FreezeMeter m_freezeMeter; // 冻结条（0~100；满 100 冻结 1.5s；连续 3s 未受霜击后衰减 10/s；2s 缓冲）
 
     // ---- 分区运行时（批六甲；restart 复位）----
     // 当前所在区：ZoneId::Count = 尚未判定（进局/重开后首个 Playing 固定步

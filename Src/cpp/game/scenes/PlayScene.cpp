@@ -1221,7 +1221,8 @@ void PlayScene::update(const UpdateContext& ctx)
         // 冒烟观测点：减速结束（与「冰霜减速命中」成对）
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "冰霜减速结束（移速恢复）");
     }
-    // 冻结条：冻结中倒数 1.5s；结束后清条并给 2s 抗冻缓冲；其余时间每秒衰减 10
+    // 冻结条：冻结中倒数 1.5s；结束后清条并给 2s 抗冻缓冲；其余时间
+    // 连续 3s 未受霜击才开始每秒衰减 10（批六补丁：霜击会刷新延迟计时）
     const FreezeTickResult freezeTick = m_freezeMeter.update(ctx.deltaTime);
     if (freezeTick.freezeEnded)
     {
@@ -1331,6 +1332,14 @@ void PlayScene::update(const UpdateContext& ctx)
         enterDrowning(); // 状态切换 + 水花落点 + 无敌 + 快照
         return;          // 本步剩余战斗逻辑不再执行
     }
+
+    // ---- 远处休眠怪物回收（批六补丁·跨区槽位解锁）----
+    // 每固定步在怪物更新/刷新之前扫描对象池：玩家跨区后的第一步也在这里
+    // 执行，旧区占满的槽位立即释放——新区刷新门控「存活 < 上限」随之恢复。
+    // 三条件判据（非激活 + 巡逻 + 距离 >1800px）见 recycleDormantMonsters
+    const SDL_FRect recyclePlayerBox = m_player.collisionRect();          // 玩家脚盒快照
+    recycleDormantMonsters(recyclePlayerBox.x + recyclePlayerBox.w * 0.5f, // 玩家中心 x
+                           recyclePlayerBox.y + recyclePlayerBox.h * 0.5f); // 玩家中心 y
 
     // 主动攻击结算：每个固定步按「左键按住 + 冷却就绪」尝试一次横扫——
     // 方向取鼠标瞄准（不索敌、挥空也出招），命中由扇形判定逐只结算
@@ -3164,6 +3173,54 @@ float PlayScene::currentSpawnInterval() const
 {
     return std::max(m_monsterSpawnInterval - m_monsterElapsed * kSpawnIntervalDecay,
                     kSpawnIntervalFloor);
+}
+
+// 远处休眠怪物回收（批六补丁·跨区槽位解锁）：契约与三条件见头文件。
+// 每固定步在怪物更新/刷新前调用一次；判据走纯函数（单测直测），
+// 本函数只负责取值、回池与日志——日志文案是跨区槽位解锁的冒烟观测点。
+void PlayScene::recycleDormantMonsters(float playerCenterX, float playerCenterY)
+{
+    for (Monster& monster : m_monsters)
+    {
+        if (!monster.isAlive()) // 空槽位：没有可回收的对象
+        {
+            continue; // 跳过（回收的目标是占用池子的存活怪）
+        }
+
+        // 三条件输入一：怪物中心是否处于激活区块（用完整精灵中心——
+        // 与「非激活区跳过更新」的门控口径一致，见怪物更新循环）
+        const SDL_FRect monsterRect = monster.rect();                        // 本步怪物矩形快照
+        const float monsterCenterX = monsterRect.x + monsterRect.w * 0.5f;   // 怪物中心 x
+        const float monsterCenterY = monsterRect.y + monsterRect.h * 0.5f;   // 怪物中心 y
+        const bool inActiveChunks = m_world.isPointInActiveChunks(monsterCenterX, // 激活区块判定
+                                                                  monsterCenterY); // 同一中心 y
+
+        // 三条件输入二：AI 是否巡逻（未仇恨、未回巢——Chase/Return 不回收）
+        const bool patrolling = monster.isPatrolling();
+
+        // 三条件输入三：怪物中心到玩家中心的欧氏距离（与出生环带/仇恨
+        // 半径同一「中心 -> 中心」口径）
+        const float dx = monsterCenterX - playerCenterX; // 水平差
+        const float dy = monsterCenterY - playerCenterY; // 垂直差
+        const float distance = std::sqrt(dx * dx + dy * dy); // 距离（像素）
+
+        // 纯函数判据：非激活 + 巡逻 + 严格 >1800px 三条件同时满足才回收
+        if (!shouldRecycleDormantMonster(inActiveChunks, patrolling, distance))
+        {
+            continue; // 任一条件不满足：保留本怪物（追击/回巢/近处/激活区）
+        }
+
+        // 先保存变体与距离再回收：despawn 只改状态不清类型，但日志参数
+        // 统一在回收前取值，避免未来 despawn 语义变化影响日志
+        const MonsterType recycledType = monster.type(); // 被回收的变体（日志用）
+        monster.despawn(); // 回收回池：未激活 + 清目标/红染/减速/AI/攻击状态
+
+        // 冒烟观测点：回收日志（跨区槽位解锁的最小复现断言点——文案含
+        // 变体名与距离；需求规格原文「回收远处怪物（变体，距玩家 N px）」）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "回收远处怪物（%s，距玩家 %.0f px）",
+                    monsterTypeName(recycledType), distance);
+    }
 }
 
 // 为指定空槽位寻找落点并生成怪物（批三出生规则 + 批六乙环带配平）
