@@ -776,3 +776,58 @@ set_target_properties(monster_recycle_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  粒子池与相机震屏单元测试（particle_shake_test，M3·甲）
+#
+#  被测对象：
+#    - libs/GameEngine/src/ParticleSystem.cpp（固定池粒子：
+#      发射 / 池满覆盖最旧 / 寿命到期释放 / 重力与阻尼推进 / 清空）；
+#    - libs/GameEngine/include/engine/Camera.h 的震屏
+#      （addShake / update 线性衰减 / shakeOffset 边界 / clearShake /
+#       worldToScreen 含抖动而 screenToWorld 稳定）。
+#
+#  与 collision_homing_test 同模式：编译引擎源码并链接主工程构建出的
+#  SDL3 导入库（ParticleSystem.cpp 的 render 路径引用 SDL 绘制符号）。
+#  实际跑到的路径全部是纯计算（不创建窗口、不调用 render），任何环境
+#  都能确定性运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\particle_shake_test.exe
+# ============================================================
+
+add_executable(particle_shake_test
+    particle_shake_test.cpp
+    ../libs/GameEngine/src/ParticleSystem.cpp
+)
+
+if (MSVC)
+    target_compile_options(particle_shake_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：引擎头在子模块，SDL 头在 vendor
+target_include_directories(particle_shake_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 链接主工程构建出的 SDL3 导入库（ParticleSystem::render 引用绘制符号）
+target_link_libraries(particle_shake_test PRIVATE
+    "${TESTS_SDL3_BUILD_DIR}/vendor/SDL-main/SDL3.lib")
+
+# 运行目录放一份 SDL3.dll（与主工程同一份构建产物）
+add_custom_command(TARGET particle_shake_test POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${TESTS_SDL3_BUILD_DIR}/SDL3.dll"
+    "$<TARGET_FILE_DIR:particle_shake_test>"
+)
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(particle_shake_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
