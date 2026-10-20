@@ -26,6 +26,188 @@ void formatSurvivalText(char* buffer, size_t size, float seconds)
     SDL_snprintf(buffer, size, "存活: %02d:%02d", total / 60, total % 60);
 }
 
+// ============================================================
+// 粒子与震屏参数（M3·甲；代码常量，不进配置——观感调参集中在这里）
+// ============================================================
+// 粒子数量（个）：按事件重要性分档——受击/击杀/拾取是高频小反馈（6~12），
+// 升级与法术是低频高光（16~24）。池容量 512，同帧多事件叠加仍有富余
+constexpr int kPlayerHitSparkCount = 10;    // 玩家受击：红色火花（少量）
+constexpr int kMonsterHitSparkCount = 6;    // 横扫命中：怪物处小火花
+constexpr int kMonsterDeathSparkCount = 12; // 击杀：怪物颜色系爆散（规格 10~16）
+constexpr int kGemPickupSparkCount = 6;     // 拾取经验宝石：青色火花
+constexpr int kCoinPickupSparkCount = 6;    // 拾取金币：金色火花
+constexpr int kLevelUpSparkCount = 24;      // 升级：金色向上爆散
+constexpr int kFireballSparkCount = 16;     // 火球爆炸：橙红火花
+constexpr int kFrostNovaSparkCount = 18;    // 冰环：青蓝碎片感
+
+// 角度常量（弧度）：整圆张角与半圆/向上方向的可读名字
+constexpr float kPi = 3.14159265359f;  // π：向上方向 = -π/2
+constexpr float kFullCircle = 6.28318530718f; // 2π：整圆随机张角
+
+// 震屏参数（M3·甲；只扰渲染，鼠标世界瞄准稳定）：
+// 受击 6px/0.15s（规格示例）、击杀 2px/0.1s、升级 3px/0.12s；
+// 振幅是最大偏移长度（像素），时长是线性衰减总时长（秒）
+constexpr float kShakePlayerHitAmplitude = 6.0f;  // 玩家受击震屏振幅（像素）
+constexpr float kShakePlayerHitSeconds = 0.15f;   // 玩家受击震屏时长（秒）
+constexpr float kShakeKillAmplitude = 2.0f;       // 击杀震屏振幅（像素）
+constexpr float kShakeKillSeconds = 0.10f;        // 击杀震屏时长（秒）
+constexpr float kShakeLevelUpAmplitude = 3.0f;    // 升级震屏振幅（像素）
+constexpr float kShakeLevelUpSeconds = 0.12f;     // 升级震屏时长（秒）
+
+// 玩家受击火花：红色为主、整圆飞溅、带重力回落——「被打出血花」的短促反馈
+ParticleParams makePlayerHitSparks()
+{
+    ParticleParams params; // 默认参数包（下面逐字段覆盖）
+    params.color = SDL_Color{ 255, 70, 50, 255 }; // 红色（偏橙，暗底可读）
+    params.speedMin = 60.0f;                      // 初速下限（像素/秒）
+    params.speedMax = 180.0f;                     // 初速上限（像素/秒）
+    params.lifeMin = 0.25f;                       // 寿命下限（秒）
+    params.lifeMax = 0.45f;                       // 寿命上限（秒）
+    params.sizeMin = 2.0f;                        // 边长下限（像素）
+    params.sizeMax = 4.0f;                        // 边长上限（像素）
+    params.spreadRadians = kFullCircle;           // 整圆：向四周飞溅
+    params.gravityY = 260.0f;                     // 重力：火花下坠
+    params.damping = 2.5f;                        // 阻尼：快速减速（短促）
+    return params;                                // 交还本事件参数
+}
+
+// 横扫命中火花：白黄色小火花，寿命很短（0.15~0.28s）——只做「刀刃擦中」提示
+ParticleParams makeMonsterHitSparks()
+{
+    ParticleParams params; // 默认参数包
+    params.color = SDL_Color{ 255, 235, 170, 255 }; // 白黄（金属火花感）
+    params.speedMin = 80.0f;                        // 初速下限
+    params.speedMax = 190.0f;                       // 初速上限
+    params.lifeMin = 0.15f;                         // 寿命下限（比受击更短）
+    params.lifeMax = 0.28f;                         // 寿命上限
+    params.sizeMin = 1.5f;                          // 小火花边长下限
+    params.sizeMax = 3.0f;                          // 小火花边长上限
+    params.spreadRadians = kFullCircle;             // 整圆飞溅
+    params.gravityY = 180.0f;                       // 轻微下坠
+    params.damping = 3.0f;                          // 强阻尼：火花一触即散
+    return params;                                  // 交还本事件参数
+}
+
+// 击杀爆散颜色：按怪物变体取同色系（草地三型绿/黄绿/骨白；
+// 雪山三型冰蓝/霜蓝/淡青）——「怪物颜色系爆散」的直观落点
+SDL_Color monsterDeathColor(MonsterType type)
+{
+    switch (type) // 逐变体派发颜色
+    {
+    case MonsterType::Slime:       return SDL_Color{ 120, 230, 120, 255 }; // 草地史莱姆：草绿
+    case MonsterType::Goblin:      return SDL_Color{ 170, 220, 90, 255 };  // 草地哥布林：黄绿
+    case MonsterType::Skelet:      return SDL_Color{ 230, 225, 210, 255 }; // 草地骷髅：骨白
+    case MonsterType::IceSlime:    return SDL_Color{ 120, 220, 255, 255 }; // 冰史莱姆：冰蓝
+    case MonsterType::FrostGoblin: return SDL_Color{ 150, 205, 255, 255 }; // 霜哥布林：霜蓝
+    case MonsterType::FrostSkelet: return SDL_Color{ 190, 235, 255, 255 }; // 霜骷髅：淡青
+    default:                       return SDL_Color{ 230, 230, 230, 255 }; // 防御：异常变体用骨白
+    }
+}
+
+// 击杀爆散：12 粒（规格 10~16），速度/寿命/尺寸都比命中火花更大更久，
+// 整圆四散 + 重力回落——「怪物被打碎」的收尾高光
+ParticleParams makeMonsterDeathBurst(MonsterType type)
+{
+    ParticleParams params;                    // 默认参数包
+    params.color = monsterDeathColor(type);   // 颜色 = 变体同色系
+    params.speedMin = 90.0f;                  // 初速下限
+    params.speedMax = 240.0f;                 // 初速上限
+    params.lifeMin = 0.35f;                   // 寿命下限
+    params.lifeMax = 0.65f;                   // 寿命上限
+    params.sizeMin = 2.0f;                    // 边长下限
+    params.sizeMax = 5.0f;                    // 边长上限（爆散块更大）
+    params.spreadRadians = kFullCircle;       // 整圆爆散
+    params.gravityY = 240.0f;                 // 重力回落
+    params.damping = 1.5f;                    // 中等阻尼（飞得开、收得住）
+    return params;                            // 交还本事件参数
+}
+
+// 经验宝石拾取火花：青蓝色（与宝石染色一致），小范围上飘——「吸收」的轻反馈
+ParticleParams makeGemPickupSparks()
+{
+    ParticleParams params;                          // 默认参数包
+    params.color = SDL_Color{ 90, 235, 225, 255 };  // 青蓝（与经验宝石同色系）
+    params.speedMin = 40.0f;                        // 初速下限（轻）
+    params.speedMax = 120.0f;                       // 初速上限
+    params.lifeMin = 0.18f;                         // 寿命下限
+    params.lifeMax = 0.32f;                         // 寿命上限
+    params.sizeMin = 1.5f;                          // 小颗粒
+    params.sizeMax = 3.0f;                          // 颗粒上限
+    params.spreadRadians = kFullCircle;             // 整圆轻微四散
+    params.gravityY = 0.0f;                         // 无重力：轻飘
+    params.damping = 2.0f;                          // 快速收敛
+    return params;                                  // 交还本事件参数
+}
+
+// 金币拾取火花：金黄色（与金币同色系），小范围四散——「叮」的视觉对位
+ParticleParams makeCoinPickupSparks()
+{
+    ParticleParams params;                           // 默认参数包
+    params.color = SDL_Color{ 255, 210, 80, 255 };   // 金黄
+    params.speedMin = 40.0f;                         // 初速下限
+    params.speedMax = 120.0f;                        // 初速上限
+    params.lifeMin = 0.18f;                          // 寿命下限
+    params.lifeMax = 0.32f;                          // 寿命上限
+    params.sizeMin = 1.5f;                           // 小颗粒
+    params.sizeMax = 3.0f;                           // 颗粒上限
+    params.spreadRadians = kFullCircle;              // 整圆四散
+    params.gravityY = 0.0f;                          // 无重力
+    params.damping = 2.0f;                           // 快速收敛
+    return params;                                   // 交还本事件参数
+}
+
+// 升级金色爆散：向上 60° 扇形喷发、重力回落——「等级提升」的高光礼花
+ParticleParams makeLevelUpBurst()
+{
+    ParticleParams params;                          // 默认参数包
+    params.color = SDL_Color{ 255, 215, 0, 255 };   // 金色（升级飘字同色）
+    params.speedMin = 140.0f;                       // 初速下限（喷得高）
+    params.speedMax = 300.0f;                       // 初速上限
+    params.lifeMin = 0.55f;                         // 寿命下限（停留更久）
+    params.lifeMax = 0.95f;                         // 寿命上限
+    params.sizeMin = 2.0f;                          // 边长下限
+    params.sizeMax = 4.0f;                          // 边长上限
+    params.directionRadians = -kPi * 0.5f;          // 中轴朝上（屏幕 y 向下为正）
+    params.spreadRadians = kPi / 3.0f;              // 总张角 60°：向上扇形
+    params.gravityY = 220.0f;                       // 重力：喷高后回落
+    params.damping = 0.6f;                          // 弱阻尼：保留上升速度
+    return params;                                  // 交还本事件参数
+}
+
+// 火球爆炸火花：橙红色、整圆爆散——与爆炸贴图叠出「炸开」的热感
+ParticleParams makeFireballSparks()
+{
+    ParticleParams params;                          // 默认参数包
+    params.color = SDL_Color{ 255, 150, 50, 255 };  // 橙红（火球主色）
+    params.speedMin = 100.0f;                       // 初速下限
+    params.speedMax = 280.0f;                       // 初速上限
+    params.lifeMin = 0.25f;                         // 寿命下限
+    params.lifeMax = 0.50f;                         // 寿命上限
+    params.sizeMin = 2.0f;                          // 边长下限
+    params.sizeMax = 5.0f;                          // 边长上限
+    params.spreadRadians = kFullCircle;             // 整圆爆炸
+    params.gravityY = 100.0f;                       // 轻微重力
+    params.damping = 2.0f;                          // 快速收敛
+    return params;                                  // 交还本事件参数
+}
+
+// 冰环碎片：青蓝色、整圆飞散——给冰霜新星补「冰屑炸开」的颗粒感
+ParticleParams makeFrostNovaShards()
+{
+    ParticleParams params;                          // 默认参数包
+    params.color = SDL_Color{ 150, 225, 255, 255 }; // 冰蓝
+    params.speedMin = 120.0f;                       // 初速下限（向外炸开）
+    params.speedMax = 300.0f;                       // 初速上限
+    params.lifeMin = 0.30f;                         // 寿命下限
+    params.lifeMax = 0.55f;                         // 寿命上限
+    params.sizeMin = 2.0f;                          // 边长下限
+    params.sizeMax = 4.0f;                          // 边长上限
+    params.spreadRadians = kFullCircle;             // 整圆飞散
+    params.gravityY = 80.0f;                        // 轻微下坠
+    params.damping = 1.8f;                          // 中等阻尼
+    return params;                                  // 交还本事件参数
+}
+
 } // 匿名命名空间结束
 
 // 析构（批五A 起恢复自定义实现；批五B 追加法术素材释放）：除成员 RAII
@@ -439,6 +621,11 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
                     spawn.y + m_player.height() * 0.5f);
     m_world.updateActiveChunks(m_renderer, m_camera);
 
+    // M3·甲：进局时粒子与震屏从干净状态起（场景对象虽是新建，仍显式清一次——
+    // 防御未来「复用同一 PlayScene 对象重新进局」的改动，成本可忽略）
+    m_particles.clear();    // 粒子池全空（无上一局残留火花）
+    m_camera.clearShake();  // 震屏归零（进局画面不抖动）
+
     // 12) 预创建怪物对象池：resize 按池大小（kMonsterPoolSize = 数量上限封顶 12）
     //     构造槽位（此刻纹理为空、均为未激活）。注意：纹理不在创建时预加载——
     //     变体在「刷新时刻」才等权随机决定，纹理随变体由 loadVariant 按需加载
@@ -508,7 +695,7 @@ void PlayScene::handleEvent(const SDL_Event& event)
 // 例外（M2/批五B/批六乙）：LevelUp/Shop 下暂停等动作不响应（防误触）；
 // Drowning/Reviving 下全部对局控制都不响应（输入锁定）。去重标记照常
 // 记录，面板/过场期间按下的键不会在回到 Playing 后迟到触发。
-// 批六乙：R（restart）自 GameOver 退役后不再被查询——保留配置绑定但无分支
+// M3·甲：R（restart）重新启用——仅 Playing/Paused 响应，重开并清空粒子/震屏
 void PlayScene::handleInputEdges(const UpdateContext& ctx)
 {
     // 本步的边沿采样（ctx.input 为 nullptr 时按「都没按」安全降级）。
@@ -571,6 +758,9 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
         {
             // 进入暂停：世界与计时从此冻结（update 对非 Playing 直接返回）
             m_state = PlayState::Paused;
+            // M3·甲：清掉震屏偏移——暂停画面从第一帧起就完全静止，
+            // 不会因残余抖动让「暂停冻结像素一致」失效（粒子本身已随世界冻结）
+            m_camera.clearShake();
             // 播放暂停轻音（pause）：与恢复共用同一个音效，切换动作的听觉确认
             m_audio->play(SoundId::Pause);
             // 冒烟观测点：确认暂停触发（自动化测试据此断言）
@@ -593,6 +783,18 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
         }
     }
     m_pauseHandled = pausePressed; // 记录本步采样：边沿消失前不再重复处理
+
+    // ---- R 重开（M3·甲：重新启用批六乙退役的重开键）----
+    // 仅 Playing/Paused 响应：面板（LevelUp/Shop）与过场（Drowning/Reviving）
+    // 不响应（防误触/输入锁定）。按下边缘去重与暂停同款——同帧多固定步
+    // 只重开一次；restart() 内部会把粒子/震屏一并清空并切回 Playing
+    const bool restartPressed = ctx.input != nullptr && ctx.input->pressed("restart"); // R 动作采样
+    if (restartPressed && !m_restartHandled &&
+        (m_state == PlayState::Playing || m_state == PlayState::Paused))
+    {
+        restart(); // 完整复位（含粒子池清空与震屏清零）
+    }
+    m_restartHandled = restartPressed; // 记录本步采样：上升沿去重
 
     // 回主菜单：仅 Paused 下按 M 生效（Playing 下不响应；Drowning/Reviving
     // 输入锁定）。批六乙：退出前静默比较并写盘本局战绩——旧「中途退出
@@ -1119,6 +1321,11 @@ void PlayScene::update(const UpdateContext& ctx)
     // 否则暂停后按 ESC/M 将无法恢复/回菜单；各分支状态判据负责防误触）
     handleInputEdges(ctx);
 
+    // 震屏计时（M3·甲）：表现层效果按固定步推进，不受世界冻结分支影响——
+    // 升级/商店/落水/复活期间抖动会自然衰减到 0（不会把整屏偏移冻在面板上）；
+    // 暂停在进入时已清抖动，因此暂停画面保持完全静止（粒子仍随世界冻结）
+    m_camera.update(ctx.deltaTime);
+
     // 落水过场（批六乙）：只推进水花/下沉计时；世界本体冻结、输入锁定。
     // 计时结束 -> beginDeath(落水)（内部处理惩罚/选点并切 Reviving）
     if (m_state == PlayState::Drowning)
@@ -1262,6 +1469,11 @@ void PlayScene::update(const UpdateContext& ctx)
         fx.left = std::max(fx.left - ctx.deltaTime, 0.0f); // 递减并夹到 0
     }
     std::erase_if(m_monsterHitFxs, [](const MonsterHitFx& fx) { return fx.left <= 0.0f; });
+
+    // 粒子推进（M3·甲）：只在此 Playing 分支执行——上面各非 Playing 状态
+    // 提前返回，粒子因此随世界一起冻结（暂停/升级面板/商店/过场全部静止）；
+    // 寿命归零的粒子在 update 内部释放槽位（池满策略见 ParticleSystem.h）
+    m_particles.update(ctx.deltaTime);
 
     // 鼠标世界坐标（批二）：把本帧鼠标的「屏幕位置」经相机换算到世界，
     // 注入玩家作为朝向翻转的基准——屏幕->世界的换算收敛在场景层，
@@ -1530,6 +1742,15 @@ void PlayScene::update(const UpdateContext& ctx)
                     spawnMonsterHitFx((playerCenterX + monsterCenterX) * 0.5f,
                                       (playerCenterY + monsterCenterY) * 0.5f);
 
+                    // 7.5) 粒子与震屏（M3·甲）：红色火花在玩家脚下中心爆开，
+                    //      同时登记 6px/0.15s 的小幅震屏（只扰渲染，鼠标瞄准稳定）
+                    m_particles.emitBurst(playerCenterX, playerCenterY,
+                                          kPlayerHitSparkCount, makePlayerHitSparks());
+                    m_camera.addShake(kShakePlayerHitAmplitude, kShakePlayerHitSeconds);
+                    // 冒烟观测点：火花事件日志（连拍截图的时序对齐依据）
+                    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                                "粒子：玩家受击火花（%d 粒）", kPlayerHitSparkCount);
+
                     // 8) 怪物小幅回弹（约 40px；批四口径）：沿「玩家盒中心 ->
                     //    怪物中心」方向瞬移；knockback 内部做世界可走校验
                     //    （被墙挡逐级缩短）并快照防拉丝
@@ -1593,6 +1814,17 @@ void PlayScene::update(const UpdateContext& ctx)
         {
             gem.markPicked(); // 标记：本次遍历结束后统一清理
 
+            // 粒子（M3·甲）：拾取火花（青蓝色，与宝石同色系）挂在宝石中心——
+            // 取矩形中心后再发射（宝石本步末才移除，位置仍是有效的拾取点）
+            const SDL_FRect gemRect = gem.rect(); // 宝石矩形快照（世界坐标）
+            m_particles.emitBurst(gemRect.x + gemRect.w * 0.5f, // 宝石中心 x
+                                  gemRect.y + gemRect.h * 0.5f, // 宝石中心 y
+                                  kGemPickupSparkCount,         // 粒数（6）
+                                  makeGemPickupSparks());       // 青色轻飘火花
+            // 冒烟观测点：火花事件日志（连拍截图的时序对齐依据）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "粒子：拾取宝石火花（%d 粒）", kGemPickupSparkCount);
+
             // 经验结算：进度累计 + 按曲线循环结算 + 升级反馈与卡牌欠账
             //（可能连升多级——grantXp 内部循环处理）。
             // 批六丙：基础经验来自本颗宝石（掉落时按怪物等级定稿）；
@@ -1645,6 +1877,17 @@ void PlayScene::update(const UpdateContext& ctx)
         if (!coin.isPicked() && rectsOverlap(playerBox, coin.rect()))
         {
             coin.markPicked(); // 标记：本次遍历结束后统一清理
+
+            // 粒子（M3·甲）：拾取火花（金黄色，与金币同色系）挂在金币中心——
+            // 与宝石拾取同一模式：先取位置再发射，本步末才统一清理
+            const SDL_FRect coinRect = coin.rect(); // 金币矩形快照（世界坐标）
+            m_particles.emitBurst(coinRect.x + coinRect.w * 0.5f, // 金币中心 x
+                                  coinRect.y + coinRect.h * 0.5f, // 金币中心 y
+                                  kCoinPickupSparkCount,         // 粒数（6）
+                                  makeCoinPickupSparks());       // 金色轻飘火花
+            // 冒烟观测点：火花事件日志（连拍截图的时序对齐依据）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "粒子：拾取金币火花（%d 粒）", kCoinPickupSparkCount);
 
             // 局内货币累计：本局 +1（本批只储备不消费——为将来商店/
             // 强化体系铺路；restart 清零）
@@ -2061,7 +2304,15 @@ void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
         }
         else
         {
-            // 未死：微击退（沿「玩家中心 -> 怪物中心」方向远离玩家）。
+            // 未死：命中火花（M3·甲）——白黄色小火花在怪物中心一闪，
+            // 与死亡爆散二选一（击杀时只放更大更久的颜色系爆散，避免叠两层）
+            m_particles.emitBurst(monsterCenterX, monsterCenterY,
+                                  kMonsterHitSparkCount, makeMonsterHitSparks());
+            // 冒烟观测点：火花事件日志（连拍截图的时序对齐依据）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "粒子：横扫命中火花（%d 粒）", kMonsterHitSparkCount);
+
+            // 微击退（沿「玩家中心 -> 怪物中心」方向远离玩家）。
             // 距离来自 attack_knockback（默认 30——由原 60 减半的「微」
             // 击退，保持追击压力、方便下一轮连扫补刀）；落点经世界可走校验
             monster.knockback(centerX, centerY, m_attackKnockback);
@@ -2370,6 +2621,17 @@ void PlayScene::resolveMonsterDeath(Monster& monster, float centerX, float cente
     const int coinCount = monster.coinDrop(); // 本变体的金币掉落数（含等级加成）
     dropCoinsAt(centerX, centerY, coinCount); // 掉落金币（散开可见）
 
+    // 粒子与震屏（M3·甲）：击杀爆散用怪物变体同色系（12 粒，规格 10~16），
+    // 并登记 2px/0.1s 的轻震——横扫与法术致死共用本函数，因此两条击杀链
+    // 都自动获得同款反馈；Boss 震屏留待后续批
+    m_particles.emitBurst(centerX, centerY, kMonsterDeathSparkCount,
+                          makeMonsterDeathBurst(monster.type())); // 颜色系爆散
+    m_camera.addShake(kShakeKillAmplitude, kShakeKillSeconds);    // 轻震（2px/0.1s）
+    // 冒烟观测点：爆散日志（含变体名与粒数——连拍截图的时序对齐依据）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "粒子：击杀爆散（%s，%d 粒）",
+                monsterTypeName(monster.type()), kMonsterDeathSparkCount);
+
     // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
     // 冒烟观测点：宝石经验日志（批六丙：经验随怪物等级——冒烟对照断言用）
@@ -2489,6 +2751,14 @@ void PlayScene::explodeFireball(const Fireball& fireball)
     fx.radius = fireball.blastRadius;           // 绘制半径（渲染时 x2 为直径）
     fx.left = kFireballBlastFxSeconds;          // 寿命置满（0.3s 渐隐）
 
+    // 粒子（M3·甲）：爆炸中心橙红火花（16 粒）——与爆炸贴图叠加出热浪感；
+    // 无论是否命中（到点自爆）都有火花，画面反馈与爆炸表现一致
+    m_particles.emitBurst(fireball.x, fireball.y, kFireballSparkCount,
+                          makeFireballSparks());
+    // 冒烟观测点：火花事件日志（连拍截图的时序对齐依据）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "粒子：火球爆炸火花（%d 粒）", kFireballSparkCount);
+
     // 冒烟观测点：火球爆炸（命中数——冒烟断言「飞行 -> 爆炸」链路）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "火球爆炸（命中 %d）", hitCount);
 }
@@ -2545,6 +2815,14 @@ void PlayScene::castFrostNova(const SDL_FRect& playerBox)
     fx.y = centerY;                     // 圆心 y
     fx.radius = radius;                 // 判定半径（渲染按它算直径）
     fx.left = kFrostNovaFxSeconds;      // 寿命置满（0.35s 展开淡出）
+
+    // 粒子（M3·甲）：冰环碎片感——在冰环圆心向整圆飞散 18 粒青蓝碎片，
+    // 半径/贴图之外的简单颗粒补充（不改变范围伤害判定）
+    m_particles.emitBurst(centerX, centerY, kFrostNovaSparkCount,
+                          makeFrostNovaShards());
+    // 冒烟观测点：火花事件日志（连拍截图的时序对齐依据）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "粒子：冰环碎片（%d 粒）", kFrostNovaSparkCount);
 
     // 冷却重置 + 日志（命中数——冒烟断言点）
     m_spellCooldownLeft[spellIndex] = spellFrostNovaCooldown(level);
@@ -3060,6 +3338,18 @@ void PlayScene::grantXp(int amount)
                           playerRect.y - 24.0f - (levelReached - oldLevel - 1) * 26.0f, // 头顶上方
                           SDL_Color{ 255, 215, 0, 255 },                    // 金色：升级高光
                           kLevelupTextLifeSeconds);                         // 比伤害数字停留更久
+
+        // 粒子（M3·甲）：升级金色向上爆散（每升一级一簇；连升时多簇叠加，
+        // 与逐级错开的「升级！」飘字同源）。注意升级面板会立刻冻结世界，
+        // 这簇粒子会停在半空，待玩家选完法术回到 Playing 后继续播完
+        m_particles.emitBurst(playerRect.x + playerRect.w * 0.5f, // 玩家中心 x（爆散原点）
+                              playerRect.y + playerRect.h * 0.5f, // 玩家中心 y
+                              kLevelUpSparkCount,                 // 粒数（24）
+                              makeLevelUpBurst());                // 金色向上扇形
+        // 冒烟观测点：火花事件日志（连拍截图的时序对齐依据）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "粒子：升级金色爆散（等级 %d，%d 粒）",
+                    levelReached, kLevelUpSparkCount);
     }
 
     // 有升级才触发 HUD 瞬闪：短暂窗口内等级数字金白交替（渲染端消费本计时）。
@@ -3069,6 +3359,9 @@ void PlayScene::grantXp(int amount)
     if (result.levelsGained > 0)
     {
         m_levelFlashLeft = kLevelFlashSeconds;  // 重置为满值（连升多级只刷一次时长）
+        // 震屏（M3·甲）：升级 3px/0.12s（连升多级只震一次，避免叠加过强）；
+        // 升级面板打开后震屏计时仍按固定步自然衰减（不会把偏移冻在面板上）
+        m_camera.addShake(kShakeLevelUpAmplitude, kShakeLevelUpSeconds);
         m_levelupSfx.play();                    // 升级音效（游戏层直读 levelup.wav；不可用安全静默）
         m_choiceQueue.add(result.levelsGained); // 欠账登记：每升一级欠一次选择
         openSpellPanel();                       // 打开选择面板（正常路径：抽到法术并进入 LevelUp）
@@ -3360,8 +3653,9 @@ void PlayScene::separateOverlappingMonsters()
 }
 
 // 重开一局：把整局相关的数据全部恢复到初始状态。
-// 批六乙：GameOver 退役后 R 已无触发分支；本函数保留为完整复位入口
-// （神龛/升级历史/落水过场等复位都在这里，供未来重开键或调试复用）
+// 批六乙：GameOver 退役（死亡改为自动复活流）；M3·甲起 R 重新接回本入口
+// （仅 Playing/Paused 响应）——神龛/升级历史/落水过场等复位都在这里，
+// 粒子池与震屏也在此清空（「R 重开清空粒子」的落点）
 void PlayScene::restart()
 {
     // 强化与升级流程状态清零（M2 起源；批五B 拆分口径）：「重开清零
@@ -3507,10 +3801,17 @@ void PlayScene::restart()
     // 场上命中特效清空（批五A）：上一局未播完的爪痕不跨局残留
     m_monsterHitFxs.clear();
 
+    // 粒子与震屏清空（M3·甲）：重开画面不残留上一局的火花，也不带震屏偏移——
+    // 这是「R 重开清空粒子」的落点（冒烟日志与截图据此断言）
+    m_particles.clear();   // 粒子池全空（512 槽位全部释放）
+    m_camera.clearShake(); // 震屏立即归零（第一帧即静止画面）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "粒子与震屏已清空（重开）"); // 冒烟观测点
+
     // 最后切回 Playing，新一局正式开始
     m_state = PlayState::Playing;
 
-    // 复位入口日志（当前无按键触发；未来重开入口接入后即冒烟观测点）
+    // 复位入口日志（R 重开/未来重开入口共用——冒烟观测点）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "重开一局");
 }
 
@@ -3620,6 +3921,11 @@ void PlayScene::render(float alpha)
     {
         coin.render(m_renderer, alpha, m_camera);
     }
+
+    // 粒子火花（M3·甲）：世界层小方块——画在实体/宝石/金币之后、
+    // 飘字与 HUD 之前；世界坐标经相机换算（含震屏偏移），alpha 随寿命线性淡出。
+    // 暂停时 update 已冻结，这里按原状态重绘 => 两帧像素完全一致
+    m_particles.render(m_renderer, m_camera);
 
     // 漂浮文字（伤害/升级共用）：世界层最上层——叠加在实体之上、HUD 之下。
     // 批二起存世界坐标，绘制时经相机换算（相机滚动时飘字随世界点移动）；

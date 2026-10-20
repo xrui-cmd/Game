@@ -150,8 +150,8 @@ void GameDev::bindInputActions()
 
     // 对局控制（pressed 边缘：暂停/重开/回菜单）
     bindAction("pause", "bind_pause", "ESC", SDL_SCANCODE_ESCAPE);
-    // 重开：GameOver 退役后已无触发场景（批六乙），绑定保留以兼容旧配置；
-    // 代码侧不再查询该动作——「R 无效果」的最终口径见批六乙报告
+    // 重开：批六乙 GameOver 退役后一度无触发场景；M3·甲起重新启用——
+    // PlayScene 仅在 Playing/Paused 查询该动作，重开一局并清空粒子/震屏
     bindAction("restart", "bind_restart", "R", SDL_SCANCODE_R);
     bindAction("menu", "bind_menu", "M", SDL_SCANCODE_M);
 

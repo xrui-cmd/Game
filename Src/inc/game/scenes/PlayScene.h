@@ -3,7 +3,8 @@
 
 #include "engine/Scene.h"       // Scene：场景基类
 #include "engine/AudioSystem.h" // AudioSystem：音效系统（拾取/受击/结束/暂停/破纪录触发播放）
-#include "engine/Camera.h"      // Camera：相机（平滑跟随 + 世界↔屏幕换算；批二）
+#include "engine/Camera.h"      // Camera：相机（平滑跟随 + 世界↔屏幕换算 + 震屏；批二/M3甲）
+#include "engine/ParticleSystem.h" // ParticleSystem：固定池矩形粒子（受击/击杀/拾取/升级/法术火花；M3甲）
 #include "engine/Font.h"        // Font：TTF 字体资源（HUD/叠层文字/漂浮文字，支持中文）
 #include "game/AttackArc.h"     // AttackArc：横扫扇形判定（纯函数，tests/attack_arc_test.cpp 直测）
 #include "game/World.h"         // World：世界（确定性生成 + 区块 + 格级碰撞；批二）
@@ -55,6 +56,8 @@
 //      - 相机每固定步 follow 玩家中心（指数平滑 camera_smooth_time）、
 //        进局/重开 snapTo；暂停/结束冻结（相机不更新）；鼠标瞄准经
 //        screenToWorld 换算后计算方向（零向量回退保留）；
+//      - 震屏（M3·甲）：玩家受击 6px/0.15s、击杀 2px/0.1s、升级 3px/0.12s；
+//        只扰渲染（worldToScreen），鼠标世界瞄准稳定；R 重开/暂停清抖动；
 //      - 区块激活窗口（相机所在区块 ±1）内才更新/渲染怪物——非激活区
 //        怪物暂停更新不删除；进入/离开窗口时烘焙/卸载区块纹理（日志
 //        「区块 (x,y) 加载 / 卸载」供冒烟断言）；
@@ -165,15 +168,16 @@
 //      缺键/坏值自动回退内置默认值
 //   6. 渲染：世界区块（地板/墙/装饰，经相机）-> 玩家（含横扫表现与受击
 //      红染）-> 怪物（含前扑残影/蓄力警示/受击红染）-> 命中爪痕特效 ->
-//      经验宝石 -> 金币 -> 漂浮文字（以上全部世界坐标，绘制处经相机换算）
+//      法术特效 -> 经验宝石 -> 金币 -> 粒子火花（M3甲：矩形粒子，随世界
+//      一起震屏）-> 漂浮文字（以上全部世界坐标，绘制处经相机换算）
 //      -> 生存 HUD（屏幕空间：左上 HP 血条+文字；其下等级（升级时瞬闪）/
 //      经验条（当前级进度/所需）/击杀/存活/金币；左下角 FPS/帧时间，
 //      F3 切换显隐）
 //
 // 「每次进入 = 全新一局」：每局都是新构造的 PlayScene 对象，
 // 数据成员的默认值就是初始状态；onEnter 把玩家与怪物池布置到位。
-// restart() 保留为完整复位入口（批六乙 GameOver 退役后按 R 不再触发，
-// 神龛/历史栈等复位逻辑仍保留供未来重开入口复用）
+// restart() 是完整复位入口：M3·甲起按 R（Playing/Paused）重新接回——
+// 除既有战斗/世界/面板状态外，同时清空粒子与震屏；死亡自动复活流不变
 //
 // 状态机（PlayState）：
 //   Playing  ：接受输入、推进战斗、检测碰撞与刷新、存活时间正计时
@@ -247,7 +251,8 @@ private:
     // pressed 在整帧的所有固定步都为 true，用「本帧已处理」标记去重，
     // 保证每次按下恰好触发一次（行为与事件式完全一致）。
     // 说明（M2/批六乙）：LevelUp/Shop/Drowning/Reviving 下这些动作不响应
-    //（防误触/输入锁定）；R（restart）自 GameOver 退役后无触发分支
+    //（防误触/输入锁定）；R（restart）M3·甲起重新启用：仅 Playing/Paused
+    // 响应（重开一局并清空粒子/震屏——见 restart()）
     void handleInputEdges(const UpdateContext& ctx);
 
     // ---- 落水与死亡复活流（批六乙）----
@@ -772,8 +777,13 @@ private:
 
     // 相机（批二核心）：每固定步 follow 玩家中心（camera_smooth_time 平滑）、
     // 进局/重开 snapTo；实体与区块渲染在绘制处经它换算到屏幕。
-    // 暂停/结束不推进（冻结）
+    // 暂停/结束不推进跟随（冻结）；震屏计时独立衰减（M3·甲），暂停时清抖动
     Camera m_camera;
+
+    // 粒子系统（M3·甲）：固定池 512 粒，受击/击杀/拾取/升级/法术火花共用。
+    // 只在 Playing 分支 update（与世界一起冻结：暂停/面板/过场全部静止）；
+    // 渲染在世界实体之后、飘字之前（世界坐标经相机换算，随相机震屏抖动）
+    ParticleSystem m_particles;
 
     // 字体资源：一个实例对应一个字号，加载失败时绘制安全跳过（Font 内部已警告）
     Font m_hudFont;  // HUD/提示文字（FPS 以外的文字、操作提示、结束列表）
@@ -984,6 +994,7 @@ private:
     // 折叠为「每个上升沿恰好一次」。动作松开后标记随采样自然复位
     bool m_pauseHandled = false; // 暂停/恢复动作本帧是否已处理
     bool m_menuHandled = false;  // 回菜单动作本帧是否已处理
+    bool m_restartHandled = false; // R 重开动作本帧是否已处理（M3·甲重新启用）
 
     // ---- FPS / 帧时间显示 ----
     // 显示内容：左下角 "FPS: 59.9 | 16.7 ms"。数值来自渲染帧间隔的
