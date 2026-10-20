@@ -831,3 +831,42 @@ set_target_properties(particle_shake_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  双区 Boss 纯逻辑单元测试（boss_test，M3·乙）
+#
+#  被测对象：Src/inc/game/Boss.h（header-only）——
+#    降临节奏（180s 间隔/排程/同屏唯一跳过）、双区选型与等级、
+#    属性公式（生命 696/936、速度 99、伤害 x1.5、体型 x1.5）、
+#    四招专属模组（重砸/冲锋/冰环/重击）、距离+冷却选招、
+#    奖励（金币 25~40 / 经验 150~200 / 回血 30%）、冻结减速免疫。
+#
+#  与 zone_test / monster_level_test 同模式：只依赖 SDL 头（Boss.h ->
+#  MonsterLevel.h -> Zone.h -> World.h -> SDL.h 类型），不链接 SDL3 运行时。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\boss_test.exe
+# ============================================================
+
+add_executable(boss_test boss_test.cpp)
+
+if (MSVC)
+    target_compile_options(boss_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Boss.h 位于游戏仓 Src/inc；SDL 头目录供 Zone.h -> World.h
+target_include_directories(boss_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../libs/GameEngine/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../vendor/SDL-main/include")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(boss_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
