@@ -13,9 +13,10 @@
 //      - 重复命中「刷新时长、不叠乘」：新乘区覆盖旧乘区、倒计时重置为满；
 //      - 与雪区常驻 x0.85 的乘算是场景层职责（本类只给一个乘区）；
 //   2. FreezeMeter —— 冻结条：
-//      - 0~100；霜怪命中累积（霜哥布林 +25 / 霜骷髅 +20）；
+//      - 0~100；霜怪命中累积（霜哥布林 +35 / 霜骷髅 +30——批六补丁上调）；
 //      - 满 100 -> 冻结 1.5s（玩家不可移动/不可攻击由场景消费）；
-//      - 不挨打时每秒衰减 10；
+//      - 连续 3 秒未受霜击才开始衰减 10/s（霜击刷新延迟计时——批六补丁：
+//        默认血量下玩家先死、冻结条不可达，故把衰减改为「延迟 3s 起算」）；
 //      - 冻结结束清零，并给 2s「抗冻缓冲」——缓冲期内不再累积；
 //      - HUD 在 value > 0 或冻结中显示。
 //
@@ -97,11 +98,12 @@ class FreezeMeter
 public:
     static constexpr int kMaxValue = 100;          // 冻结条上限（满值触发冻结）
     static constexpr float kFreezeSeconds = 1.5f;  // 冻结时长（秒）
-    static constexpr float kDecayPerSecond = 10.0f; // 不挨打时每秒衰减量
+    static constexpr float kDecayDelaySeconds = 3.0f; // 衰减延迟（秒）：连续 3s 未受霜击才起算
+    static constexpr float kDecayPerSecond = 10.0f; // 延迟结束后每秒衰减量
     static constexpr float kImmunitySeconds = 2.0f; // 冻结结束后的抗冻缓冲（秒）
 
-    // 累积冻结条：amount <= 0 忽略；冻结中 / 抗冻缓冲中不累积。
-    // 达到 100 -> 立即冻结 1.5s，并把值夹在上限（HUD 满条）。
+    // 累积冻结条：amount <= 0 忽略；每次有效霜击都刷新「未受击计时」；
+    // 冻结中 / 抗冻缓冲中不累积。达到 100 -> 立即冻结 1.5s，并把值夹在上限。
     FreezeTickResult add(int amount)
     {
         FreezeTickResult result{}; // 默认：无上升沿
@@ -109,6 +111,12 @@ public:
         {
             return result; // 不改变状态
         }
+
+        // 霜击刷新衰减延迟计时（批六补丁）：无论本次是否真累积（冻结/
+        // 缓冲中会被忽略），「刚挨过霜击」都成立——解除状态后 3s 内不衰减。
+        // 规格原文「霜击刷新该计时」：放在冻结/缓冲判定之前，语义最完整
+        m_sinceHit = 0.0f;
+
         if (m_frozen || m_immunityLeft > 0.0f) // 冻结中或缓冲期：不再累积
         {
             return result; // 保持现状（缓冲期「不再累积」的规格口径）
@@ -127,7 +135,8 @@ public:
     }
 
     // 推进计时：冻结中 = 倒计时；冻结结束 -> 清零 + 2s 抗冻缓冲；
-    // 非冻结且非缓冲 = 每秒衰减 10（「不挨打时衰减」）。
+    // 非冻结且非缓冲 = 先累计「距上次霜击」的时长，只有超过 3s 的部分
+    // 才按每秒 10 衰减（跨越延迟边界的那一步按超出时长精确扣减）。
     FreezeTickResult update(float dt)
     {
         FreezeTickResult result{}; // 默认：无上升沿
@@ -161,8 +170,18 @@ public:
             return result; // 缓冲期不累积、不衰减（值已为 0）
         }
 
-        // 普通状态：不挨打时每秒衰减 10（连续衰减，固定步与帧率无关）
-        m_value = std::max(m_value - kDecayPerSecond * dt, 0.0f); // 衰减并夹到 0
+        // 普通状态：推进「距上次霜击」计时（批六补丁），并只对超过延迟
+        // 阈值的时段做衰减——跨过 3s 边界的那一步会精确扣「超出部分」
+        const float sinceHitBefore = m_sinceHit; // 本步前的未受击时长（秒）
+        m_sinceHit += dt;                        // 累计本步未受霜击时长
+        // 本步前/后「已进入可衰减期」的时长：两者之差 = 本步应衰减的秒数
+        const float decayBefore = std::max(sinceHitBefore - kDecayDelaySeconds, 0.0f); // 步前可衰减时长
+        const float decayAfter = std::max(m_sinceHit - kDecayDelaySeconds, 0.0f);      // 步后可衰减时长
+        const float decaySeconds = decayAfter - decayBefore; // 本步实际衰减时长（>=0）
+        if (decaySeconds > 0.0f) // 已越过 3s 延迟：开始每秒 10 的衰减
+        {
+            m_value = std::max(m_value - kDecayPerSecond * decaySeconds, 0.0f); // 衰减并夹到 0
+        }
         return result; // 无上升沿
     }
 
@@ -188,6 +207,7 @@ public:
     void reset()
     {
         m_value = 0.0f;        // 冻结条清零
+        m_sinceHit = 0.0f;     // 未受霜击计时清零（下次累积重新起算 3s 延迟）
         m_frozen = false;      // 解除冻结
         m_freezeLeft = 0.0f;   // 冻结计时归零
         m_immunityLeft = 0.0f; // 缓冲清零
@@ -195,6 +215,7 @@ public:
 
 private:
     float m_value = 0.0f;        // 当前冻结条（0~100）
+    float m_sinceHit = 0.0f;     // 距上次霜击的时长（秒；>=3 才开始衰减，批六补丁）
     bool m_frozen = false;       // 是否冻结中
     float m_freezeLeft = 0.0f;   // 冻结剩余时长（秒）
     float m_immunityLeft = 0.0f; // 抗冻缓冲剩余时长（秒）

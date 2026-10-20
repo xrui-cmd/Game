@@ -51,7 +51,7 @@ struct AttackModule
     AttackElement element;     // 命中附带的元素效果
     float slowFactor;          // 减速乘区（仅 Slow 有效；0.8 = 八折移速）
     float slowSeconds;         // 减速持续时长（仅 Slow 有效；重复命中刷新）
-    int freezeAmount;          // 冻结条累积点数（仅 Freeze 有效；霜哥布林 25 / 霜骷髅 20）
+    int freezeAmount;          // 冻结条累积点数（仅 Freeze 有效；霜哥布林 35 / 霜骷髅 30）
     bool frostVisual;          // 是否绘制冰霜系命中视觉（冰环/冰爪/冰痕）
 };
 
@@ -61,7 +61,8 @@ struct AttackModule
 //   - 哥布林系：沿用既有蓄力前扑（0.35s / 24px / 0.12s，接触判定）；
 //   - 骷髅系：后倾 0.3s、突刺 140px/0.25s，撞墙/命中即止；
 //   - 霜系只加元素与冰霜视觉：冰史莱姆减速 x0.8 / 3s；
-//     霜哥布林冻结条 +25；霜骷髅冻结条 +20。
+//     霜哥布林冻结条 +35；霜骷髅冻结条 +30（批六补丁上调：默认血量下
+//     约 3 击可达 100，配合「连续 3s 未受霜击才衰减」解不可达问题）。
 // 伤害倍率本批统一 1.0（保持批六丙等级伤害口径不变；字段留作后续调平）。
 inline constexpr AttackModule kAttackModules[] = {
     // 0 史莱姆（草地）：跳跃砸击——深蹲 0.45s -> 弧线跃出 80px/0.3s -> 落点 40px
@@ -76,12 +77,12 @@ inline constexpr AttackModule kAttackModules[] = {
     // 3 冰史莱姆（雪山）：跳跃砸击 + 落地冰环 + 命中减速 x0.8 / 3s
     { "跳跃砸击（冰环）", AttackKind::JumpSmash, 0.45f, 80.0f, 0.30f, 40.0f,
       1.0f, AttackElement::Slow, 0.8f, 3.0f, 0, true },
-    // 4 霜哥布林（雪山）：前扑 + 冰爪视觉 + 冻结条 +25
+    // 4 霜哥布林（雪山）：前扑 + 冰爪视觉 + 冻结条 +35
     { "蓄力前扑（冰爪）", AttackKind::Lunge, 0.35f, 24.0f, 0.12f, 0.0f,
-      1.0f, AttackElement::Freeze, 0.0f, 0.0f, 25, true },
-    // 5 霜骷髅（雪山）：突刺 + 冰痕视觉 + 冻结条 +20
+      1.0f, AttackElement::Freeze, 0.0f, 0.0f, 35, true },
+    // 5 霜骷髅（雪山）：突刺 + 冰痕视觉 + 冻结条 +30
     { "突刺冲锋（冰痕）", AttackKind::Thrust, 0.30f, 140.0f, 0.25f, 0.0f,
-      1.0f, AttackElement::Freeze, 0.0f, 0.0f, 20, true },
+      1.0f, AttackElement::Freeze, 0.0f, 0.0f, 30, true },
 };
 
 // 表项数量（MonsterType::Count 的镜像；单测断言两者一致的依据）

@@ -53,10 +53,10 @@ constexpr VariantSpec kVariants[] = {
     // 冰史莱姆（swampy 冰霜重染色）：雪山低级目标；数值同史莱姆，命中减速
     { "冰史莱姆", "assets/monster_ice_slime_sheet.png", "assets/monster_ice_slime.png",
       20, 90.0f, 1, SDL_Color{118, 190, 232, 255} },
-    // 霜哥布林（goblin 冰霜重染色）：雪山基准目标；数值同哥布林，命中 +25 冻结条
+    // 霜哥布林（goblin 冰霜重染色）：雪山基准目标；数值同哥布林，命中 +35 冻结条
     { "霜哥布林", "assets/monster_frost_goblin_sheet.png", "assets/monster_frost_goblin.png",
       30, 110.0f, 2, SDL_Color{80, 154, 170, 255} },
-    // 霜骷髅（skelet 冰霜重染色）：雪山快速目标；数值同骷髅，命中 +20 冻结条
+    // 霜骷髅（skelet 冰霜重染色）：雪山快速目标；数值同骷髅，命中 +30 冻结条
     { "霜骷髅", "assets/monster_frost_skelet_sheet.png", "assets/monster_frost_skelet.png",
       18, 140.0f, 1, SDL_Color{208, 230, 244, 255} },
 };
