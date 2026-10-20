@@ -10,7 +10,8 @@
 //  覆盖场景：
 //    ① 六型表完整性：数量、三种攻击方式、六行参数范围、关键定值；
 //    ② 减速：施加/刷新/覆盖/到期/非法输入/乘区夹取；
-//    ③ 冻结条：累积、每秒衰减 10、满 100 冻结 1.5s、冻结结束清零、
+//    ③ 冻结条：累积（+35/+30）、连续 3s 未受霜击才开始衰减 10/s、
+//       霜击刷新延迟计时、满 100 冻结 1.5s、冻结结束清零、
 //       2s 抗冻缓冲（缓冲期不累积）、大步长跨过冻结终点的余量处理。
 //
 //  退出码：main 返回失败断言数（全部通过 = 0）。
@@ -134,13 +135,13 @@ int main()
         const AttackModule& frostGoblin = attackModuleForIndex(4); // 4 霜哥布林
         expectTrue("霜哥布林 = 前扑", frostGoblin.kind == AttackKind::Lunge);
         expectTrue("霜哥布林带冻结", frostGoblin.element == AttackElement::Freeze);
-        expectInt("霜哥布林冻结条 +25", frostGoblin.freezeAmount, 25);
+        expectInt("霜哥布林冻结条 +35", frostGoblin.freezeAmount, 35);
         expectTrue("霜哥布林有冰霜视觉（冰爪）", frostGoblin.frostVisual);
 
         const AttackModule& frostSkelet = attackModuleForIndex(5); // 5 霜骷髅
         expectTrue("霜骷髅 = 突刺", frostSkelet.kind == AttackKind::Thrust);
         expectTrue("霜骷髅带冻结", frostSkelet.element == AttackElement::Freeze);
-        expectInt("霜骷髅冻结条 +20", frostSkelet.freezeAmount, 20);
+        expectInt("霜骷髅冻结条 +30", frostSkelet.freezeAmount, 30);
         expectTrue("霜骷髅有冰霜视觉（冰痕）", frostSkelet.frostVisual);
     }
 
@@ -190,37 +191,49 @@ int main()
     }
 
     // ------------------------------------------------------------------
-    // CASE 3 冻结条：累积 / 每秒衰减 10 / 阈值冻结
+    // CASE 3 冻结条：累积 / 3s 衰减延迟 / 霜击刷新 / 阈值冻结
     // ------------------------------------------------------------------
-    beginCase(3, "冻结条累积、衰减与阈值冻结");
+    beginCase(3, "冻结条累积、衰减延迟与阈值冻结");
     {
         FreezeMeter meter; // 被测：冻结条
         expectNear("初始值 0", meter.value(), 0.0f);
         expectTrue("初始未冻结", !meter.isFrozen());
         expectTrue("初始无缓冲", !meter.isImmune());
 
-        FreezeTickResult r = meter.add(25); // 霜哥布林命中
-        expectInt("+25", static_cast<int>(meter.value()), 25);
-        expectTrue("+25 未触发冻结", !r.freezeStarted);
-        r = meter.add(20); // 霜骷髅命中
-        expectInt("再 +20 = 45", static_cast<int>(meter.value()), 45);
-        expectTrue("45 未触发冻结", !r.freezeStarted);
+        FreezeTickResult r = meter.add(35); // 霜哥布林命中（批六补丁 +35）
+        expectInt("+35", static_cast<int>(meter.value()), 35);
+        expectTrue("+35 未触发冻结", !r.freezeStarted);
+        r = meter.add(30); // 霜骷髅命中（批六补丁 +30）
+        expectInt("再 +30 = 65", static_cast<int>(meter.value()), 65);
+        expectTrue("65 未触发冻结", !r.freezeStarted);
         r = meter.add(0); // 0 点：忽略
-        expectInt("+0 不变", static_cast<int>(meter.value()), 45);
+        expectInt("+0 不变", static_cast<int>(meter.value()), 65);
         expectTrue("+0 无上升沿", !r.freezeStarted);
         r = meter.add(-5); // 负点：忽略
-        expectInt("负点不变", static_cast<int>(meter.value()), 45);
+        expectInt("负点不变", static_cast<int>(meter.value()), 65);
         expectTrue("负点无上升沿", !r.freezeStarted);
 
-        meter.update(1.0f); // 一秒不挨打：衰减 10
-        expectInt("衰减 1s 后 = 35", static_cast<int>(meter.value()), 35);
-        meter.update(2.0f); // 两秒：再衰减 20
-        expectInt("再衰减 2s 后 = 15", static_cast<int>(meter.value()), 15);
-        meter.update(2.0f); // 过量衰减：夹到 0
+        // 衰减延迟（批六补丁）：连续 3s 未受霜击之前不衰减；越过 3s 后
+        // 只对超出的时段按 10/s 衰减（跨边界的这一步精确扣「超出部分」）
+        meter.update(2.9f); // 2.9s：仍在延迟窗口内
+        expectNear("2.9s 未受击不衰减", meter.value(), 65.0f);
+        meter.update(0.2f); // 3.1s：只衰减超出的 0.1s -> 1 点
+        expectNear("3.1s 按超出时长衰减 1 点", meter.value(), 64.0f);
+        meter.update(1.0f); // 4.1s：再衰减 1s
+        expectNear("之后每秒衰减 10", meter.value(), 54.0f);
+        meter.update(10.0f); // 过量衰减：夹到 0
         expectNear("衰减不出现负值", meter.value(), 0.0f);
 
-        meter.add(60); // 累积到 60
-        r = meter.add(40); // 再 +40 -> 满 100
+        // 霜击刷新延迟计时：新的命中把「距上次霜击」清零，重新等 3s
+        meter.add(35); // 累积到 35
+        meter.update(2.0f); // 未受击 2s
+        meter.add(30); // 再 +30 = 65，并刷新延迟计时
+        meter.update(2.9f); // 刷新后 2.9s：不衰减
+        expectNear("霜击刷新后 2.9s 不衰减", meter.value(), 65.0f);
+        meter.update(0.2f); // 刷新后 3.1s：衰减 1 点
+        expectNear("刷新后 3.1s 衰减 1 点", meter.value(), 64.0f);
+
+        r = meter.add(60); // 64 + 60 -> 夹到 100：触发冻结
         expectTrue("满 100 触发冻结", r.freezeStarted);
         expectTrue("冻结状态成立", meter.isFrozen());
         expectNear("冻结 1.5s", meter.freezeLeft(), 1.5f);
@@ -261,10 +274,16 @@ int main()
         expectTrue("缓冲结束", !meter.isImmune());
         expectNear("缓冲结束值仍 0", meter.value(), 0.0f);
 
-        meter.add(20); // 缓冲结束后恢复累积
+        meter.add(20); // 缓冲结束后恢复累积（同时刷新延迟计时）
         expectInt("缓冲后可累积 +20", static_cast<int>(meter.value()), 20);
-        meter.update(1.0f); // 正常衰减
-        expectInt("衰减 1s 后 = 10", static_cast<int>(meter.value()), 10);
+        meter.update(2.99f); // 差 0.01s 到 3s：仍在延迟窗口内
+        expectNear("缓冲后 2.99s 不衰减", meter.value(), 20.0f);
+        meter.add(30); // 霜击再次刷新计时（50，仍在累积）
+        expectInt("刷新后可继续累积 = 50", static_cast<int>(meter.value()), 50);
+        meter.update(2.99f); // 刷新后 2.99s：不衰减
+        expectNear("再次刷新后 2.99s 不衰减", meter.value(), 50.0f);
+        meter.update(1.01f); // 4s：衰减 1s
+        expectNear("刷新后越过 3s 每秒衰减 10", meter.value(), 40.0f);
 
         // 大步长跨过冻结终点：剩余步长应继续计入抗冻缓冲
         FreezeMeter big; // 大步长用例

@@ -741,3 +741,38 @@ set_target_properties(attack_element_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  远处休眠怪物回收判据单元测试（monster_recycle_test，批六补丁）
+#
+#  被测对象：Src/inc/game/MonsterRecycle.h（header-only 纯逻辑）——
+#  shouldRecycleDormantMonster 的三条件（非激活区块 / 巡逻状态 /
+#  距玩家 > 1800px）与默认阈值常量。
+#
+#  与 xp_test 同模式：纯头文件逻辑，不依赖 SDL3、无 .cpp、无链接——
+#  任何环境都能确定性构建运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\monster_recycle_test.exe
+# ============================================================
+
+add_executable(monster_recycle_test monster_recycle_test.cpp)
+
+if (MSVC)
+    target_compile_options(monster_recycle_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：MonsterRecycle.h 位于游戏仓 Src/inc
+target_include_directories(monster_recycle_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(monster_recycle_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
