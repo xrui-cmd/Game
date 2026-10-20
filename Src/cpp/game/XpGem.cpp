@@ -27,6 +27,14 @@ void XpGem::update(const UpdateContext& ctx)
     // 帧动画无条件推进（与基类默认实现同款语句）：飞行与否都持续旋转
     m_animTime += ctx.deltaTime;
 
+    // 拾取延迟（M3·乙）：Boss 高价值宝石先在地上停留一会儿再起飞——
+    // 延迟内只播旋转动画（落点可见），不消耗追踪速度
+    if (m_pickupDelayLeft > 0.0f)
+    {
+        m_pickupDelayLeft = std::max(m_pickupDelayLeft - ctx.deltaTime, 0.0f); // 递减并夹到 0
+        return; // 延迟未结束：本步不位移
+    }
+
     // 未注入吸收目标（防御路径）：只播动画、不位移
     if (!m_hasHoming)
     {

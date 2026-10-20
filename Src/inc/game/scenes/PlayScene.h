@@ -484,11 +484,32 @@ private:
 
     // 掉落一颗经验宝石到 (x, y)（通常为怪物中心）：创建对象、加载纹理、落位，
     // 并写入本颗宝石的经验值（xpValue——批六丙由怪物等级缩放后传入）
-    void dropGemAt(float x, float y, int xpValue);
+    void dropGemAt(float x, float y, int xpValue, float pickupDelaySeconds = 0.0f);
 
     // 掉落 count 枚金币到 (x, y) 周围（批三）：数量按变体（Monster::coinDrop()），
-    // 多枚时绕掉落中心小半径散开（避免完全重叠、一眼可见数量）
-    void dropCoinsAt(float x, float y, int count);
+    // 多枚时绕掉落中心散开（避免完全重叠、一眼可见数量）。scatterRadius 为
+    // 散开半径（像素；普通怪 12，Boss 用更大半径让 25~40 枚铺开可见）；
+    // 落点做可行走校验（墙/水回退到中心），保证「掉落落在可行走地面」
+    void dropCoinsAt(float x, float y, int count, float scatterRadius = kCoinDropScatter,
+                     float pickupDelaySeconds = 0.0f);
+
+    // ---- Boss（M3·乙）----
+    // 场上存活 Boss 查询（同时最多 1 只）：non-const 供生成/日志，const 供 HUD
+    Monster* findAliveBoss();
+    const Monster* findAliveBoss() const;
+
+    // 到点尝试降临（仅 Playing）：环带 500~700px 采样（激活区块 + walkable +
+    // 避水），按落点所在区选型（草地=哥布林王 / 雪山=霜爵），等级固定
+    // Lv20/Lv30；成功打「Boss 降临（名，等级 N）」日志。返回是否生成成功
+    bool spawnBoss();
+
+    // Boss 攻击命中/落空后的表现（重砸/冰环/冲锋）：粒子 + 震屏 6~8px。
+    // 不改变伤害结算（无敌期/护盾/扣血仍由既有流程裁决），只补战斗反馈
+    void spawnBossAttackFeedback(const Monster& monster);
+
+    // 顶部 Boss 血条（屏幕顶部中央 480x18 + 名/Lv.n/当前/最大生命）：
+    // 仅 Boss 存活时绘制；文字走 Font（名用 m_cardFont、数值用 m_smallFont）
+    void renderBossHud();
 
     // 生成一处命中特效（批五A）：怪物攻击命中时由场景调用——(centerX,
     // centerY) 为接触点近似（双方中心的中点）；寿命置满（0.15s 渐隐），
@@ -600,6 +621,8 @@ private:
     static constexpr float kDefaultMonsterAggroRadius = 320.0f; // 仇恨半径缺省（monster_aggro_radius，像素）
     static constexpr float kDefaultMonsterLeashRadius = 500.0f; // 栓绳半径缺省（monster_leash_radius，像素）
     static constexpr float kDefaultMonsterReturnHealPercent = 0.0f; // 回巢回血缺省（monster_return_heal_percent，0=关闭）
+    static constexpr float kDefaultBossIntervalSeconds = kBossIntervalDefault; // Boss 降临间隔缺省（boss_interval_seconds，180s）
+    static constexpr float kDefaultBossKillHealPercent = kBossKillHealPercentDefault; // Boss 击杀回血缺省（boss_kill_heal_percent，30%）
     static constexpr int kDefaultXpLevelBase = 30;              // 升级曲线基数（xp_level_base）
     static constexpr float kDefaultXpLevelGrowth = 1.35f;       // 升级曲线倍率（xp_level_growth）
     // 说明（M2；批五B 修订）：每级自动强化的 kDefaultLevelup* 常量已退役
@@ -610,7 +633,9 @@ private:
     static constexpr float kDefaultCameraSmoothTime = 0.12f;    // 相机平滑时间常数缺省值（camera_smooth_time，秒）
 
     // ---- 玩法常量（代码固定，不进配置；改动须连同注释一起审视）----
-    static constexpr int kMonsterPoolSize = 12;          // 怪物对象池槽位数 = 数量上限封顶值
+    // 怪物对象池槽位数 = 普通怪上限 12 + Boss 专用 1（M3·乙）：
+    // 普通怪到上限时仍有空槽位接纳 Boss，Boss 存活期间普通怪因上限少刷 1 只
+    static constexpr int kMonsterPoolSize = 13; // 12 普通怪 + 1 Boss（普通怪上限仍为 12）
     static constexpr float kFirstSpawnDelay = 2.0f;      // 首刷延迟（秒）：开局 2 秒后第 1 只出现
     static constexpr float kCapGrowthPeriod = 20.0f;     // 数量上限成长周期（秒）：每 20 秒 +2
     static constexpr int kCapGrowthStep = 2;             // 每次成长的增量（只）
@@ -860,6 +885,9 @@ private:
     int m_monsterDamage = kDefaultMonsterDamage;          // 怪物攻击伤害（monster_damage）
     float m_monsterAttackCooldown = kDefaultMonsterAttackCooldown; // 怪物攻击冷却（monster_attack_cooldown，秒）
     float m_coinMagnetRadius = kDefaultCoinMagnetRadius;  // 金币磁吸半径（coin_magnet_radius，像素）
+    float m_bossInterval = kBossIntervalDefault;          // Boss 降临间隔（boss_interval_seconds，秒）
+    float m_bossKillHealPercent = kBossKillHealPercentDefault; // Boss 击杀回血百分比（boss_kill_heal_percent，%）
+    float m_bossNextAttemptTime = kBossIntervalDefault;   // 下一次 Boss 尝试时刻（局内秒；restart 重置）
 
     // 神龛激活键名（批六乙）：读取 config 的 bind_activate（默认 "E"），
     // 只用于提示文案「按 X 激活」——实际按键绑定由 GameDev 的输入系统完成。

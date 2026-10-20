@@ -2,6 +2,7 @@
 #define __COIN_H__
 
 #include "engine/Entity.h" // Entity：实体基类（空间/纹理/帧动画公共能力）
+#include <algorithm>       // std::max：拾取延迟/磁吸参数的边界夹取
 
 // ============================================================
 // Coin：金币实体（怪物掉落、玩家拾取、旋转帧动画；批三新增）
@@ -81,6 +82,22 @@ public:
     // 是否已磁化（场景查询用：未磁化才做半径判定；渲染/日志可扩展使用）
     bool magnetized() const { return m_magnetized; }
 
+    // ---- 拾取延迟（M3·乙：Boss 掉落落点可见）----
+
+    // 设置拾取延迟（秒）：延迟内不触发磁吸、也不可被拾取（仍播放旋转动画）。
+    // 用途：Boss 死亡时 25~40 枚金币在脚下铺开，若立即磁吸会一瞬间吸光，
+    // 玩家看不到「掉落」。普通怪掉落不调用（保持既有即时拾取手感）
+    void setPickupDelay(float seconds)
+    {
+        m_pickupDelayLeft = std::max(0.0f, seconds); // 负值按 0（无延迟）
+    }
+
+    // 当前是否可被磁吸/拾取（拾取延迟已走完）
+    bool canPickup() const { return m_pickupDelayLeft <= 0.0f; }
+
+    // 拾取延迟剩余时长（秒；冒烟/调试查询）
+    float pickupDelayLeft() const { return m_pickupDelayLeft; }
+
     // 注入磁吸目标（玩家碰撞盒中心的世界坐标；场景每固定步在磁化后调用）：
     // 目标随玩家移动刷新——金币追的是「当前的脚下」，不是触发时那一点
     void setMagnetTarget(float worldX, float worldY)
@@ -109,6 +126,7 @@ private:
     float m_magnetX = 0.0f;      // 磁吸目标 x（世界坐标；setMagnetTarget 写入）
     float m_magnetY = 0.0f;      // 磁吸目标 y
     bool m_hasTarget = false;    // 是否已注入目标（false = 不位移——防御）
+    float m_pickupDelayLeft = 0.0f; // 拾取延迟剩余（秒；>0 时不可磁吸/拾取）
 };
 
 #endif // !__COIN_H__

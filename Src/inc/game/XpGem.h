@@ -84,6 +84,22 @@ public:
     // 是否已被拾取（场景清理阶段据此移除对象）
     bool isPicked() const { return m_picked; }
 
+    // ---- 拾取延迟（M3·乙：Boss 高价值宝石落点可见）----
+
+    // 设置拾取延迟（秒）：延迟内不追踪飞行、也不可被拾取（只播旋转动画）。
+    // 用途：Boss 掉落的 150~200 经验宝石先在地上停留约 0.8s，避免
+    // 「刚落地就消失」；普通怪宝石不调用（保持既有即时吸收手感）
+    void setPickupDelay(float seconds)
+    {
+        m_pickupDelayLeft = std::max(0.0f, seconds); // 负值按 0（无延迟）
+    }
+
+    // 当前是否可被吸收（拾取延迟已走完）
+    bool canPickup() const { return m_pickupDelayLeft <= 0.0f; }
+
+    // 拾取延迟剩余时长（秒；冒烟/调试查询）
+    float pickupDelayLeft() const { return m_pickupDelayLeft; }
+
     // 注入吸收目标（玩家碰撞盒中心的世界坐标；批四）：场景每固定步调用
     // ——宝石自掉落起持续朝玩家飞（自动吸收，玩家无需走动）；
     // 从未注入过时只播旋转动画、不位移（防御路径，不崩不飞）
@@ -113,6 +129,7 @@ private:
     float m_homingX = 0.0f;   // 吸收目标 x（世界坐标；setHomingTarget 写入）
     float m_homingY = 0.0f;   // 吸收目标 y
     bool m_hasHoming = false; // 是否已注入目标（false = 只播动画不位移——防御）
+    float m_pickupDelayLeft = 0.0f; // 拾取延迟剩余（秒；>0 时不可追踪/拾取）
 };
 
 #endif // !__XPGEM_H__

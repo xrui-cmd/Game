@@ -1,4 +1,4 @@
-#include "game/scenes/PlayScene.h"
+﻿#include "game/scenes/PlayScene.h"
 #include "game/scenes/MenuScene.h" // MenuScene：暂停界面按 M 时切换回主菜单（批六乙战绩静默结算后）
 #include "game/Separation.h"       // computeSeparation：重叠兜底与怪怪软分离的最小分离量（批四）
 #include "game/MonsterLevel.h"     // 怪物等级与缩放纯函数（批六丙：梯度/生命/伤害/经验/金币）
@@ -208,6 +208,103 @@ ParticleParams makeFrostNovaShards()
     return params;                                  // 交还本事件参数
 }
 
+// ============================================================
+// Boss 战斗反馈参数（M3·乙；代码常量，不进配置）
+// ============================================================
+constexpr int kBossSlamSparkCount = 26;   // 重砸：金色尘土 26 粒
+constexpr int kBossChargeSparkCount = 22; // 冲锋：金色风尘 22 粒
+constexpr int kBossRingSparkCount = 30;   // 冰环：青蓝冰屑 30 粒
+constexpr int kBossDeathSparkCount = 60;  // Boss 死亡：同色系大爆散 60 粒（规格「大爆散」）
+constexpr float kBossCoinScatter = 48.0f; // Boss 金币散开半径（像素）：25~40 枚铺开可见
+constexpr float kBossDropVisibilityDelay = 0.8f; // Boss 掉落拾取延迟（秒）：落点先展示再磁吸
+
+constexpr float kShakeBossSlamAmplitude = 8.0f;    // 重砸震屏振幅（像素；规格 6~8）
+constexpr float kShakeBossSlamSeconds = 0.22f;     // 重砸震屏时长（秒）
+constexpr float kShakeBossChargeAmplitude = 7.0f;  // 冲锋震屏振幅（像素）
+constexpr float kShakeBossChargeSeconds = 0.18f;   // 冲锋震屏时长（秒）
+constexpr float kShakeBossRingAmplitude = 6.0f;    // 冰环震屏振幅（像素）
+constexpr float kShakeBossRingSeconds = 0.18f;     // 冰环震屏时长（秒）
+constexpr float kShakeBossDeathAmplitude = 8.0f;   // Boss 死亡震屏振幅（像素；规格 8）
+constexpr float kShakeBossDeathSeconds = 0.30f;    // Boss 死亡震屏时长（秒）
+
+// Boss 死亡爆散颜色：哥布林王 = 金色系；霜爵 = 冰蓝系（「同色系」的落点）
+SDL_Color bossDeathColor(BossType type)
+{
+    if (type == BossType::FrostDuke) // 霜爵：冰蓝
+    {
+        return SDL_Color{ 150, 225, 255, 255 }; // 冰蓝碎片
+    }
+    return SDL_Color{ 255, 205, 80, 255 }; // 哥布林王：金色碎片
+}
+
+// 重砸尘土：金褐色、整圆、带重力——砸地冲击的地面颗粒
+ParticleParams makeBossSlamSparks()
+{
+    ParticleParams params;                          // 默认参数包
+    params.color = SDL_Color{ 230, 190, 100, 255 }; // 金褐尘土
+    params.speedMin = 90.0f;                        // 初速下限
+    params.speedMax = 260.0f;                       // 初速上限
+    params.lifeMin = 0.25f;                         // 寿命下限
+    params.lifeMax = 0.50f;                         // 寿命上限
+    params.sizeMin = 2.0f;                          // 边长下限
+    params.sizeMax = 5.0f;                          // 边长上限
+    params.spreadRadians = kFullCircle;             // 整圆四散
+    params.gravityY = 300.0f;                       // 强重力：尘土回落
+    params.damping = 2.0f;                          // 快速收敛
+    return params;                                  // 交还本事件参数
+}
+
+// 冲锋风尘：金色拖尾、无重力——高速位移的冲刺感
+ParticleParams makeBossChargeSparks()
+{
+    ParticleParams params;                          // 默认参数包
+    params.color = SDL_Color{ 255, 215, 90, 255 };  // 金色风尘
+    params.speedMin = 120.0f;                       // 初速下限
+    params.speedMax = 300.0f;                       // 初速上限
+    params.lifeMin = 0.18f;                         // 寿命下限（短促）
+    params.lifeMax = 0.38f;                         // 寿命上限
+    params.sizeMin = 2.0f;                          // 边长下限
+    params.sizeMax = 4.0f;                          // 边长上限
+    params.spreadRadians = kFullCircle;             // 整圆（身后拖尾的近似）
+    params.gravityY = 0.0f;                         // 无重力
+    params.damping = 1.2f;                          // 弱阻尼：保留速度感
+    return params;                                  // 交还本事件参数
+}
+
+// 冰环冰屑：青蓝、整圆、向外炸开——与冰环贴图叠出「环状爆裂」感
+ParticleParams makeBossRingSparks()
+{
+    ParticleParams params;                          // 默认参数包
+    params.color = SDL_Color{ 150, 225, 255, 255 }; // 冰蓝
+    params.speedMin = 140.0f;                       // 初速下限（向外）
+    params.speedMax = 360.0f;                       // 初速上限
+    params.lifeMin = 0.30f;                         // 寿命下限
+    params.lifeMax = 0.60f;                         // 寿命上限
+    params.sizeMin = 2.0f;                          // 边长下限
+    params.sizeMax = 5.0f;                          // 边长上限
+    params.spreadRadians = kFullCircle;             // 整圆
+    params.gravityY = 60.0f;                        // 轻微下坠
+    params.damping = 1.5f;                          // 中等阻尼
+    return params;                                  // 交还本事件参数
+}
+
+// Boss 死亡大爆散：Boss 身份同色系、速度/寿命/尺寸全面放大
+ParticleParams makeBossDeathBurst(BossType type)
+{
+    ParticleParams params;                         // 默认参数包
+    params.color = bossDeathColor(type);           // 身份同色系（金/冰蓝）
+    params.speedMin = 120.0f;                      // 初速下限
+    params.speedMax = 380.0f;                      // 初速上限（爆得开）
+    params.lifeMin = 0.50f;                        // 寿命下限
+    params.lifeMax = 1.00f;                        // 寿命上限（停留更久）
+    params.sizeMin = 3.0f;                         // 边长下限
+    params.sizeMax = 7.0f;                         // 边长上限（大块碎片）
+    params.spreadRadians = kFullCircle;            // 整圆大爆散
+    params.gravityY = 200.0f;                      // 重力回落
+    params.damping = 1.2f;                         // 弱阻尼：飞得开
+    return params;                                 // 交还本事件参数
+}
+
 } // 匿名命名空间结束
 
 // 析构（批五A 起恢复自定义实现；批五B 追加法术素材释放）：除成员 RAII
@@ -347,6 +444,15 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     m_monsterAttackCooldown =
         std::max(0.0f, config.getFloat("monster_attack_cooldown", kDefaultMonsterAttackCooldown));
 
+    // M3·乙：Boss 降临间隔与击杀回血。间隔做下限夹取（bossSafeInterval 同款
+    // 1s——配置 0/负值不会导致同帧无限尝试）；回血百分比夹到 [0,100]。
+    // 首只 Boss 的时刻 = 开场后 m_bossInterval 秒（onEnter 下方排程）
+    m_bossInterval = bossSafeInterval(
+        config.getFloat("boss_interval_seconds", kDefaultBossIntervalSeconds)); // 有效间隔（秒）
+    m_bossKillHealPercent = std::clamp(
+        config.getFloat("boss_kill_heal_percent", kDefaultBossKillHealPercent), // 配置值
+        0.0f, 100.0f); // 百分比夹取（0=关闭，>100 按 100）
+
     // 批四新增：金币磁吸半径（像素）读进「基准」字段（M2：聚宝从基准加半径）
     // ——负值夹到 0（0 = 只在完全贴合时吸附的显式语义；范围外金币静止不动，
     // 可走过去拾取）
@@ -409,6 +515,7 @@ void PlayScene::onEnter(SDL_Renderer* renderer, const Config& config, AudioSyste
     // 刷新时刻表从首刷延迟起算；玩家生命在步骤 8 的 applyCardEffects 之后
     // 回满（先把上限按卡牌层数重算到位——层数全 0 时即配置初值）
     m_monsterNextSpawnTime = kFirstSpawnDelay;   // 首只怪物：局内 2 秒后出现
+    m_bossNextAttemptTime = m_bossInterval;      // 首只 Boss：登场后 m_bossInterval 秒（默认 180s）
 
     // 冒烟观测点：日志确认场景切换实际发生（自动化测试据此断言流程）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入场景: Play");
@@ -1307,6 +1414,17 @@ void PlayScene::applyAttackElement(const Monster& monster)
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "玩家冻结（%.1f 秒，不可移动/攻击）", FreezeMeter::kFreezeSeconds);
         }
+
+        // M3·乙：霜爵·重击同时带「冻结条 +35」与「减速 x0.6/3s」——
+        // Freeze 模组若 slowSeconds > 0，额外挂减速（冰环 slowSeconds=0 不受影响）
+        if (module.slowSeconds > 0.0f)
+        {
+            m_playerSlow.apply(module.slowFactor, module.slowSeconds); // 覆盖乘区并刷新时长
+            refreshPlayerMoveSpeed(); // 立即按新乘区注入移速（不叠乘）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "冰霜减速命中（移速 x%.2f，持续 %.1f 秒；区乘区 x%.2f）",
+                        module.slowFactor, module.slowSeconds, currentZoneMoveMultiplier());
+        }
         return; // 元素结算结束
     }
     // 无元素（草地三型）：命中只造成伤害
@@ -1561,7 +1679,27 @@ void PlayScene::update(const UpdateContext& ctx)
     // 局内秒数累计 + 到点生成。存活计时与怪物难度计时共用同一时间基准
     // （固定步长，暂停时冻结）
     m_survivalSeconds += ctx.deltaTime; // 存活时间正计时（HUD/结算展示）
-    m_monsterElapsed += ctx.deltaTime;  // 局内秒数：难度曲线与刷新节奏的计时基准
+    m_monsterElapsed += ctx.deltaTime;  // 局内秒数：难度曲线、刷新节奏与 Boss 排程的计时基准
+
+    // ---- Boss 降临（M3·乙）：每 boss_interval_seconds 尝试一次 ----
+    // 首只 = 开局后 180s（配置可调）；到点先排下一次，再判「同屏唯一」：
+    // 已有 Boss 存活则本次跳过并日志，绝不叠第二只
+    if (bossSpawnIsDue(m_monsterElapsed, m_bossNextAttemptTime))
+    {
+        m_bossNextAttemptTime = bossNextAttemptTime(
+            m_bossNextAttemptTime, m_bossInterval); // 先排下一次尝试（无论成败）
+        if (bossSpawnBlockedByAlive(findAliveBoss() != nullptr)) // 同屏唯一判据
+        {
+            // 冒烟观测点：场上有 Boss 时到点不刷（规格边界）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "Boss 降临跳过（场上已有 Boss 存活）");
+        }
+        else
+        {
+            spawnBoss(); // 环带采样 + 区选型 + 日志；失败时下次到点再试
+        }
+    }
+
     if (m_monsterElapsed >= m_monsterNextSpawnTime)
     {
         // 排定下一次尝试：间隔按当前局内时间收紧（下限 1s）。
@@ -1604,7 +1742,7 @@ void PlayScene::update(const UpdateContext& ctx)
                         spawnBox.y + spawnBox.h * 0.5f); // 出生点（脚盒）中心 y
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "怪物出现（第 %d 只，%s Lv.%d，%s，距玩家 %.0f px）",
-                                m_monsterSpawnedTotal, monsterTypeName(monster.type()),
+                                m_monsterSpawnedTotal, monster.name(),
                                 monster.level(), zoneDef(logZone).name, spawnDistance);
                 }
                 break; // 本步至多生成一只（无论成功与否）
@@ -1649,17 +1787,21 @@ void PlayScene::update(const UpdateContext& ctx)
         const float monsterCenterX = monsterRect.x + monsterRect.w * 0.5f;   // 中心 x
         const float monsterCenterY = monsterRect.y + monsterRect.h * 0.5f;   // 中心 y
 
-        // 非激活区：跳过本步更新（动画/移动/红染计时全部冻结——暂停语义）
-        if (!m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY))
+        // 非激活区：普通怪跳过本步更新（动画/移动/红染计时全部冻结——暂停语义）。
+        // M3·乙：Boss 例外——不适用远处冻结/回收，跨区也持续追击玩家
+        //（渲染端仍按激活窗口裁剪；Boss 追上进入窗口后立即重新可见）
+        if (!monster.isBoss() &&
+            !m_world.isPointInActiveChunks(monsterCenterX, monsterCenterY))
         {
-            continue; // 非激活：本步不推进（渲染端同样跳过）
+            continue; // 普通怪非激活：本步不推进（渲染端同样跳过）
         }
 
-        // 本步速度 = 变体基础速度 + 成长 x 局内秒数（逐只计算：三变体基础值不同），
-        // 封顶 kMonsterMaxSpeed 后注入
-        const float speed = std::min(
-            monster.baseSpeed() + m_monsterSpeedGrowth * m_monsterElapsed,
-            kMonsterMaxSpeed);
+        // 本步速度：普通怪 = 变体基础 + 成长 x 局内秒数（封顶 260）；
+        // Boss = 固定 99（baseSpeed 已含 x0.9）——不叠难度成长，保持可跑开
+        const float speed = monster.isBoss()
+            ? monster.baseSpeed()                         // Boss：固定略降速度
+            : std::min(monster.baseSpeed() + m_monsterSpeedGrowth * m_monsterElapsed,
+                       kMonsterMaxSpeed);                 // 普通怪：难度成长封顶
 
         monster.setTarget(playerBox); // 注入追踪目标（批四：玩家碰撞盒 → 中心点 + 完整盒）
         monster.setChaseSpeed(speed); // 注入本步速度（难度曲线：随时间爬升）
@@ -1668,11 +1810,19 @@ void PlayScene::update(const UpdateContext& ctx)
         // ---- 攻击结算消费（批四·蓄力前扑，替换旧「纯接触即伤」）----
         // 每只怪物每步至多发布一条结果（consumeAttackResult 返回并清除）
         const MonsterAttackResult attack = monster.consumeAttackResult();
+
+        // Boss 招式反馈（M3·乙）：重砸/冰环/冲锋在结算瞬间配粒子与震屏——
+        // 无论命中与否、玩家是否无敌都播放（攻击本身已经发生）
+        if (attack != MonsterAttackResult::None && monster.isBoss())
+        {
+            spawnBossAttackFeedback(monster); // 只补表现，不改伤害结算
+        }
+
         if (attack == MonsterAttackResult::Miss)
         {
             // 冒烟观测点：蓄力落空（玩家在躲避窗口内离开了接触范围）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                        "怪物攻击落空（%s）", monsterTypeName(monster.type()));
+                        "怪物攻击落空（%s）", monster.name());
         }
         else if (attack == MonsterAttackResult::Hit)
         {
@@ -1688,9 +1838,12 @@ void PlayScene::update(const UpdateContext& ctx)
                 //（伤害 x(1+6%/级)，批六丙；等级 1 = 配置原值），再乘模组倍率
                 //（批六丁数据表；本批六型均为 1.0，保持既有调平）
                 const AttackModule& attackModule = monster.attackModule(); // 本次攻击模组
+                // 伤害 = 等级缩放伤害 x 模组倍率 x Boss 总倍率（M3·乙 x1.5）。
+                // 例：Lv20 Boss = 21 x 1.5 = 31.5 -> 32；Lv30 = 27 x 1.5 = 40.5 -> 41
+                const float bossMultiplier = monster.isBoss() ? kBossDamageMultiplier : 1.0f; // Boss x1.5
                 int remainingDamage = static_cast<int>(std::lround(
                     scaledMonsterDamage(m_monsterDamage, monster.level()) *
-                    attackModule.damageMultiplier)); // 等级伤害 x 模组倍率（四舍五入）
+                    attackModule.damageMultiplier * bossMultiplier)); // 四舍五入到整点
                 remainingDamage = std::max(remainingDamage, 0); // 防御：负倍率不变成治疗
                 if (m_playerShield > 0 && remainingDamage > 0) // 有盾才走吸收
                 {
@@ -1714,7 +1867,7 @@ void PlayScene::update(const UpdateContext& ctx)
                     // 供「数值缩放随级」断言）
                     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                                 "怪物攻击命中（%s Lv.%d，扣 %d 点生命，剩余 %d/%d）",
-                                monsterTypeName(monster.type()), monster.level(),
+                                monster.name(), monster.level(),
                                 remainingDamage, m_playerHp, m_playerMaxHp);
 
                     // 3) 打击音效（低频闷响）：受击反馈的听觉层（视觉 = 击退 + 红染）
@@ -1808,9 +1961,12 @@ void PlayScene::update(const UpdateContext& ctx)
         // 推进旋转动画 + 追踪位移（速度/加速度曲线在 XpGem 内，纯函数积分）
         gem.update(ctx);
 
+        // 拾取延迟（M3·乙）：Boss 高价值宝石先在地面展示 0.8s，再允许吸收
+        const bool gemCanPickup = gem.canPickup();
+
         // 抵达判定：与玩家碰撞盒（脚盒）相交即吸收——宝石朝脚下飞，
         // 必然命中（单步位移 5.8~7.5px，不会穿透 32x26 的盒）
-        if (!gem.isPicked() && rectsOverlap(playerBox, gem.rect()))
+        if (gemCanPickup && !gem.isPicked() && rectsOverlap(playerBox, gem.rect()))
         {
             gem.markPicked(); // 标记：本次遍历结束后统一清理
 
@@ -1851,9 +2007,13 @@ void PlayScene::update(const UpdateContext& ctx)
     // coin_magnet_radius 即磁化吸附，触及（玩家盒重叠）即拾取
     for (Coin& coin : m_coins)
     {
+        // 拾取延迟（M3·乙）：Boss 金币落地后先展示 0.8s；延迟内不做磁吸
+        // 触发与重叠拾取（coin.update 仍会递减延迟并播放旋转动画）
+        const bool coinCanPickup = coin.canPickup();
+
         // 磁吸触发判定（未磁化时）：硬币中心与玩家盒中心距离 <= 半径
         //（含边界）即磁化；一次触发、永久保持（跑出范围也不半路丢下）
-        if (!coin.magnetized())
+        if (!coin.magnetized() && coinCanPickup)
         {
             const SDL_FRect coinRect = coin.rect();                             // 硬币快照
             const float dx = coinRect.x + coinRect.w * 0.5f - playerCenterX;    // 与玩家中心横向差
@@ -1874,7 +2034,7 @@ void PlayScene::update(const UpdateContext& ctx)
 
         // 触及即拾取：与玩家碰撞盒（脚盒）相交 -> 标记 + 局内货币累计 +
         // 播放「叮」音效；实际移除放在循环之后统一做（避免边遍历边删除）
-        if (!coin.isPicked() && rectsOverlap(playerBox, coin.rect()))
+        if (coinCanPickup && !coin.isPicked() && rectsOverlap(playerBox, coin.rect()))
         {
             coin.markPicked(); // 标记：本次遍历结束后统一清理
 
@@ -2344,7 +2504,7 @@ void PlayScene::advanceSwingSweep(const SDL_FRect& playerRect)
 
 // 掉落一颗经验宝石到 (x, y)：两个坐标指「怪物中心」，内部换算为宝石左上角。
 // xpValue 为本颗宝石的经验值（批六丙：场景按怪物等级缩放后传入）
-void PlayScene::dropGemAt(float x, float y, int xpValue)
+void PlayScene::dropGemAt(float x, float y, int xpValue, float pickupDelaySeconds)
 {
     // 在链表尾部原位构造（节点式容器：插入不搬动既有元素，
     // 实体持有的纹理指针绝不会因扩容被复制——这是选 std::list 的原因）
@@ -2354,24 +2514,40 @@ void PlayScene::dropGemAt(float x, float y, int xpValue)
     // 写入经验值（吸收时读它结算；随掉落源等级，不随场上滞留时间变化）
     gem.setXpValue(xpValue);
 
+    // 拾取延迟（M3·乙）：Boss 宝石先落地停留，普通怪 0 = 立即吸收
+    gem.setPickupDelay(std::max(0.0f, pickupDelaySeconds));
+
     // 纹理加载（三级回退在实体内部；失败只记录不中断——该宝石渲染时跳过）
     if (!gem.load(m_renderer))
     {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建经验宝石纹理失败：%s", SDL_GetError());
     }
 
-    // 落位：坐标以怪物中心给出，换算到宝石左上角；setPosition 内部同步插值快照
-    gem.setPosition(x - gem.width() * 0.5f, y - gem.height() * 0.5f);
+    // 落位：坐标以怪物中心给出，换算到宝石左上角；setPosition 内部同步插值快照。
+    // 落点可行走校验（M3·乙）：墙/水格回退到死亡中心——「掉落落在可行走地面」
+    float dropX = x - gem.width() * 0.5f;  // 候选宝石左上角 x
+    float dropY = y - gem.height() * 0.5f; // 候选宝石左上角 y
+    const SDL_FRect candidate{ dropX, dropY, gem.width(), gem.height() }; // 候选矩形
+    if (!m_world.isRectWalkable(candidate)) // 候选落在墙/水
+    {
+        dropX = x - gem.width() * 0.5f;  // 回退中心 x（死亡点本身可走）
+        dropY = y - gem.height() * 0.5f; // 回退中心 y
+    }
+    gem.setPosition(dropX, dropY);
 }
 
-// 掉落 count 枚金币到 (x, y) 周围（批三）：坐标指「怪物中心」
-void PlayScene::dropCoinsAt(float x, float y, int count)
+// 掉落 count 枚金币到 (x, y) 周围（批三；M3·乙加散开半径与可行走校验）
+void PlayScene::dropCoinsAt(float x, float y, int count, float scatterRadius,
+                            float pickupDelaySeconds)
 {
     // 非正数（未来改表/调用方错误）：无掉落，直接返回（防御）
     if (count <= 0)
     {
         return;
     }
+
+    // 散开半径夹到非负（负值按 0 = 全部落中心处理）
+    const float scatter = std::max(0.0f, scatterRadius); // 有效散开半径（像素）
 
     for (int i = 0; i < count; ++i)
     {
@@ -2386,16 +2562,44 @@ void PlayScene::dropCoinsAt(float x, float y, int count)
             SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "创建金币纹理失败：%s", SDL_GetError());
         }
 
-        // 散开落位：多枚金币绕掉落中心均匀分布在小半径圆上（2 枚时
-        // 左右各一、一眼数得清）；单枚（count==1）时半径取 0 = 落中心
-        const float angle = 6.283185307179586f * static_cast<float>(i) / static_cast<float>(count); // 每枚的方位角
-        const float offsetX = std::cos(angle) * kCoinDropScatter; // 横向偏移
-        const float offsetY = std::sin(angle) * kCoinDropScatter; // 纵向偏移
+        // 拾取延迟（M3·乙）：Boss 金币先铺开约 0.8s 再磁吸，落点可见；
+        // 普通怪 0 = 保持既有「落地即可吸」手感
+        coin.setPickupDelay(std::max(0.0f, pickupDelaySeconds));
+
+        // 散开落位：普通怪 1~3 枚沿用「均匀角 + 固定小半径」（2 枚左右各一，
+        // 一眼数得清）；4 枚以上（Boss 25~40 枚）用黄金角螺旋铺满圆面，
+        // 避免全部挤在同一圈上——多枚金币的落点仍然可见、可数
+        float offsetX = 0.0f; // 横向偏移（像素）
+        float offsetY = 0.0f; // 纵向偏移（像素）
+        if (count <= 3) // 普通掉落：保持既有观感
+        {
+            const float angle = 6.283185307179586f * static_cast<float>(i) /
+                                static_cast<float>(count); // 每枚的均匀方位角
+            offsetX = std::cos(angle) * scatter; // 横向偏移
+            offsetY = std::sin(angle) * scatter; // 纵向偏移
+        }
+        else // Boss 掉落：黄金角螺旋（面积均匀铺开）
+        {
+            constexpr float kGoldenAngle = 2.399963229728653f; // 黄金角（弧度）
+            const float angle = kGoldenAngle * static_cast<float>(i); // 每枚的方位角
+            const float ring = scatter * std::sqrt(
+                (static_cast<float>(i) + 0.5f) / static_cast<float>(count)); // 面积均匀半径
+            offsetX = std::cos(angle) * ring; // 横向偏移
+            offsetY = std::sin(angle) * ring; // 纵向偏移
+        }
 
         // 落位：坐标以怪物中心给出（含散开偏移），换算到金币左上角；
-        // setPosition 内部同步插值快照（瞬移类操作防拉丝）
-        coin.setPosition(x + offsetX - coin.width() * 0.5f,
-                         y + offsetY - coin.height() * 0.5f);
+        // 可行走校验（M3·乙）：偏移落到墙/水时回退死亡中心——「掉落落在
+        // 可行走地面」；setPosition 内部同步插值快照（瞬移类操作防拉丝）
+        float dropX = x + offsetX - coin.width() * 0.5f;  // 候选金币左上角 x
+        float dropY = y + offsetY - coin.height() * 0.5f; // 候选金币左上角 y
+        const SDL_FRect candidate{ dropX, dropY, coin.width(), coin.height() }; // 候选矩形
+        if (!m_world.isRectWalkable(candidate)) // 候选不可走
+        {
+            dropX = x - coin.width() * 0.5f;  // 回退死亡中心 x
+            dropY = y - coin.height() * 0.5f; // 回退死亡中心 y
+        }
+        coin.setPosition(dropX, dropY);
     }
 }
 
@@ -2612,36 +2816,68 @@ int PlayScene::findNearestMonster(float centerX, float centerY, float radius,
 // 公共死亡结算（横扫与法术共用；契约见头文件）：文案与批三/批四完全一致
 void PlayScene::resolveMonsterDeath(Monster& monster, float centerX, float centerY)
 {
-    // 击杀结算：计数 +1、原地掉落经验宝石与金币（批三双掉落）。
+    // 击杀结算：计数 +1（普通怪与 Boss 共用）
+    ++m_killCount; // 本局击杀 +1（HUD/结算使用）
+
+    if (monster.isBoss()) // ---- Boss 死亡分支（M3·乙）----
+    {
+        // 奖励：金币 25~40、经验 150~200（均匀 roll，纯函数夹取）。
+        // 经验以一枚高价值宝石落地（可见、可吸收）；金币用更大散开半径
+        const int bossCoins = bossCoinReward(static_cast<int>(SDL_rand(kBossCoinRolls))); // 25~40 枚
+        const int bossXp = bossXpReward(static_cast<int>(SDL_rand(kBossXpRolls)));       // 150~200 点
+        dropGemAt(centerX, centerY, bossXp, kBossDropVisibilityDelay); // 经验宝石（先停留 0.8s）
+        dropCoinsAt(centerX, centerY, bossCoins, kBossCoinScatter,     // 金币铺开（避免叠成一团）
+                    kBossDropVisibilityDelay);                          // 先停留 0.8s 再磁吸
+
+        // 大爆散 + 震屏 8px（规格）：粒子数量/尺寸/寿命全面放大，颜色同色系
+        m_particles.emitBurst(centerX, centerY, kBossDeathSparkCount,
+                              makeBossDeathBurst(monster.bossType())); // 同色系大爆散
+        m_camera.addShake(kShakeBossDeathAmplitude, kShakeBossDeathSeconds); // 震屏 8px
+
+        // 击杀回血 30%（百分比可配置）：先记录再夹到上限，日志含前后值
+        const int heal = bossKillHeal(m_playerMaxHp, m_bossKillHealPercent); // 回血量（纯函数）
+        const int hpBefore = m_playerHp;                                    // 回血前生命
+        m_playerHp = std::min(m_playerHp + heal, m_playerMaxHp);            // 加上回血并夹到上限
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 击杀回血（%.0f%%：%d -> %d / %d）",
+                    m_bossKillHealPercent, hpBefore, m_playerHp, m_playerMaxHp); // 冒烟观测点
+
+        // 冒烟观测点：Boss 击杀 + 掉落明细（奖励公式与震屏/粒数的断言依据）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 击杀（%s Lv.%d，累计 %d 杀；金币 %d 枚，经验 %d，%d 粒爆散）",
+                    monster.name(), monster.level(), m_killCount,
+                    bossCoins, bossXp, kBossDeathSparkCount);
+        return; // Boss 分支结束（普通怪结算不再执行）
+    }
+
+    // ---- 普通怪死亡（既有口径）----
     // 批六丙：宝石经验按掉落源等级缩放（10 x(1+10%/级)）；
     // 金币数 = 变体基础 + floor((lv-1)/10)（Monster::coinDrop 已含等级）
-    ++m_killCount; // 本局击杀 +1（HUD/结算使用）
     const int gemXp = monsterXpValue(kGemXpValue, monster.level()); // 本颗宝石经验（随级）
     dropGemAt(centerX, centerY, gemXp);       // 掉落宝石：坐标即怪物中心 + 经验值
     const int coinCount = monster.coinDrop(); // 本变体的金币掉落数（含等级加成）
     dropCoinsAt(centerX, centerY, coinCount); // 掉落金币（散开可见）
 
     // 粒子与震屏（M3·甲）：击杀爆散用怪物变体同色系（12 粒，规格 10~16），
-    // 并登记 2px/0.1s 的轻震——横扫与法术致死共用本函数，因此两条击杀链
-    // 都自动获得同款反馈；Boss 震屏留待后续批
+    // 并登记 2px/0.1s 的轻震——横扫与法术致死共用本函数
     m_particles.emitBurst(centerX, centerY, kMonsterDeathSparkCount,
                           makeMonsterDeathBurst(monster.type())); // 颜色系爆散
     m_camera.addShake(kShakeKillAmplitude, kShakeKillSeconds);    // 轻震（2px/0.1s）
     // 冒烟观测点：爆散日志（含变体名与粒数——连拍截图的时序对齐依据）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "粒子：击杀爆散（%s，%d 粒）",
-                monsterTypeName(monster.type()), kMonsterDeathSparkCount);
+                monster.name(), kMonsterDeathSparkCount);
 
     // 冒烟观测点：击杀日志（自动化测试据此断言击杀链路）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "击杀怪物（累计 %d 杀）", m_killCount);
     // 冒烟观测点：宝石经验日志（批六丙：经验随怪物等级——冒烟对照断言用）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "宝石掉落（经验 %d，%s Lv.%d）",
-                gemXp, monsterTypeName(monster.type()), monster.level());
+                gemXp, monster.name(), monster.level());
     // 冒烟观测点：金币掉落日志（批六丙追加等级——数量随级断言用）
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "金币掉落（%d 枚，%s Lv.%d）",
-                coinCount, monsterTypeName(monster.type()), monster.level());
+                coinCount, monster.name(), monster.level());
 }
 
 // 法术伤害结算（契约见头文件）：与横扫结算同款但飘字颜色区分、不带击退
@@ -3436,18 +3672,20 @@ void PlayScene::settleRecords()
     // 静默结算口径（旧 GameOver 界面的三项标记已随本批清理）
 }
 
-// 存活怪物计数：刷新上限的门控依据（池最多 12 个槽位，遍历成本可忽略）
+// 存活普通怪计数：刷新上限的门控依据（遍历 13 槽位，成本可忽略）。
+// M3·乙：Boss 占用独立的第 13 个槽位，不计入普通怪上限——Boss 存活时
+// 普通怪仍可按既有 12 只上限刷新（池恰好容纳 12 + 1）
 int PlayScene::aliveMonsterCount() const
 {
-    int count = 0; // 存活计数从 0 起
+    int count = 0; // 普通怪存活计数从 0 起
     for (const Monster& monster : m_monsters)
     {
-        if (monster.isAlive())
+        if (monster.isAlive() && !monster.isBoss()) // 只统计普通怪
         {
-            ++count; // 在场槽位 +1
+            ++count; // 在场普通怪 +1
         }
     }
-    return count; // 返回存活总数
+    return count; // 返回普通怪存活总数
 }
 
 // 当前数量上限：初始值（monster_max_count）+ 每 20 秒 +2，封顶 kMaxMonsterCap（12）。
@@ -3478,6 +3716,10 @@ void PlayScene::recycleDormantMonsters(float playerCenterX, float playerCenterY)
         if (!monster.isAlive()) // 空槽位：没有可回收的对象
         {
             continue; // 跳过（回收的目标是占用池子的存活怪）
+        }
+        if (monster.isBoss()) // Boss 不适用远处回收（M3·乙）：跨区也持续追击
+        {
+            continue; // 无论距离/区块，Boss 永不被回收
         }
 
         // 三条件输入一：怪物中心是否处于激活区块（用完整精灵中心——
@@ -3587,6 +3829,193 @@ bool PlayScene::spawnMonsterAtSlot(Monster& monster)
     // 重试耗尽（少见：环带被墙/水/窗口边界占满等极端情形）：本步不生成。
     // 刷新时刻表已在调用方推进——下一次刷新时刻自然再试，不会死循环
     return false;
+}
+
+// 查询场上存活 Boss（M3·乙）：同时最多 1 只，返回首个匹配槽位（无则 nullptr）
+Monster* PlayScene::findAliveBoss()
+{
+    for (Monster& monster : m_monsters) // 全池扫描（13 槽位，开销可忽略）
+    {
+        if (monster.isAlive() && monster.isBoss()) // 存活 + Boss 标记
+        {
+            return &monster; // 命中（唯一性由生成规则保证）
+        }
+    }
+    return nullptr; // 场上无 Boss
+}
+
+// const 版本：供渲染/HUD 只读查询（与上方非 const 版本同一判据）
+const Monster* PlayScene::findAliveBoss() const
+{
+    for (const Monster& monster : m_monsters) // 全池只读扫描
+    {
+        if (monster.isAlive() && monster.isBoss()) // 存活 + Boss 标记
+        {
+            return &monster; // 命中
+        }
+    }
+    return nullptr; // 场上无 Boss
+}
+
+// 到点尝试 Boss 降临（M3·乙）：契约见头文件。
+// 采样规则与普通怪同源（激活区块 + 脚盒 walkable，含避水），但环带改为
+// 500~700px；身份/等级按落点所在区定稿（草地 Lv20 / 雪山 Lv30）。
+bool PlayScene::spawnBoss()
+{
+    // 1) 找空槽位：池 = 12 普通怪 + 1 Boss，正常情形必有空位；
+    // 极端情形（未来改池/生成失败残留）返回 false，下次到点再试
+    Monster* slot = nullptr; // 目标空槽位
+    for (Monster& monster : m_monsters) // 全池找第一个空位
+    {
+        if (!monster.isAlive()) // 空槽位（含刚死亡/尚未使用）
+        {
+            slot = &monster; // 记录目标
+            break;           // 找到一个即可
+        }
+    }
+    if (slot == nullptr) // 池满（理论不可达：13 槽位 vs 12 普通怪上限）
+    {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Boss 降临失败（怪物池已满）");
+        return false; // 下次到点再试
+    }
+
+    // 2) 先用临时 Boss 体型做落点校验（两种 Boss 同尺寸 72x72 / 脚盒 54x45）；
+    //    候选点定稿后再 loadBoss 换成真实身份（loadBoss 会重置体型/碰撞盒）
+    slot->setBoss(BossType::GoblinKing); // 临时体型（与霜爵同尺寸）
+
+    // 玩家中心：环带圆心（与普通怪出生同一「脚盒中心」口径）
+    const SDL_FRect playerBox = m_player.collisionRect();         // 玩家脚盒快照
+    const float playerCenterX = playerBox.x + playerBox.w * 0.5f; // 圆心 x
+    const float playerCenterY = playerBox.y + playerBox.h * 0.5f; // 圆心 y
+
+    // 环带面积均匀采样：半径平方在 [min², max²] 均匀，再开方
+    const float minRadiusSq = kBossSpawnRingMin * kBossSpawnRingMin; // 内径平方
+    const float maxRadiusSq = kBossSpawnRingMax * kBossSpawnRingMax; // 外径平方
+    constexpr float kTwoPi = 6.283185307179586f;                     // 2π（均匀角度）
+    constexpr int kAttempts = 64;                                    // 采样重试上限（与普通怪一致）
+
+    for (int attempt = 0; attempt < kAttempts; ++attempt)
+    {
+        const float angle = SDL_randf() * kTwoPi; // 均匀方位角
+        const float radiusSq = minRadiusSq + SDL_randf() * (maxRadiusSq - minRadiusSq); // 面积均匀半径平方
+        const float radius = std::sqrt(radiusSq); // 环带半径（500~700）
+        const float spawnCenterX = playerCenterX + std::cos(angle) * radius; // 候选中心 x
+        const float spawnCenterY = playerCenterY + std::sin(angle) * radius; // 候选中心 y
+
+        // 条件一：激活区块内（非激活区不生 Boss——与普通怪门控一致）
+        if (!m_world.isPointInActiveChunks(spawnCenterX, spawnCenterY))
+        {
+            continue; // 出激活窗口：换候选
+        }
+
+        // 条件二：Boss 脚盒在候选点可走（isRectWalkable 同时拒绝墙与水）
+        const SDL_FRect bossBox =
+            slot->collisionRectAt(spawnCenterX - slot->width() * 0.5f,  // 候选精灵左上角 x
+                                  spawnCenterY - slot->height() * 0.5f); // 候选精灵左上角 y
+        if (!m_world.isRectWalkable(bossBox))
+        {
+            continue; // 墙/水：换候选
+        }
+
+        // 条件二·补（M3·乙冒烟修正）：玩家 -> 候选点的直线路径必须能让
+        // Boss 的大脚盒通过——Boss 体型 1.5 倍，若生在墙后/一格窄缝里，
+        // 直线追击会被卡死（贴墙侧滑也挤不过 48px 通道）。沿连线采样
+        // 12 个点逐一校验，保证「生在同一片开阔地」；失败换候选
+        bool pathClear = true; // 直线路径是否全程可走
+        constexpr int kPathSamples = 12; // 路径采样点数（约每 50~60px 一点）
+        for (int sample = 1; sample <= kPathSamples; ++sample) // 从玩家外侧到候选点
+        {
+            const float t = static_cast<float>(sample) / static_cast<float>(kPathSamples); // 归一化进度
+            const float pathX = playerCenterX + (spawnCenterX - playerCenterX) * t; // 采样点 x
+            const float pathY = playerCenterY + (spawnCenterY - playerCenterY) * t; // 采样点 y
+            const SDL_FRect pathBox = slot->collisionRectAt(pathX - slot->width() * 0.5f, // 采样点脚盒 x
+                                                             pathY - slot->height() * 0.5f); // 采样点脚盒 y
+            if (!m_world.isRectWalkable(pathBox)) // 连线穿墙/水
+            {
+                pathClear = false; // 标记失败
+                break;             // 换下一个候选
+            }
+        }
+        if (!pathClear) // 路径不通
+        {
+            continue; // 换候选（避免 Boss 出生即被墙卡死）
+        }
+
+        // 条件三（防御）：圆心距落在 [500,700]（浮点/边界退化也不破规格）
+        const float dx = spawnCenterX - playerCenterX; // 与玩家中心横向差
+        const float dy = spawnCenterY - playerCenterY; // 纵向差
+        const float distanceSq = dx * dx + dy * dy;    // 圆心距平方
+        if (distanceSq < minRadiusSq || distanceSq > maxRadiusSq)
+        {
+            continue; // 环带外：换候选
+        }
+
+        // 3) 全部校验通过：按落点所在区选型 -> 加载外观 -> 落位生成。
+        //    等级取该区高点档（草地 20 / 雪山 30），不参与距离梯度
+        const ZoneId spawnZone = zoneAtWorld(spawnCenterX, spawnCenterY); // 落点所属区
+        const BossType bossType = bossTypeForZone(spawnZone);             // 双区选型
+        const int bossLevel = bossLevelForZone(spawnZone);                // 固定等级
+        slot->loadBoss(m_renderer, bossType); // 复用同族外观 + 套 Boss 体型
+        slot->spawnAt(spawnCenterX, spawnCenterY, bossLevel); // 落位（写 Boss 生命/巢）
+
+        // 4) 冒烟观测点：降临日志（规格文案「Boss 降临（名，等级 N）」）
+        const float distance = std::sqrt(distanceSq); // 实际圆心距（日志）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 降临（%s，等级 %d，%s，距玩家 %.0f px）",
+                    bossTypeName(bossType), bossLevel,
+                    zoneDef(spawnZone).name, distance);
+        // 冒烟观测点：免疫规则说明（冻结/减速对 Boss 无效）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 特性（%s：免疫冻结与减速；持续追击、不回收）",
+                    bossTypeName(bossType));
+        return true; // 生成成功
+    }
+
+    // 采样耗尽（环带被墙/水/窗口占满等极端情形）：本次失败，下次到点再试
+    SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Boss 降临失败（落点采样失败）");
+    return false; // 调用方无需回滚（下一次尝试已排程）
+}
+
+// Boss 招式反馈（M3·乙）：重砸/冰环/冲锋在结算瞬间配粒子与震屏。
+// 不做伤害判断——伤害/无敌/护盾由既有流程裁决，这里只补「打到了」的表现
+void PlayScene::spawnBossAttackFeedback(const Monster& monster)
+{
+    const AttackModule& module = monster.attackModule(); // 本次招式（Boss 专属）
+    const SDL_FRect rect = monster.rect();               // 怪物矩形快照
+    const float centerX = rect.x + rect.w * 0.5f;        // 中心 x（特效原点）
+    const float centerY = rect.y + rect.h * 0.5f;        // 中心 y
+
+    if (module.kind == AttackKind::Slam) // 重砸：金色尘土 + 8px 震屏
+    {
+        m_particles.emitBurst(centerX, centerY, kBossSlamSparkCount,
+                              makeBossSlamSparks()); // 砸地尘土
+        m_camera.addShake(kShakeBossSlamAmplitude, kShakeBossSlamSeconds); // 震屏 8px
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 重砸冲击（%d 粒，震屏 %.0fpx）",
+                    kBossSlamSparkCount, kShakeBossSlamAmplitude); // 冒烟观测点
+        return; // 单招处理完毕
+    }
+    if (module.kind == AttackKind::Ring) // 冰环：青蓝冰屑 + 6px 震屏
+    {
+        m_particles.emitBurst(centerX, centerY, kBossRingSparkCount,
+                              makeBossRingSparks()); // 冰屑整圆
+        m_camera.addShake(kShakeBossRingAmplitude, kShakeBossRingSeconds); // 震屏 6px
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 冰环爆发（%d 粒，震屏 %.0fpx）",
+                    kBossRingSparkCount, kShakeBossRingAmplitude); // 冒烟观测点
+        return; // 单招处理完毕
+    }
+    if (module.kind == AttackKind::Charge) // 冲锋：金色风尘 + 7px 震屏
+    {
+        m_particles.emitBurst(centerX, centerY, kBossChargeSparkCount,
+                              makeBossChargeSparks()); // 冲刺风尘
+        m_camera.addShake(kShakeBossChargeAmplitude, kShakeBossChargeSeconds); // 震屏 7px
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 冲锋冲击（%d 粒，震屏 %.0fpx）",
+                    kBossChargeSparkCount, kShakeBossChargeAmplitude); // 冒烟观测点
+        return; // 单招处理完毕
+    }
+    // 重击（前扑）等普通位移招式：沿用命中火花/受击反馈，不额外加特效
 }
 
 // 把与玩家碰撞盒重叠的怪物按最小分离量推出（批四·体积碰撞兜底）
@@ -3755,6 +4184,7 @@ void PlayScene::restart()
     m_monsterElapsed = 0.0f;                   // 难度计时重新起算
     m_monsterNextSpawnTime = kFirstSpawnDelay; // 首只怪物重新按 2s 延迟出现
     m_monsterSpawnedTotal = 0;                 // 日志编号重新从第 1 只开始
+    m_bossNextAttemptTime = m_bossInterval;    // 首只 Boss 重新从「开局后 180s」起算
 
     // 刷新窗口实际尺寸缓存：重开时窗口可能已被调整过大小
     SDL_GetWindowSize(m_window, &m_width, &m_height);
@@ -4376,6 +4806,10 @@ void PlayScene::renderHud()
         }
     }
 
+    // 顶部 Boss 血条（M3·乙）：仅 Boss 存活时显示；放在状态叠层之前，
+    // 暂停/面板下也保留（玩家能看清冻结时刻的 Boss 血量）
+    renderBossHud();
+
     if (m_state == PlayState::Paused)
     {
         // 暂停叠层：大号「暂停」+ 两条操作提示。
@@ -4664,6 +5098,67 @@ void PlayScene::renderHud()
         m_hudFont.drawCentered(m_renderer, "按 1~9 或点击购买 · B/ESC 关闭", centerX,
                                screenH * 0.93f);
     }
+}
+
+// 顶部 Boss 血条（M3·乙；契约见头文件）：屏幕顶部中央 480x18 长条 +
+// Boss 名 + 「Lv.n」+ 当前/最大生命数值。仅 Boss 存活时显示；文字走 Font。
+void PlayScene::renderBossHud()
+{
+    const Monster* boss = findAliveBoss(); // 场上唯一 Boss（nullptr = 不显示）
+    if (boss == nullptr) // 无 Boss：什么都不画
+    {
+        return; // 保持画面干净
+    }
+
+    // 输出尺寸（物理像素）：与其余 HUD 同一布局基准
+    int outW = 0; // 输出宽（像素）
+    int outH = 0; // 输出高（像素）
+    SDL_GetRenderOutputSize(m_renderer, &outW, &outH); // 查询当前渲染目标尺寸
+    const float screenW = static_cast<float>(outW);    // 浮点别名：水平居中
+    (void)outH;                                        // 纵坐标固定从顶部起算，高度不参与
+
+    // 长条几何（规格约 480x18）：顶部中央，留 30px 上边距
+    constexpr float kBarW = 480.0f; // 血条宽（像素）
+    constexpr float kBarH = 18.0f;  // 血条高（像素）
+    constexpr float kBarY = 30.0f;  // 血条上边界（像素）
+    const float barX = (screenW - kBarW) * 0.5f; // 水平居中后的左边界
+    const float ratio = (boss->maxHp() > 0)     // 生命比例（防御除零）
+        ? std::clamp(static_cast<float>(boss->hp()) /
+                     static_cast<float>(boss->maxHp()), 0.0f, 1.0f)
+        : 0.0f;                                  // 异常上限按空条处理
+
+    // 外沿（近黑描边）：让血条在亮/暗背景上都有轮廓
+    SDL_SetRenderDrawColor(m_renderer, 0, 0, 0, 255); // 近黑
+    const SDL_FRect outline{ barX - 2.0f, kBarY - 2.0f, // 外扩 2px
+                             kBarW + 4.0f, kBarH + 4.0f }; // 宽高各加 4
+    SDL_RenderFillRect(m_renderer, &outline); // 描边底
+
+    // 底色（深红灰）：满宽铺底——剩余生命比例对照背景读出
+    SDL_SetRenderDrawColor(m_renderer, 52, 24, 28, 255); // 深红灰
+    const SDL_FRect back{ barX, kBarY, kBarW, kBarH };   // 满宽底条
+    SDL_RenderFillRect(m_renderer, &back);               // 填充底色
+
+    // 前景（亮红）：宽度 = 满宽 x 生命比例
+    SDL_SetRenderDrawColor(m_renderer, 225, 55, 55, 255); // 亮红
+    const SDL_FRect fill{ barX, kBarY, kBarW * ratio, kBarH }; // 按比例缩宽
+    SDL_RenderFillRect(m_renderer, &fill);                     // 填充前景
+
+    // Boss 名 + 等级（长条上方；m_cardFont 24pt，先画暗影再画主体）
+    char nameText[64]; // 容纳「哥布林王 Lv.20」，绰绰有余
+    SDL_snprintf(nameText, sizeof(nameText), "%s Lv.%d", // 规格要求的「名 + Lv.n」
+                 boss->name(), boss->level());            // Boss 展示名 / 固定等级
+    const float nameY = 2.0f; // 文字顶边（长条上方 2px 起）
+    SDL_SetRenderDrawColor(m_renderer, 8, 12, 20, 230); // 暗影：近黑蓝
+    m_cardFont.drawCentered(m_renderer, nameText, screenW * 0.5f + 2.0f, nameY + 2.0f); // 暗影层
+    SDL_SetRenderDrawColor(m_renderer, 255, 232, 150, 255); // 暖金：Boss 名
+    m_cardFont.drawCentered(m_renderer, nameText, screenW * 0.5f, nameY); // 主体层
+
+    // 当前/最大生命数值（长条下方；m_smallFont 16pt）：规格要求的数值行
+    char hpText[64]; // 容纳「696 / 696」，绰绰有余
+    SDL_snprintf(hpText, sizeof(hpText), "%d / %d", // 当前 / 最大
+                 boss->hp(), boss->maxHp());         // 直接读实体（唯一事实来源）
+    SDL_SetRenderDrawColor(m_renderer, 235, 235, 235, 255); // 近白：数值
+    m_smallFont.drawCentered(m_renderer, hpText, screenW * 0.5f, kBarY + kBarH + 4.0f); // 条下 4px
 }
 
 // 采样渲染帧间隔并做 EMA 平滑：FPS 显示的数据来源。

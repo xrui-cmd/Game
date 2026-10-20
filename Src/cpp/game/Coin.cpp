@@ -26,6 +26,14 @@ void Coin::update(const UpdateContext& ctx)
     // 帧动画无条件推进（与基类默认实现同款语句）：静置/飞行都持续旋转
     m_animTime += ctx.deltaTime;
 
+    // 拾取延迟（M3·乙）：Boss 掉落的金币先在地上铺开一会儿再允许磁吸/
+    // 拾取——延迟内仍播放旋转动画，但保持原位（落点可见）
+    if (m_pickupDelayLeft > 0.0f)
+    {
+        m_pickupDelayLeft = std::max(m_pickupDelayLeft - ctx.deltaTime, 0.0f); // 递减并夹到 0
+        return; // 延迟未结束：本步不移动
+    }
+
     // 未磁化或未注入目标（范围外/防御路径）：静止不动——规格语义
     if (!m_magnetized || !m_hasTarget)
     {

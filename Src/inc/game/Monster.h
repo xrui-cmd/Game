@@ -4,6 +4,7 @@
 #include "engine/Entity.h"     // Entity：实体基类（空间/纹理/帧动画公共能力）
 #include "game/MonsterAi.h"    // MonsterAi：AI 状态决策（纯逻辑，批三巡逻/仇恨/栓绳）
 #include "game/AttackModule.h" // AttackModule：六型进攻模组数据表（批六丁·蓄力/距离/元素）
+#include "game/Boss.h"         // Boss：双区 Boss 身份/属性/专属模组/奖励纯逻辑（M3·乙）
 
 // 前置声明：世界（碰撞）与相机（渲染换算）在本类中只以指针/引用出现，
 // 完整定义由 Monster.cpp 的包含获得（减少头依赖）
@@ -165,17 +166,44 @@ public:
     // PlayScene 在 spawnAt 之前调用（换皮）；重复加载同变体也无害
     bool loadVariant(SDL_Renderer* renderer, MonsterType type);
 
-    // 当前变体类型（日志/查询用）
+    // 当前变体类型（日志/查询用；Boss 返回其外观复用的同族变体）
     MonsterType type() const { return m_type; }
+
+    // ---- Boss（M3·乙）----
+
+    // 按 Boss 身份加载外观并应用 Boss 属性：外观复用同区基础变体
+    //（哥布林王 = 哥布林 / 霜爵 = 霜哥布林）——先 loadVariant（会清 Boss 态）、
+    // 再 setBoss（放大体型/碰撞盒）。返回纹理是否加载成功（失败仍可玩）
+    bool loadBoss(SDL_Renderer* renderer, BossType type);
+
+    // 设置 Boss 身份与体型：视觉 72x72、脚盒 54x45（全部 x1.5）。
+    // 只应在空槽位/加载后调用；普通怪物 spawn 路径会经 loadVariant 清回非 Boss
+    void setBoss(BossType type);
+
+    // 当前是否 Boss（场景用于：顶部血条、奖励、免疫、回收豁免、伤害倍率）
+    bool isBoss() const { return m_isBoss; }
+
+    // Boss 身份（非 Boss 时返回 GoblinKing 哨兵值；调用方先判 isBoss）
+    BossType bossType() const { return m_bossType; }
+
+    // 展示名：Boss = 哥布林王/霜爵；普通怪 = 变体名（所有日志的统一入口）
+    const char* name() const;
+
+    // 当前使用的 Boss 招式下标（0 近身 / 1 远距；-1 = 尚未出招）。
+    // 场景在命中/落空结算后可据此选特效；普通怪恒为 -1
+    int activeBossAttackIndex() const { return m_activeBossAttack; }
 
     // 当前是否处于「巡逻」AI 状态（批六补丁·回收判据）：true = 绕巢游荡
     // 或停顿（不含与玩家仇恨追击、也不含栓绳回巢）。场景的远处休眠怪
     // 回收只对巡逻状态的怪物生效——追击/回巢的怪物代表玩家正在拉怪，
     // 回收会让目标凭空消失（规则与三条件见 game/MonsterRecycle.h）
-    bool isPatrolling() const { return m_ai.state() == MonsterAiState::Patrol; }
+    bool isPatrolling() const
+    {
+        return !m_isBoss && m_ai.state() == MonsterAiState::Patrol; // Boss 永不巡逻（M3·乙）
+    }
 
-    // 本变体的基础追击速度（像素/秒）：PlayScene 在它之上叠加难度成长
-    // （monster_speed_growth x 局内秒数）并封顶，再经 setChaseSpeed 注入
+    // 基础追击速度（像素/秒）：普通怪 = 变体基础速度（场景再叠难度成长）；
+    // Boss = 变体基础 x 0.9（99——略降且不叠成长，保持「可跑开」红线）
     float baseSpeed() const;
 
     // 击杀金币掉落数（枚）：变体基础（史莱姆 1 / 哥布林 2 / 骷髅 1）
@@ -187,9 +215,17 @@ public:
     // 场景用于：攻击伤害缩放、经验宝石价值、血条旁「Lv.n」显示与日志断言
     int level() const { return m_level; }
 
-    // 本变体的进攻模组（批六丁）：场景在命中结算时读取伤害倍率/元素效果；
-    // 冒烟与单测也可直接查看当前蓄力/位移参数
-    const AttackModule& attackModule() const { return attackModuleFor(m_type); }
+    // 当前进攻模组：普通怪 = 变体固定模组；Boss = 本次已选择的专属招式
+    //（出招瞬间快照，结算/渲染/元素读取同一份）。Boss 尚未出招时退回其
+    // 外观变体模组（仅用于防御性渲染查询，不会触发普通怪出招）
+    const AttackModule& attackModule() const
+    {
+        if (m_isBoss && m_activeBossAttack >= 0) // Boss 已选招：用专属模组
+        {
+            return bossAttackDef(m_bossType, m_activeBossAttack).module; // 表驱动
+        }
+        return attackModuleFor(m_type); // 普通怪 / Boss 未选招：变体模组
+    }
 
     // 注入法术冰环纹理（场景复用 spell_frost_nova.png）：冰史莱姆落地时
     // 绘制一圈冰环视觉。只借用不持有（纹理生命周期归场景）；nullptr = 不画
@@ -292,6 +328,7 @@ public:
         m_ai.clear();        // AI 状态回巡逻（巢保留——下次 spawnAt 会重写）
         clearMotionState();  // 清持久化侧滑与卡死检测窗口
         clearAttackState();  // 清攻击状态（批四：出招阶段/冷却/脉冲不跨生命周期）
+        clearBossState();    // 清 Boss 身份/体型/冷却（M3·乙：池复用绝不留 Boss 态）
         clearPlayerBlocker(); // 清玩家盒实心（批四：池复用不带旧玩家位置）
     }
 
@@ -479,6 +516,12 @@ private:
     float m_landingFxLeft = 0.0f;      // 落地冰环剩余时长（秒；冰史莱姆落地时置满）
     MonsterAttackResult m_attackResult = MonsterAttackResult::None; // 待消费结果（每步至多一条）
 
+    // ---- Boss 运行时（M3·乙）----
+    bool m_isBoss = false;                          // 是否 Boss（体型/奖励/免疫/回收豁免的总开关）
+    BossType m_bossType = BossType::GoblinKing;     // Boss 身份（非 Boss 时为默认哨兵）
+    int m_activeBossAttack = -1;                    // 当前招式下标（0 近身 / 1 远距；-1 未出招）
+    float m_bossCooldownLeft[kBossAttackCount] = {}; // 两招独立冷却剩余（秒；Boss 分支递减）
+
     // ---- 前扑/突刺残影运行时（批五A）----
     struct LungeGhost
     {
@@ -541,7 +584,25 @@ private:
         m_attackPulseLeft = 0.0f;                   // 染色脉冲熄灭
         m_landingFxLeft = 0.0f;                     // 落地冰环熄灭（不跨生命周期）
         m_attackResult = MonsterAttackResult::None; // 待消费结果丢弃（不跨生命周期发布）
+        m_activeBossAttack = -1;                    // Boss 当前招式清空（池复用不带旧招）
+        m_bossCooldownLeft[0] = 0.0f;               // 近身招冷却清零（新 Boss 可立即出招）
+        m_bossCooldownLeft[1] = 0.0f;               // 远距招冷却清零（同上）
         clearLungeGhosts();                         // 前扑/突刺残影清空（不跨生命周期）
+    }
+
+    // 清 Boss 身份与体型（loadVariant / despawn 复用）：普通怪物绝不留
+    // Boss 的 72x72 体型、免疫标记或专属模组；纹理尺寸回 48x48 基准
+    void clearBossState()
+    {
+        m_isBoss = false;                       // 摘掉 Boss 标记
+        m_bossType = BossType::GoblinKing;      // 身份回默认哨兵
+        m_activeBossAttack = -1;                // 当前招式清空
+        m_bossCooldownLeft[0] = 0.0f;           // 近身招冷却清零
+        m_bossCooldownLeft[1] = 0.0f;           // 远距招冷却清零
+        m_w = kSize;                            // 视觉宽回 48（普通怪基准）
+        m_h = kSize;                            // 视觉高回 48
+        setCollisionBox(kCollisionBoxW, kCollisionBoxH, // 脚盒回 36x30
+                        kCollisionBoxOffsetX, kCollisionBoxOffsetY); // 偏移回 (6,12)
     }
 
     // 清前扑残影（批五A）：寿命清零（render 不再绘制）并复位记录槽位——
@@ -570,9 +631,22 @@ private:
         ++m_lungeGhostNext;               // 槽位推进（下一重写下一个）
     }
 
-    // 攻击状态机单步推进（蓄力后倾 -> 前扑前冲 -> 结算）：仅 update 内调用。
-    // 位移走 applyAttackMotion（墙 + 玩家盒的滑动），不参与卡死检测/侧滑
+    // 攻击状态机单步推进（蓄力后倾 -> 前扑/冲锋/砸地/冰环 -> 结算）：仅
+    // update 内调用。位移走 applyAttackMotion（墙 + 玩家盒的滑动），
+    // 不参与卡死检测/侧滑
     void advanceAttack(float dt);
+
+    // Boss 双招冷却推进（仅 Boss 分支调用）：两招各自独立倒计时
+    void updateBossCooldowns(float dt);
+
+    // Boss 出招：记录招式下标 -> 复用 beginWindup（方向锁定/脉冲/日志）
+    void beginBossWindup(int attackIndex);
+
+    // 当前目标中心与自身中心的距离（像素；无目标返回极大值——不触发攻击）
+    float distanceToTarget() const;
+
+    // 出招结算后的冷却落账：普通怪写单一冷却；Boss 写本招独立冷却
+    void applyCooldownAfterAttack();
 
     // slideMoveEx 回调（静态成员满足 C 函数指针签名；context 传 this）：
     // 候选矩形与玩家盒重叠即不可推进——「怪物移动含玩家盒」的实现

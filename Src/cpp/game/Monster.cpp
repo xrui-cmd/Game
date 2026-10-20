@@ -1,4 +1,4 @@
-#include "game/Monster.h"
+﻿#include "game/Monster.h"
 #include "game/MonsterLevel.h" // scaledMonsterHp / monsterCoinDrop：等级数值缩放（批六丙纯逻辑）
 #include "game/Zone.h"      // ZoneId / zoneAtWorld：生成分表按出生点所在区选变体（批六丁）
 #include "game/World.h"     // World：移动的分轴碰撞滑动（slideMove）与落点可走查询
@@ -67,6 +67,17 @@ int variantIndex(MonsterType type)
     // 枚举值直接作为下标使用；越界（未来加枚举忘加表项）夹到最后一项，
     // 宁可外观/数值不符也绝不越界读表
     return std::clamp(static_cast<int>(type), 0, static_cast<int>(MonsterType::Count) - 1);
+}
+
+// Boss 外发光/描边颜色（M3·乙；纯代码绘制，不新增素材）：
+// 哥布林王 = 金色（威严/财富），霜爵 = 冰蓝（冰霜主题）
+SDL_Color bossGlowColor(BossType type)
+{
+    if (type == BossType::FrostDuke) // 霜爵：冰蓝
+    {
+        return SDL_Color{ 150, 225, 255, 255 }; // 冰蓝描边
+    }
+    return SDL_Color{ 255, 210, 90, 255 }; // 哥布林王：金色描边
 }
 
 // 前扑「快出慢收」缓出映射（批五A）：把归一化进度 p ∈ [0,1] 映射成
@@ -146,6 +157,10 @@ bool Monster::loadVariant(SDL_Renderer* renderer, MonsterType type)
     // 记录变体类型：baseSpeed()/spawnAt 的出生生命都从它查表
     m_type = type;
 
+    // 换普通变体前先摘掉 Boss 态（M3·乙）：池槽位可能刚死过 Boss——
+    // 体型/碰撞盒/免疫标记/专属冷却全部复位，普通怪绝不继承 72x72
+    clearBossState();
+
     // 取出本变体的规格（路径、帧参数外的数值、回退色）
     const VariantSpec& spec = kVariants[variantIndex(type)];
 
@@ -163,10 +178,46 @@ bool Monster::loadVariant(SDL_Renderer* renderer, MonsterType type)
                                    spec.fallback);     // 回退颜色：变体主色系方块
 }
 
+// 按 Boss 身份加载外观（M3·乙）：外观复用同区基础变体——
+// 哥布林王 = 哥布林、霜爵 = 霜哥布林；随后应用 x1.5 体型与 Boss 标记。
+// 顺序不可颠倒：loadVariant 会清 Boss 态（池复用语义），setBoss 必须在后
+bool Monster::loadBoss(SDL_Renderer* renderer, BossType type)
+{
+    const MonsterType appearance = (type == BossType::FrostDuke) // 霜爵复用霜哥布林
+        ? MonsterType::FrostGoblin                              // 雪山外观
+        : MonsterType::Goblin;                                  // 哥布林王复用哥布林
+    const bool loaded = loadVariant(renderer, appearance); // 先换皮（内部清 Boss 态）
+    setBoss(type);                                         // 再套 Boss 身份/体型/碰撞盒
+    return loaded;                                         // 纹理失败仍返回 false（玩法照常）
+}
+
+// 设置 Boss 身份与体型（M3·乙）：视觉 72x72、脚盒 54x45（全部 x1.5）。
+// 所有尺寸/偏移来自 Boss.h 常量，实体层不重复写死数字
+void Monster::setBoss(BossType type)
+{
+    m_isBoss = true;              // Boss 总开关：奖励/免疫/回收豁免/顶部血条都读它
+    m_bossType = type;            // 身份（双区选型的最终结果）
+    m_activeBossAttack = -1;      // 尚未选招
+    m_w = kBossVisualSize;        // 视觉宽 72（48 x 1.5）
+    m_h = kBossVisualSize;        // 视觉高 72
+    setCollisionBox(kBossCollisionWidth, kBossCollisionHeight, // 脚盒 54x45（同步 x1.5）
+                    kBossCollisionOffsetX, kBossCollisionOffsetY); // 偏移 (9,18)
+}
+
+// 展示名：Boss 用身份名；普通怪用变体名（日志/顶部血条的统一入口）
+const char* Monster::name() const
+{
+    return m_isBoss ? bossTypeName(m_bossType) : monsterTypeName(m_type); // 二选一
+}
+
 // 本变体的基础追击速度（像素/秒）：难度成长在其上叠加（由场景完成）
 float Monster::baseSpeed() const
 {
-    // 查表返回基础速度；越界情形由 variantIndex 夹取保护
+    if (m_isBoss) // Boss：变体基础 x0.9（99），略降且不叠难度成长
+    {
+        return bossBaseSpeed(m_bossType); // Boss 专属基础速度（纯函数）
+    }
+    // 普通怪：查表返回基础速度；越界情形由 variantIndex 夹取保护
     return kVariants[variantIndex(m_type)].baseSpeed;
 }
 
@@ -194,6 +245,18 @@ void Monster::setTarget(const SDL_FRect& targetRect)
 // 施放覆盖（后施放为准——与「连续受击全部状态重新计时」同款口径）
 void Monster::applySlow(float factor, float seconds)
 {
+    // Boss 免疫减速与冻结（M3·乙规格）：减速入口直接拒绝并打日志——
+    // 冰霜新星等控制技能对 Boss 只结算伤害，不产生速度乘区。
+    // 冻结在本项目当前只作用于玩家；同一免疫规则由 Boss.h 的
+    // bossImmuneToElement 覆盖（未来怪物冻结入口复用该判据）
+    if (m_isBoss && bossImmuneToElement(AttackElement::Slow))
+    {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Boss 免疫冻结与减速（%s，忽略速度乘区 x%.2f/%.1f 秒）",
+                    name(), factor, seconds); // 冒烟观测点：免疫日志
+        return; // 不写入任何减速状态
+    }
+
     // 非正时长（调用方错误/0 秒）：忽略并警告——不产生任何状态
     if (seconds <= 0.0f)
     {
@@ -264,7 +327,11 @@ void Monster::spawnAt(float centerX, float centerY, int level)
     // 当前变体，再乘等级系数（生命 x(1+10%/级)，见 MonsterLevel.h）
     const VariantSpec& spec = kVariants[variantIndex(m_type)]; // 本变体规格
     m_alive = true;                     // 本对象进入战场：更新/渲染/碰撞自此生效
-    m_maxHp = scaledMonsterHp(spec.hp, m_level); // 生命上限（等级 1 = 基础值）
+    // 生命上限：普通怪 = 变体基础 x 等级缩放；Boss = 变体基础 x8 x 等级缩放
+    //（M3·乙：草地 Lv20 = 696 / 雪山 Lv30 = 936——公式与值见 Boss.h）
+    m_maxHp = m_isBoss
+        ? bossMaxHp(m_bossType, m_level)             // Boss：x8 后再走等级缩放
+        : scaledMonsterHp(spec.hp, m_level);         // 普通怪：既有公式
     m_hp = m_maxHp;                     // 出生满血（0 血出生会在首帧判定为已死）
     m_hitTintLeft = 0.0f;               // 新生怪物不带受击红染
     m_hasTarget = false;                // 玩家目标等场景下个固定步注入
@@ -410,9 +477,58 @@ void Monster::beginWindup()
     m_attackPulseLeft = kAttackPulseSeconds;     // 出招瞬间染色脉冲（0.1s）
     m_landingFxLeft = 0.0f;                      // 新动作不带上一轮的落地冰环
 
-    // 冒烟观测点：出招日志（追加模组名——六型攻击的区分依据）
-    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "怪物出招（%s：%s）",
-                monsterTypeName(m_type), module.name);
+    // 冒烟观测点：出招日志（Boss 用「Boss 出招」，普通怪沿用「怪物出招」）
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                m_isBoss ? "Boss 出招（%s：%s）" : "怪物出招（%s：%s）",
+                name(), module.name); // 名称 + 模组名（Boss 专属招式的区分依据）
+}
+
+// Boss 双招冷却推进（M3·乙）：两招各自独立倒计时，固定步递减、暂停冻结
+void Monster::updateBossCooldowns(float dt)
+{
+    for (float& cooldown : m_bossCooldownLeft) // 逐招递减
+    {
+        if (cooldown > 0.0f) // 仅冷却中才推进
+        {
+            cooldown = std::max(cooldown - dt, 0.0f); // 递减并夹到 0
+        }
+    }
+}
+
+// Boss 出招（M3·乙）：记录招式下标后再走通用 beginWindup——方向锁定、
+// 蓄力计时、染色脉冲与日志全部复用；攻击模组由 attackModule() 动态取
+void Monster::beginBossWindup(int attackIndex)
+{
+    m_activeBossAttack = std::clamp(attackIndex, 0, kBossAttackCount - 1); // 招式下标夹取
+    beginWindup(); // 通用出招：模组来自当前 Boss 招式
+}
+
+// 当前目标中心与自身中心的距离（像素）：Boss 距离驱动选招的依据。
+// 无目标返回极大值（不触发任何攻击；AI 正常流程每步都会注入目标）
+float Monster::distanceToTarget() const
+{
+    if (!m_hasTarget) // 目标未注入（防御）
+    {
+        return 1.0e9f; // 极大值：任何距离档都不触发
+    }
+    const float centerX = m_x + m_w * 0.5f; // 自身中心 x
+    const float centerY = m_y + m_h * 0.5f; // 自身中心 y
+    const float dx = m_targetX - centerX;   // 指向目标的横向差
+    const float dy = m_targetY - centerY;   // 纵向差
+    return std::sqrt(dx * dx + dy * dy);    // 欧氏距离
+}
+
+// 出招结算后的冷却落账：普通怪写单一冷却；Boss 写本招独立冷却。
+// 统一入口保证「四型普通攻击 + 四招 Boss 攻击」的冷却语义不遗漏
+void Monster::applyCooldownAfterAttack()
+{
+    if (m_isBoss && m_activeBossAttack >= 0) // Boss：写当前招式的独立冷却
+    {
+        m_bossCooldownLeft[m_activeBossAttack] =
+            bossAttackCooldown(m_bossType, m_activeBossAttack); // 表驱动冷却
+        return; // Boss 不使用普通怪单冷却
+    }
+    m_attackCooldownLeft = m_attackCooldown; // 普通怪：既有单一冷却
 }
 
 // 玩家是否处于接触范围（双方碰撞盒触接 + 小余量）：出招与命中共用判据
@@ -496,7 +612,9 @@ void Monster::drawBody(SDL_Renderer* renderer, float alpha, const Camera& camera
     const int frameIndex = (m_frameTime > 0.0f) // 帧时长有效才换算帧号
         ? static_cast<int>(m_animTime / m_frameTime) % std::max(m_frameCount, 1) // 循环帧号
         : 0; // 异常帧时长（防御）：停在首帧
-    const SDL_FRect src{ static_cast<float>(frameIndex) * m_w, 0.0f, m_w, m_h }; // 精灵表当前帧
+    // 源帧尺寸固定为变体帧 48x48（Boss 的 m_w/m_h 已是 72——素材本身不变，
+    // 只放大绘制目标，因此源矩形必须用 kSize 而不是 m_w/m_h）
+    const SDL_FRect src{ static_cast<float>(frameIndex) * kSize, 0.0f, kSize, kSize }; // 精灵表当前帧
     SDL_RenderTexture(renderer, m_texture, &src, &dst); // 绘制本体（单帧裁切）
 }
 
@@ -512,7 +630,8 @@ void Monster::advanceAttack(float dt)
         // 蓄力：移速归零（常规移动已被本状态接管）。
         // 前扑/突刺沿出招反方向后倾（真实位移，经碰撞滑动；总位移 8px）；
         // 跳跃砸击改为「原地深蹲」——位移为零，视觉压扁在 render 侧完成。
-        if (m_attackKind == AttackKind::Lunge || m_attackKind == AttackKind::Thrust)
+        if (m_attackKind == AttackKind::Lunge || m_attackKind == AttackKind::Thrust ||
+            m_attackKind == AttackKind::Charge)
         {
             const float leanSpeed = kAttackLeanDistance / module.windupSeconds; // 后倾速度（px/s）
             applyAttackMotion(-m_attackDirX * leanSpeed * dt,  // 反向 x 位移
@@ -525,7 +644,10 @@ void Monster::advanceAttack(float dt)
             m_attackPhase = AttackPhase::Strike;      // 蓄力结束 -> 攻击位移
             m_attackPhaseLeft = module.duration;      // 位移时长（模组数据）
             m_strikeMoved = 0.0f;                     // 位移进度归零（曲线分配起点）
-            recordLungeGhost();                       // 第 1 重残影：出招起点站位
+            if (m_attackKind != AttackKind::Slam && m_attackKind != AttackKind::Ring)
+            {
+                recordLungeGhost(); // 第 1 重残影：出招起点站位（砸地/冰环原地不动，不留影）
+            }
         }
         return; // 本步只走蓄力阶段
     }
@@ -557,9 +679,31 @@ void Monster::advanceAttack(float dt)
         m_strikeMoved = targetMoved;
 
         // 第 2 重残影：进度过半时记录在当前位置（位移路径的自然采样点）
-        if (progress >= kLungeGhostSample)
+        if (progress >= kLungeGhostSample &&
+            m_attackKind != AttackKind::Slam && m_attackKind != AttackKind::Ring)
         {
-            recordLungeGhost(); // 内部自带录满检查：两重后为无操作
+            recordLungeGhost(); // 内部自带录满检查：两重后为无操作（砸地/冰环不留影）
+        }
+
+        // ---- 重砸 / 冰环（M3·乙 Boss）：原地蓄力结束后结算圆形 AoE ----
+        // 两者都不产生位移；结算时以自身中心为圆心、模组 hitRadius 为半径，
+        // 与玩家碰撞盒最近点比较（360° 全向，冰环还会亮一圈冰环视觉）
+        if (m_attackKind == AttackKind::Slam || m_attackKind == AttackKind::Ring)
+        {
+            if (m_attackPhaseLeft <= 0.0f) // 蓄力后的短促打击窗口结束：结算
+            {
+                if (m_attackKind == AttackKind::Ring) // 冰环：复用冰霜新星贴图
+                {
+                    m_landingFxLeft = kLandingFxSeconds; // 冰环视觉计时置满
+                }
+                m_attackResult = playerInHitRadius(module.hitRadius) // 圆形范围判定
+                    ? MonsterAttackResult::Hit   // 范围内：命中
+                    : MonsterAttackResult::Miss; // 范围外：落空
+                m_attackPhase = AttackPhase::Recovery;      // 原地收势
+                m_attackPhaseLeft = kAttackRecoverySeconds; // 收势窗口（0.2s）
+                applyCooldownAfterAttack();                 // 本招独立冷却落账
+            }
+            return; // 本步只走砸地/冰环阶段
         }
 
         if (m_attackKind == AttackKind::JumpSmash)
@@ -578,14 +722,14 @@ void Monster::advanceAttack(float dt)
                     : MonsterAttackResult::Miss; // 范围外：落空
                 m_attackPhase = AttackPhase::Recovery;      // 落地后固定收势
                 m_attackPhaseLeft = kAttackRecoverySeconds; // 收势窗口（0.2s）
-                m_attackCooldownLeft = m_attackCooldown;    // 出招后进入冷却
+                applyCooldownAfterAttack();                 // 出招后进入冷却（跳跃落地）
             }
             return; // 本步只走跳跃位移
         }
 
-        if (m_attackKind == AttackKind::Thrust)
+        if (m_attackKind == AttackKind::Thrust || m_attackKind == AttackKind::Charge)
         {
-            // 突刺冲锋：撞墙/命中即止 -> 收势。
+            // 突刺/冲锋：撞墙/命中即止 -> 收势（M3·乙 Boss 冲锋复用同一执行器）。
             // 命中优先于撞墙（贴着玩家时 applyAttackMotion 被玩家盒截停，
             // 实际位移也会变小；此时应结算 Hit 而不是 Miss）。
             const bool hitNow = playerInContactRange(); // 本步是否已撞上玩家
@@ -594,11 +738,11 @@ void Monster::advanceAttack(float dt)
             if (hitNow || wallStopped || m_attackPhaseLeft <= 0.0f)
             {
                 m_attackResult = hitNow
-                    ? MonsterAttackResult::Hit   // 命中：立即止步
+                    ? MonsterAttackResult::Hit   // 命中：立即止步（冲锋撞上玩家）
                     : MonsterAttackResult::Miss; // 撞墙/走完未命中：落空
                 m_attackPhase = AttackPhase::Recovery;      // 收势（撞墙/命中即止）
                 m_attackPhaseLeft = kAttackRecoverySeconds; // 收势窗口（0.2s）
-                m_attackCooldownLeft = m_attackCooldown;    // 出招后进入冷却
+                applyCooldownAfterAttack();                 // 出招后进入冷却（突刺/冲锋止步）
             }
             return; // 本步只走突刺位移
         }
@@ -618,7 +762,7 @@ void Monster::advanceAttack(float dt)
                 m_attackPhase = AttackPhase::Recovery;       // 扑空惩罚：原地收势
                 m_attackPhaseLeft = kAttackRecoverySeconds;  // 收势窗口（0.2s）
             }
-            m_attackCooldownLeft = m_attackCooldown; // 出招后进入冷却（无论 Hit/Miss）
+            applyCooldownAfterAttack(); // 出招后进入冷却（无论 Hit/Miss）
         }
         return; // 本步只走前扑阶段
     }
@@ -765,9 +909,65 @@ void Monster::update(const UpdateContext& ctx)
         m_landingFxLeft = std::max(m_landingFxLeft - ctx.deltaTime, 0.0f); // 夹到 0
     }
 
-    // 怪物中心（世界坐标）：AI 判定的自身位置基准
+    // 怪物中心（世界坐标）：AI 判定与 Boss 追击的自身位置基准
     const float centerX = m_x + m_w * 0.5f; // 中心 x
     const float centerY = m_y + m_h * 0.5f; // 中心 y
+
+    // ============================================================
+    // Boss 专属分支（M3·乙）：不适用巡逻/回巢/栓绳，持续追击玩家
+    // ============================================================
+    // 与普通怪的差异全部收敛在这里：
+    //   1. 不走 MonsterAi 状态机（没有 Patrol/Return，永不回巢、不被回收）；
+    //   2. 两招独立冷却 + 距离驱动选招（近身 / 远距）；
+    //   3. 出招期间停步（通用攻击状态机），平时以场景注入的固定速度追击；
+    //   4. Boss 免疫减速（applySlow 已拒绝），速度不再乘 speedFactor。
+    if (m_isBoss)
+    {
+        updateBossCooldowns(ctx.deltaTime); // 两招冷却各自递减
+
+        // 平时（非出招）：距离 + 冷却决定本步是否出招；射程外继续追
+        if (m_attackPhase == AttackPhase::None)
+        {
+            const int attackIndex = bossSelectAttack(
+                m_bossType,                    // Boss 身份（两招表）
+                distanceToTarget(),            // 与目标中心距离（像素）
+                m_bossCooldownLeft[0] <= 0.0f, // 近身招就绪
+                m_bossCooldownLeft[1] <= 0.0f); // 远距招就绪
+            if (attackIndex >= 0) // 本步有可出的招
+            {
+                beginBossWindup(attackIndex); // 记录招式 -> 通用蓄力
+            }
+        }
+
+        // 出招中：推进蓄力/位移/结算，本步不移动
+        if (m_attackPhase != AttackPhase::None)
+        {
+            advanceAttack(ctx.deltaTime); // 重砸/冲锋/冰环/重击共用状态机
+            return;                       // 本步不再执行常规追击
+        }
+
+        // 无目标（防御路径）：原地停留，等场景下一步注入
+        if (!m_hasTarget)
+        {
+            return; // 不移动、不出招
+        }
+
+        // 朝玩家中心持续追击（无栓绳、无回巢；跨区也一直追）
+        const float dx = m_targetX - centerX; // 指向玩家的横向差
+        const float dy = m_targetY - centerY; // 纵向差
+        const float distance = std::sqrt(dx * dx + dy * dy); // 欧氏距离
+        if (distance <= kArriveEpsilon) // 已贴上目标：无需移动
+        {
+            return; // 等攻击冷却/距离判定
+        }
+
+        // Boss 速度：场景注入固定值（99）；未注入时退回 baseSpeed（防御）
+        const float bossSpeed = (m_chaseSpeed > 0.0f) ? m_chaseSpeed : baseSpeed(); // 像素/秒
+        const float stepDX = (dx / distance) * bossSpeed * ctx.deltaTime; // 水平位移
+        const float stepDY = (dy / distance) * bossSpeed * ctx.deltaTime; // 垂直位移
+        moveWithCollision(stepDX, stepDY, ctx.deltaTime); // 墙体滑动 + 玩家盒实心
+        return; // Boss 分支结束（不进入普通怪 AI）
+    }
 
     // ---- AI 状态决策（纯逻辑）：巡逻/仇恨/栓绳回巢/到巢 ----
     // 玩家位置 = 场景每步注入的追踪目标（m_hasTarget=false 时 AI 视为
@@ -780,12 +980,12 @@ void Monster::update(const UpdateContext& ctx)
     if (ai.enteredChase)
     {
         // 冒烟观测点：进入仇恨（自动化测试据此断言「靠近才追」）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入仇恨（%s）", monsterTypeName(m_type));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "进入仇恨（%s）", name());
     }
     if (ai.enteredReturn)
     {
         // 冒烟观测点：触发栓绳回巢（自动化测试据此断言「拉怪过线即返」）
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "触发栓绳回巢（%s）", monsterTypeName(m_type));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "触发栓绳回巢（%s）", name());
     }
     if (ai.returnedHome)
     {
@@ -793,13 +993,13 @@ void Monster::update(const UpdateContext& ctx)
         // 再打「回到巢穴」日志；真回血了补一条「回巢回血」明细日志
         const int hpBefore = m_hp; // 回血前生命（对比日志用）
         m_hp = MonsterAi::healedHpAfterReturn(m_hp, m_maxHp, m_ai.returnHealPercent());
-        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "回到巢穴（%s）", monsterTypeName(m_type));
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "回到巢穴（%s）", name());
         if (m_hp > hpBefore)
         {
             // 冒烟观测点：回血明细（monster_return_heal_percent>0 时的验证点）
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                         "回巢回血（%s：%d -> %d / %d）",
-                        monsterTypeName(m_type), hpBefore, m_hp, m_maxHp);
+                        name(), hpBefore, m_hp, m_maxHp);
         }
     }
 
@@ -959,8 +1159,11 @@ void Monster::moveWithCollision(float stepDX, float stepDY, float dt)
 
     // 盒落点 -> 精灵左上角语义（侧滑候选与主结果的比较/赋值都按精灵位置）；
     // 盒到精灵的换算 = 减偏移，与 collisionRectAt 的加偏移互为逆运算
-    const SDL_FPoint moved{ movedBox.x - kCollisionBoxOffsetX, // 精灵左上角逐点 x
-                            movedBox.y - kCollisionBoxOffsetY }; // 精灵左上角 y
+    // 盒落点 -> 精灵左上角：偏移必须用「当前碰撞盒」的实际偏移
+    //（M3·乙：Boss 脚盒偏移是 6x1.5=9 / 12x1.5=18，用基础常量 6/12 会
+    //  每步凭空多出 +3/+6 的漂移——实体移动的唯一换算入口必须同源）
+    const SDL_FPoint moved{ movedBox.x - m_collisionOffsetX, // 精灵左上角逐点 x
+                            movedBox.y - m_collisionOffsetY }; // 精灵左上角 y
 
     // 期望/实际位移的平方（比较用平方，省一次开方）
     const float expectedSq = useDX * useDX + useDY * useDY;      // 期望位移平方
@@ -1043,15 +1246,15 @@ void Monster::sideSlideCandidates(float stepDX, float stepDY,
                                                      -stepDY, stepDX,
                                                      &Monster::playerBlockerCallback,
                                                      const_cast<Monster*>(this));
-    rightPoint = SDL_FPoint{ rightBox.x - kCollisionBoxOffsetX, // 精灵系候选 x
-                             rightBox.y - kCollisionBoxOffsetY }; // 精灵系候选 y
+    rightPoint = SDL_FPoint{ rightBox.x - m_collisionOffsetX, // 精灵系候选 x（当前盒偏移）
+                             rightBox.y - m_collisionOffsetY }; // 精灵系候选 y
     // 左侧滑（逆时针 90°）：(dx, dy) -> (dy, -dx)；同样折算回精灵系
     const SDL_FPoint leftBox = m_world->slideMoveEx(col.x, col.y, col.w, col.h,
                                                     stepDY, -stepDX,
                                                     &Monster::playerBlockerCallback,
                                                     const_cast<Monster*>(this));
-    leftPoint = SDL_FPoint{ leftBox.x - kCollisionBoxOffsetX, // 精灵系候选 x
-                            leftBox.y - kCollisionBoxOffsetY }; // 精灵系候选 y
+    leftPoint = SDL_FPoint{ leftBox.x - m_collisionOffsetX, // 精灵系候选 x（当前盒偏移）
+                            leftBox.y - m_collisionOffsetY }; // 精灵系候选 y
 
     // 各自的实际位移平方：评判「哪一侧更能动」的度量
     const float rightDX = rightPoint.x - m_x; // 右滑实际水平位移
@@ -1137,7 +1340,8 @@ void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) 
     // 跳跃姿态参数：深蹲压扁只在蓄力阶段，弧线偏移只在位移阶段
     float drawScaleX = 1.0f; // 本体绘制宽缩放（普通状态 = 1）
     float drawScaleY = 1.0f; // 本体绘制高缩放（普通状态 = 1）
-    if (m_attackPhase == AttackPhase::Windup && m_attackKind == AttackKind::JumpSmash)
+    if (m_attackPhase == AttackPhase::Windup &&
+        (m_attackKind == AttackKind::JumpSmash || m_attackKind == AttackKind::Slam))
     {
         const float windup = attackModule().windupSeconds; // 深蹲总时长（模组）
         const float progress = (windup > 0.0f) // 进度（防御除零）
@@ -1167,8 +1371,8 @@ void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) 
                 continue; // 跳过
             }
             const Vec2 screen = camera.worldToScreen(ghost.x, ghost.y); // 记录点 -> 屏幕
-            const SDL_FRect dst{ screen.x, screen.y, m_w, m_h }; // 整帧矩形（同尺寸）
-            const SDL_FRect src{ 0.0f, 0.0f, m_w, m_h };         // 精灵表第 0 帧
+            const SDL_FRect dst{ screen.x, screen.y, m_w, m_h }; // 整帧矩形（Boss 为放大后的 72x72）
+            const SDL_FRect src{ 0.0f, 0.0f, kSize, kSize };     // 源帧固定 48x48（素材帧尺寸）
             const float ratio = ghost.left / kLungeGhostLifeSeconds; // 剩余寿命比例 [0,1]
             SDL_SetTextureAlphaMod(m_texture, // 渐隐：按剩余寿命调透明度
                                    static_cast<Uint8>(kLungeGhostStartAlpha * ratio)); // 0~115
@@ -1244,7 +1448,33 @@ void Monster::render(SDL_Renderer* renderer, float alpha, const Camera& camera) 
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
     }
 
-    // 本体绘制：跳跃蓄力压扁、跳跃位移叠加弧线；其余状态与基类同款
+    // ---- Boss 外发光/描边（M3·乙；纯 SDL 绘制，不新增素材）----
+    // 在本体之下画 3 层渐隐外框（8/5/2px）+ 一圈亮色描边：
+    // 金色 = 哥布林王、冰蓝 = 霜爵；与受击红染/出招脉冲互不干扰
+    if (m_isBoss)
+    {
+        const float interpX = m_prevX + (m_x - m_prevX) * alpha; // 插值左上角 x
+        const float interpY = m_prevY + (m_y - m_prevY) * alpha; // 插值左上角 y
+        const Vec2 screen = camera.worldToScreen(interpX, interpY); // 世界 -> 屏幕
+        const SDL_Color glow = bossGlowColor(m_bossType);          // 身份色（金/冰蓝）
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND); // 半透明外发光
+        for (int layer = 3; layer >= 1; --layer) // 三层：8px -> 5px -> 2px
+        {
+            const float expand = static_cast<float>(layer) * 3.0f; // 本层外扩像素
+            SDL_SetRenderDrawColor(renderer, glow.r, glow.g, glow.b, // 身份色
+                                   static_cast<Uint8>(28 + layer * 12)); // 越外越淡
+            const SDL_FRect aura{ screen.x - expand, screen.y - expand, // 外扩矩形左上角
+                                  m_w + expand * 2.0f, m_h + expand * 2.0f }; // 外扩宽高
+            SDL_RenderRect(renderer, &aura); // 空心矩形：描边/发光层
+        }
+        SDL_SetRenderDrawColor(renderer, glow.r, glow.g, glow.b, 235); // 最内层亮描边
+        const SDL_FRect outline{ screen.x - 2.0f, screen.y - 2.0f, // 本体外扩 2px
+                                 m_w + 4.0f, m_h + 4.0f }; // 与 72x72 本体同尺寸外框
+        SDL_RenderRect(renderer, &outline); // 亮色描边（Boss 一眼可辨）
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
+    }
+
+    // 本体绘制：跳跃/重砸蓄力压扁、跳跃位移叠加弧线；其余状态与基类同款
     drawBody(renderer, alpha, camera, jumpOffsetY, drawScaleX, drawScaleY);
 
     // 出招染色脉冲：出招瞬间 0.1s 内再画一遍偏红加色（与红染同一套 ADD 技法）
