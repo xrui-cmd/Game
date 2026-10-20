@@ -870,3 +870,39 @@ set_target_properties(boss_test PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
 )
+
+# ============================================================
+#  角色闪避（冲刺）纯逻辑单元测试（dodge_test，M3·丙）
+#
+#  被测对象：Src/inc/game/Dodge.h（header-only）——
+#    最终参数（0.18s / 120px / 1.2s 冷却）、二次缓出位移曲线与不同
+#    固定步长下的总距离、方向选择（WASD 优先 / 鼠标 / 朝向兜底）、
+#    禁触发条件（非 Playing/冻结/冲刺中/冷却）与优先级。
+#
+#  与 xp_test / attack_element_test 同模式：纯头文件逻辑，不依赖 SDL3、
+#  无 .cpp、无链接——任何环境都能确定性构建运行。
+#
+#  构建运行命令（与其余测试同一工程）：
+#      cmake -S tests -B tests/build
+#      cmake --build tests/build --config Debug
+#      tests\bin\dodge_test.exe
+# ============================================================
+
+add_executable(dodge_test dodge_test.cpp)
+
+if (MSVC)
+    target_compile_options(dodge_test PRIVATE /utf-8)
+endif()
+
+# 头文件搜索路径：Dodge.h 位于游戏仓 Src/inc
+target_include_directories(dodge_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Src/inc")
+
+# 产物统一输出到 tests\bin\，与其余测试一致
+set_target_properties(dodge_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+)
