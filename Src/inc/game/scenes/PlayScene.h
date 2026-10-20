@@ -9,7 +9,8 @@
 #include "game/AttackArc.h"     // AttackArc：横扫扇形判定（纯函数，tests/attack_arc_test.cpp 直测）
 #include "game/World.h"         // World：世界（确定性生成 + 区块 + 格级碰撞；批二）
 #include "game/Zone.h"          // Zone：世界分区（草地/雪山——区表/查询/移速乘区；批六甲）
-#include "game/Player.h"        // Player：玩家实体（移动 + 主动攻击 + 武器横扫表现）
+#include "game/Player.h"        // Player：玩家实体（移动 + 主动攻击 + 武器横扫表现 + 闪避冲刺）
+#include "game/Dodge.h"         // DodgeRules：闪避方向选择/禁触发判定/震屏日志口径（M3·丙）
 #include "game/Monster.h"       // Monster：追击怪物（三变体、对象池、批三 AI 生态）
 #include "game/MonsterRecycle.h" // MonsterRecycle：远处休眠怪回收判据（批六补丁，纯逻辑）
 #include "game/XpGem.h"         // XpGem：怪物掉落的经验宝石
@@ -108,6 +109,14 @@
 //        42px、历时 0.18s；经碰撞滑动不穿墙；期间 WASD 输入被抑制）+
 //        红染 0.3s（ADD 红光叠加）；0.8s 无敌保留但静默（防连续扣血——
 //        旧版无敌闪烁已移除，渲染不再有任何跳隐）；
+//      - 角色闪避（M3·丙）：Playing 按 bind_dodge（默认 SPACE）边缘触发；
+//        方向 = WASD 合成（有输入，归一化）否则玩家中心 -> 鼠标（退化时
+//        沿用朝向）；0.18s / 120px 二次缓出（快起慢收），走同一套墙体
+//        滑动（撞墙该轴即停、不穿透，可贴墙滑）；冲刺期无敌——怪物
+//        攻击伤害/元素累积全部跳过，冲刺进水域照常触发落水；冷却 1.2s
+//        从触发那一步起算（R 重开/复活清零）；冻结中禁止且冻结会打断
+//        冲刺；与受击 0.8s 无敌互不叠加（任一成立即免伤，冲刺不重置
+//        受击无敌剩余）；残影 3 重渐隐精灵，触发时 2px/0.08s 微震屏；
 //      - 成长闭环（批四起：宝石自动吸收；M2 起：升级三选一；批五B：
 //        选项改为法术）：
 //        击杀掉落的经验宝石自动飞向玩家（homing：700~900px/s 加速、
@@ -656,6 +665,12 @@ private:
     // 受击的可读反馈由玩家的击退与红染承担（见 Player::applyHitKnockback）
     static constexpr float kPlayerInvincibleSeconds = 0.8f;
 
+    // ---- 闪避触发表现（M3·丙；代码常量）----
+    // 规格「可选 2px 微震屏」：只扰渲染（worldToScreen），鼠标瞄准稳定；
+    // 幅度时长取小值，避免与受击 6px 震屏抢戏
+    static constexpr float kDodgeShakeAmplitude = 2.0f; // 冲刺触发震屏幅度（像素）
+    static constexpr float kDodgeShakeSeconds = 0.08f;  // 冲刺触发震屏时长（秒）
+
     // ---- 落水与死亡复活流（批六乙；代码常量，不进配置）----
     static constexpr float kDrownSplashSeconds = 0.4f; // 水花时长（秒；规格约 0.4）
     static constexpr float kDrownSinkSeconds = 0.5f;   // 下沉/淡出时长（秒；规格约 0.5）
@@ -1023,6 +1038,7 @@ private:
     bool m_pauseHandled = false; // 暂停/恢复动作本帧是否已处理
     bool m_menuHandled = false;  // 回菜单动作本帧是否已处理
     bool m_restartHandled = false; // R 重开动作本帧是否已处理（M3·甲重新启用）
+    bool m_dodgeHandled = false; // 闪避动作本帧是否已处理（M3·丙；按下边缘去重）
 
     // ---- FPS / 帧时间显示 ----
     // 显示内容：左下角 "FPS: 59.9 | 16.7 ms"。数值来自渲染帧间隔的

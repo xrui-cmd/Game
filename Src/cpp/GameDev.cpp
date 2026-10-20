@@ -143,6 +143,11 @@ void GameDev::bindInputActions()
     bindAction("move_left", "bind_move_left", "A", SDL_SCANCODE_A);
     bindAction("move_right", "bind_move_right", "D", SDL_SCANCODE_D);
 
+    // 角色闪避/冲刺（M3·丙；pressed 边缘：仅 Playing 按下瞬间触发一次）。
+    // 默认 SPACE、可在 config 用 bind_dodge 改键；方向/距离/冷却规则见
+    // game/Dodge.h（纯逻辑，tests/dodge_test.cpp 直测）
+    bindAction("dodge", "bind_dodge", "SPACE", SDL_SCANCODE_SPACE);
+
     // 攻击动作（本批「主动攻击改版」回归）：鼠标左键——按住按冷却节奏
     // 连续横扫、单击挥一次。它绑定在鼠标路（bindMouse），不占 bind_* 的
     // 键盘配置；held/pressed 查询与键盘动作同款，玩法侧不需要区分设备

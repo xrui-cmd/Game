@@ -3,6 +3,7 @@
 
 #include "engine/Entity.h"     // Entity：实体基类（空间/纹理/帧动画/翻转公共能力）
 #include "engine/math/Vec2.h"  // Vec2：挥砍方向（单位向量）的类型化返回
+#include "game/Dodge.h"        // DodgeRules：冲刺时长/距离/冷却/方向/禁触发纯逻辑（M3·丙）
 
 // 前置声明：世界（碰撞查询）与相机（渲染换算）在本类中只以指针/引用出现，
 // 完整定义分别由 Player.cpp 的包含获得（减少头依赖）
@@ -75,6 +76,16 @@ class Camera;
 //          （ADD，强度 = kHitTintGreenBlue 可调）；
 //        - 旧版「无敌闪烁（渲染跳隐）」已移除：无敌时长本身保留在
 //          场景层（0.8s，防连续扣血），但渲染不再做任何闪烁
+//   7. 角色闪避（M3·丙·空格冲刺）：PlayScene 在 Playing 状态检测
+//      bind_dodge（默认 SPACE）的按下边缘，按「WASD 合成方向优先、
+//      无输入时玩家中心 -> 鼠标、退化时沿用朝向」选出方向后调用
+//      tryDodge——本类负责门控（冻结/冷却/已冲刺）、固定方向、按
+//      DodgeRules 的二次缓出曲线推进位移（0.18s / 120px，走
+//      World::slideMovePlayer：撞墙该轴即停、可滑动），并在冲刺期间
+//      渲染 3 重渐隐精灵残影。冲刺无敌由场景判定（dodging()），与受击
+//      0.8s 无敌窗口互相独立；冷却从成功触发的那一步起算 1.2s。
+//      冲刺距离不受玩家移速/雪地/减速乘区影响（速度曲线只依赖
+//      DodgeRules 的常量）；冻结会立即打断冲刺（防御路径）。
 // ============================================================
 
 class Player : public Entity
@@ -204,6 +215,34 @@ public:
     // 让调用处（PlayScene::restart / onEnter）读起来更直观
     void reset(float x, float y);
 
+    // ---- 角色闪避入口（M3·丙；PlayScene 在 Playing 检测按下边缘后调用）----
+
+    // 尝试开始冲刺：方向由场景经 DodgeRules::selectDirection 选好（不必
+    // 归一化，内部会再收敛一次）。返回阻塞原因（None = 成功启动）：
+    //   - Frozen：冻结中（Player 自身状态；场景不重复判定）；
+    //   - Dashing：本次冲刺尚未结束；
+    //   - Cooldown：冲刺冷却剩余 > 0。
+    // 场景只负责「是否 Playing」——非 Playing 不会调用本函数。
+    // 成功时：固定方向、清常规速度与击退、置满冷却（1.2s，从本步起算）、
+    // 重置残影轨迹；冲刺期内 update 跳过常规 WASD 位移，改走二次缓出曲线
+    DodgeRules::DodgeStartBlock tryDodge(float dirX, float dirY);
+
+    // 是否处于冲刺中：场景据此跳过怪物攻击伤害与元素累积（冲刺无敌），
+    // 渲染据此绘制残影；冲刺结束的那一步起返回 false
+    bool dodging() const { return m_dodgeActive; }
+
+    // 本次（最近一次）冲刺的实际位移（像素；撞墙滑动/提前结束会小于 120）
+    // 场景在冲刺结束的固定步读取并打日志——冒烟位移证据的数值来源
+    float dodgeDistance() const { return m_dodgeTravelled; }
+
+    // 冲刺冷却剩余（秒；0 = 就绪）：场景日志与冷却提示使用
+    float dodgeCooldownLeft() const { return m_dodgeCooldownLeft; }
+
+    // 立即取消冲刺（冻结打断/防御路径）：只清冲刺状态与残影，不清冷却。
+    // 正常冲刺无敌期内不会吃到冻结；本入口保证异常时序下也不会带着
+    // 冲刺状态被锁定或复活
+    void cancelDodge();
+
     // ---- 受击反馈入口（批五A，PlayScene 在怪物攻击命中时调用）----
 
     // 受击击退 + 红染 + 输入抑制（契约见头文件顶部第 6 条）：
@@ -281,6 +320,12 @@ private:
     // 绘制后恢复混合模式（不污染后续绘制）。只在 m_frozen 时调用
     void renderFreezeOverlay(SDL_Renderer* renderer, float alpha, const Camera& camera) const;
 
+    // 冲刺残影（M3·丙）：在本体之前绘制 3 道历史位置精灵——复用武器残影
+    // 的「近浓远淡」思路（α 0.45/0.28/0.13），颜色略偏青蓝以区分实体。
+    // 只在 m_dodgeActive 时绘制；每道都经相机换算、沿用当前帧/翻转状态，
+    // 绘制后恢复纹理颜色/alpha（防污染本体与后续实体）
+    void renderDodgeGhosts(SDL_Renderer* renderer, const Camera& camera) const;
+
     // 当前速度（像素/秒），逐轴独立渐近：斜向输入时两轴各取自己的目标，
     // 与既有「未归一化直驱」的斜向速度语义保持一致（合速度约 1.41 倍）
     float m_velocityX = 0.0f; // 水平速度：正右负左
@@ -318,6 +363,32 @@ private:
     static constexpr int kTrailCount = 3;                                 // 残影数量（道）
     static constexpr float kTrailLagDegrees[3] = { 8.0f, 16.0f, 24.0f };  // 各道残影相对当前刀锋的角度落后量（度）
     static constexpr float kTrailAlphas[3] = { 0.55f, 0.30f, 0.15f };     // 各道残影的透明度（近 -> 远，越远越淡）
+
+    // ---- 冲刺残影参数（M3·丙；代码常量）----
+    // 3 道历史精灵：位置每隔 kDodgeTrailSampleSeconds 采样一次（0.03s ≈ 4 个
+    // 固定步），α 近浓远淡；颜色偏青蓝，读作「高速位移的残像」
+    static constexpr int kDodgeTrailCount = 3;                          // 残影数量（道）
+    static constexpr float kDodgeTrailSampleSeconds = 0.03f;            // 残影采样间隔（秒）
+    static constexpr float kDodgeTrailAlphas[3] = { 0.45f, 0.28f, 0.13f }; // 各道透明度（近 -> 远）
+
+    // ---- 冲刺运行时（M3·丙；reset/冻结打断清零）----
+    // 位移采用「累计曲线差分」：每步距离 = distanceAtProgress(新进度) -
+    // distanceAtProgress(旧进度)，因此总位移精确等于 120px（无累积误差）
+    struct DodgeTrailPoint
+    {
+        float x = 0.0f;      // 历史位置左上角 x（世界坐标）
+        float y = 0.0f;      // 历史位置左上角 y（世界坐标）
+        bool used = false;   // 该槽位是否已有有效采样（冲刺开始时填充起点）
+    };
+
+    bool m_dodgeActive = false;       // 是否处于冲刺中（无敌/残影/位移门控）
+    float m_dodgeElapsed = 0.0f;      // 冲刺已进行时长（秒；进度 = 它 / 0.18）
+    float m_dodgeCooldownLeft = 0.0f; // 冲刺冷却剩余（秒；>0 不可再冲刺）
+    float m_dodgeDirX = 1.0f;         // 本次冲刺固定方向 x（单位向量；启动时锁定）
+    float m_dodgeDirY = 0.0f;         // 本次冲刺固定方向 y（同上）
+    float m_dodgeTravelled = 0.0f;    // 本次冲刺实际累计位移（像素；撞墙会减少）
+    float m_dodgeTrailTimer = 0.0f;   // 残影采样计时（秒；达到间隔即推进轨迹）
+    DodgeTrailPoint m_dodgeTrail[kDodgeTrailCount]; // 残影轨迹（下标 0 = 最新）
 
     float m_attackCooldown = kDefaultAttackCooldown; // 攻击冷却总时长（秒）：onEnter 时由配置覆盖
     float m_attackCooldownLeft = 0.0f; // 冷却剩余（秒）：>0 时 tryAttack 返回 false

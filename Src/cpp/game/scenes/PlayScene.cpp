@@ -811,6 +811,7 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
     const bool menuPressed = ctx.input != nullptr && ctx.input->pressed("menu");
     const bool shopPressed = ctx.input != nullptr && ctx.input->pressed("shop");
     const bool activatePressed = ctx.input != nullptr && ctx.input->pressed("activate");
+    const bool dodgePressed = ctx.input != nullptr && ctx.input->pressed("dodge"); // 闪避按下边缘（M3·丙）
 
     // ---- 神龛激活（批六乙；仅 Playing + 范围内有未激活神龛时响应）----
     // 提示下标由上一个固定步的玩家位置计算（update 末尾刷新）；按下边缘
@@ -829,6 +830,92 @@ void PlayScene::handleInputEdges(const UpdateContext& ctx)
                     "复活点已激活（%s）", shrineDef(shrineIndex).name);
     }
     m_activateHandled = activatePressed; // 记录本步采样：边沿消失前不再重复处理
+
+    // ---- 闪避冲刺（M3·丙；仅 Playing 状态响应按下边缘）----
+    // 规格 1：暂停/升级面板/商店/落水/复活过场一律不触发（状态判据在
+    // 外层），去重防止同帧多个固定步把一次按下算成多次。方向选择交给
+    // DodgeRules::selectDirection（与单测同一口径）：
+    //   1) WASD 合成方向优先（含斜向，归一化为单位向量）；
+    //   2) 无移动输入 = 玩家中心 -> 鼠标（屏幕坐标经相机换算到世界）；
+    //   3) 鼠标与玩家中心重合 = 沿用当前朝向（挥砍朝向；初始朝右）。
+    // 冻结/已冲刺/冷却由 Player::tryDodge 门控并返回原因——失败也记录
+    // 日志，冒烟据此断言「第二次无效」「冻结中无法冲刺」。
+    if (dodgePressed && !m_dodgeHandled && m_state == PlayState::Playing)
+    {
+        float moveX = 0.0f; // WASD 水平合成输入（正右负左）
+        float moveY = 0.0f; // WASD 垂直合成输入（正下负上）
+        if (ctx.input->held("move_up"))
+        {
+            moveY -= 1.0f; // 上移按住：垂直输入 -1
+        }
+        if (ctx.input->held("move_down"))
+        {
+            moveY += 1.0f; // 下移按住：垂直输入 +1
+        }
+        if (ctx.input->held("move_left"))
+        {
+            moveX -= 1.0f; // 左移按住：水平输入 -1
+        }
+        if (ctx.input->held("move_right"))
+        {
+            moveX += 1.0f; // 右移按住：水平输入 +1
+        }
+
+        // 玩家中心（完整精灵口径，与攻击瞄准一致）：冲刺方向与鼠标向量
+        // 的共同原点；场景负责屏幕 -> 世界的相机换算
+        const SDL_FRect playerRect = m_player.rect();                       // 玩家完整精灵矩形
+        const float playerCenterX = playerRect.x + playerRect.w * 0.5f;     // 玩家中心 x
+        const float playerCenterY = playerRect.y + playerRect.h * 0.5f;     // 玩家中心 y
+        const Vec2 mouseScreen = ctx.input->mousePosition();                // 鼠标屏幕坐标
+        const Vec2 mouseWorld = m_camera.screenToWorld(mouseScreen.x, mouseScreen.y); // 换算到世界
+
+        // 朝向兜底取挥砍方向（玩家初始朝右，鼠标退化时不产生 NaN）
+        const Vec2 facing = m_player.swingDirection();                      // 当前朝向（单位向量）
+        const DodgeRules::DodgeDirection dir = DodgeRules::selectDirection(
+            moveX, moveY,                                                    // 移动输入（优先）
+            mouseWorld.x - playerCenterX, mouseWorld.y - playerCenterY,      // 无输入时的瞄准向量
+            facing.x, facing.y);                                             // 双重退化时的朝向兜底
+
+        const DodgeRules::DodgeStartBlock block = m_player.tryDodge(dir.x, dir.y); // 尝试启动冲刺
+        if (block == DodgeRules::DodgeStartBlock::None)
+        {
+            // 可选微震屏（2px/0.08s）：只扰渲染，鼠标世界坐标不抖（相机契约）
+            m_camera.addShake(kDodgeShakeAmplitude, kDodgeShakeSeconds); // 可选微震屏（只扰渲染）
+            // 冒烟观测点：冲刺开始（方向/起点坐标/时长/冷却/无敌——位移与
+            // 方向断言依据；起点取精灵左上角，与结束日志同一坐标口径）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "闪避冲刺开始（方向 %.2f, %.2f，起点 (%.1f, %.1f)，"
+                        "时长 %.2f 秒，冷却 %.1f 秒，冲刺无敌）",
+                        dir.x, dir.y, playerRect.x, playerRect.y,
+                        DodgeRules::kDurationSeconds, DodgeRules::kCooldownSeconds);
+        }
+        else
+        {
+            // 失败原因映射为中文文案：区分「冷却中 / 冻结中 / 冲刺中」
+            const char* reason = "冲刺中"; // 默认文案（Dashing 分支最常见）
+            if (block == DodgeRules::DodgeStartBlock::Cooldown)
+            {
+                reason = "冷却中"; // 冷却门控
+            }
+            else if (block == DodgeRules::DodgeStartBlock::Frozen)
+            {
+                reason = "冻结中"; // 冻结门控（优先级高于冷却）
+            }
+            else if (block == DodgeRules::DodgeStartBlock::Dashing)
+            {
+                reason = "冲刺中"; // 已处于冲刺中
+            }
+            else if (block == DodgeRules::DodgeStartBlock::NotPlaying)
+            {
+                reason = "非战斗状态"; // 非 Playing（场景不会调用，防御文案）
+            }
+            // 冒烟观测点：未触发（原因 + 冷却剩余——第二次按下/冻结断言依据）
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "闪避未触发（%s，冷却剩余 %.2f 秒）",
+                        reason, m_player.dodgeCooldownLeft());
+        }
+    }
+    m_dodgeHandled = dodgePressed; // 记录本步采样：上升沿去重
 
     // ---- 商店开关（批五B；先于暂停处理：Shop 中 ESC 的语义是「关闭商店」，
     //      须在暂停分支看到它之前先把状态算清楚）----
@@ -1406,6 +1493,7 @@ void PlayScene::applyAttackElement(const Monster& monster)
         if (result.freezeStarted) // 本步刚好满 100：立即冻结
         {
             m_player.setFrozen(true);          // 锁定移动（不可移动）
+            m_player.cancelDodge();            // 冻结打断冲刺（防御：冲刺无敌期正常不会中冻结）
             m_player.cancelSwingVisual();      // 取消挥砍表现（不可攻击）
             m_sweepRunning = false;            // 场景侧扫程终止（不再结算后续刀锋）
             m_sweepHitCount = 0;               // 命中计数清零
@@ -1617,10 +1705,26 @@ void PlayScene::update(const UpdateContext& ctx)
     m_player.setSolidRects(m_monsterSolidBoxes.data(),
                            static_cast<int>(m_monsterSolidBoxes.size()));
 
+    // 冲刺结束观测（M3·丙）：本步之前还在冲刺、update 之后已退出 =
+    // 本步是冲刺的最后一步。此时读取实际累计位移打日志——冒烟「位移
+    // 约 120px / 撞墙滑动后小于 120px」的数值证据来源
+    const bool dodgeWasActive = m_player.dodging(); // 本步之前是否处于冲刺中
+
     // 玩家使用上下文更新：内部按 ctx.input 的移动动作渐近移动（批二起经
     // World::slideMove 的「分轴 + 撞墙滑动」，不再做窗口 clamp）、按注入的
-    // 瞄准点切换朝向翻转，并推进攻击计时
-    m_player.update(ctx);
+    // 瞄准点切换朝向翻转，并推进攻击计时；冲刺期改走 DodgeRules 曲线
+    m_player.update(ctx); // 推进移动/冲刺/攻击计时
+
+    if (dodgeWasActive && !m_player.dodging())
+    {
+        // 冲刺终点（精灵左上角，与开始日志同一口径）：冒烟可用「终点 - 起点」
+        // 复核实际位移，也用于判断是否已到水域/墙边
+        const SDL_FRect endRect = m_player.rect(); // 冲刺结束后的精灵矩形
+        // 冒烟观测点：冲刺结束（实际位移 + 终点坐标——与开始日志配对断言）
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "闪避冲刺结束（实际位移 %.1f px，终点 (%.1f, %.1f)）",
+                    m_player.dodgeDistance(), endRect.x, endRect.y);
+    }
 
     // 玩家矩形只取一次：本步的碰撞检测、怪物追踪与相机跟随共用一个快照
     const SDL_FRect playerRect = m_player.rect();
@@ -1828,8 +1932,11 @@ void PlayScene::update(const UpdateContext& ctx)
         {
             // 玩家无敌期内：本次打击无效（无伤害/无日志/无击退/无特效/无
             // 回弹）——「受击保护窗口」的语义由「跳过结算」表达（怪物照常
-            // 进冷却）。批五A：静默保护——跳过即完全无反馈，不再有闪烁
-            if (m_playerInvincibleLeft <= 0.0f)
+            // 进冷却）。批五A：静默保护——跳过即完全无反馈，不再有闪烁。
+            // M3·丙：冲刺无敌是第二个独立判据——与受击 0.8s 无敌并列，
+            // 任一成立即跳过整个命中结算（伤害/护盾/元素累积/击退/特效）；
+            // 冲刺不会重置受击无敌剩余，两者互不覆盖、互不延长
+            if (m_playerInvincibleLeft <= 0.0f && !m_player.dodging())
             {
                 // 1) 先盾后血（批五B）：护盾点数先抵扣本次伤害，余量才进入
                 //    扣血；有吸收即打「护盾吸收」日志（冒烟断言点——先盾后血
@@ -1926,6 +2033,13 @@ void PlayScene::update(const UpdateContext& ctx)
                 {
                     break;
                 }
+            }
+            else if (m_player.dodging()) // 冲刺无敌：攻击命中但整个结算被跳过
+            {
+                // 冒烟观测点：冲刺穿过攻击（无扣血/无元素/无击退/无特效）——
+                // 与「怪物攻击命中」日志互斥出现，供无敌断言
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "闪避无敌：跳过 %s 的攻击伤害与元素结算", monster.name());
             }
         }
     }
@@ -2116,6 +2230,7 @@ void PlayScene::enterDrowning()
     m_playerInvincibleLeft = kDrownSplashSeconds + kDrownSinkSeconds;
 
     m_player.cancelSwingVisual();        // 取消挥砍表现（冻结后不会残留武器）
+    m_player.cancelDodge();              // 冲刺进水域：结束冲刺状态（落水过场接管）
     m_player.setDrownVisual(0.0f, 1.0f); // 下沉/淡出从未开始状态起算
     m_player.snapshotPreviousPosition(); // 插值快照对齐：水面位置不拉丝
 
@@ -4121,6 +4236,7 @@ void PlayScene::restart()
     }
     m_shopHandled = false;          // B 动作去重标记复位
     m_activateHandled = false;      // 神龛激活键去重标记复位（批六乙）
+    m_dodgeHandled = false;         // 闪避按下边缘去重标记复位（M3·丙）
 
     // 法术状态复位（批五B）：层数/冷却/护盾/飞行物/全部特效归零——
     // 新一局从零法术、无护盾开始（升级流程重新抽取法术）

@@ -195,6 +195,65 @@ void Player::setAttackArc(float degrees)
     m_sweepArcDegrees = degrees; // 覆盖扫角：其后的渲染与刀锋角计算使用新值
 }
 
+// 开始冲刺（M3·丙）：门控 -> 锁定方向 -> 清常规速度/击退 -> 冷却起算。
+// 返回阻塞原因，场景据此打日志（成功 = None）；纯逻辑判定集中在
+// DodgeRules::dodgeStartBlock（与 tests/dodge_test.cpp 同一口径）
+DodgeRules::DodgeStartBlock Player::tryDodge(float dirX, float dirY)
+{
+    // 冻结/已冲刺/冷却三项门控（Playing 由场景保证，这里按 true 传入）；
+    // 顺序即优先级：冻结 > 冲刺中 > 冷却
+    const DodgeRules::DodgeStartBlock block = DodgeRules::dodgeStartBlock(
+        true, m_frozen, m_dodgeActive, m_dodgeCooldownLeft);
+    if (block != DodgeRules::DodgeStartBlock::None)
+    {
+        return block; // 条件不满足：本次不启动，状态原样保留
+    }
+
+    // 方向最终收敛：传入向量未归一化也安全；零向量时沿用挥砍朝向（向右兜底），
+    // 与场景的 selectDirection 形成第二道防御
+    const DodgeRules::DodgeDirection dir = DodgeRules::normalizeOrFallback(
+        dirX, dirY, m_swingDirX, m_swingDirY);
+    m_dodgeDirX = dir.x; // 锁定本次冲刺方向 x（整个冲刺期不再改变）
+    m_dodgeDirY = dir.y; // 锁定本次冲刺方向 y（转向输入不影响冲刺轨迹）
+
+    m_dodgeActive = true;          // 进入冲刺状态（无敌/残影/位移门控）
+    m_dodgeElapsed = 0.0f;         // 冲刺计时从 0 开始
+    m_dodgeTravelled = 0.0f;       // 本次实际位移清零（撞墙时如实累计）
+    m_dodgeCooldownLeft = DodgeRules::kCooldownSeconds; // 冷却从成功触发起算 1.2s
+
+    // 冲刺接管移动：常规速度与击退全部清零，避免冲刺结束后带着旧惯性；
+    // 击退窗口关闭（冲刺本身已提供保护，不需要击退位移叠加）
+    m_velocityX = 0.0f;   // 水平常规速度清零
+    m_velocityY = 0.0f;   // 垂直常规速度清零
+    m_knockbackVX = 0.0f; // 击退速度 x 清零
+    m_knockbackVY = 0.0f; // 击退速度 y 清零
+    m_knockbackLeft = 0.0f; // 击退/输入抑制窗口关闭
+
+    // 残影轨迹复位：三个槽位全部落在起点，首个采样间隔后才拉开距离
+    for (DodgeTrailPoint& point : m_dodgeTrail)
+    {
+        point.x = m_x;       // 历史位置 x = 当前左上角 x
+        point.y = m_y;       // 历史位置 y = 当前左上角 y
+        point.used = true;   // 槽位有效（渲染跳过「与本体重合」的残影）
+    }
+    m_dodgeTrailTimer = 0.0f; // 采样计时清零：下一步重新累计
+
+    return DodgeRules::DodgeStartBlock::None; // 成功启动
+}
+
+// 取消冲刺（M3·丙）：清活动状态/计时/轨迹，保留冷却剩余。
+// 冻结打断与异常时序防御使用；正常冲刺无敌不会触发此路径
+void Player::cancelDodge()
+{
+    m_dodgeActive = false;   // 退出冲刺：场景下一固定步恢复常规移动/受击结算
+    m_dodgeElapsed = 0.0f;   // 计时清零（下次冲刺从 0 开始）
+    m_dodgeTravelled = 0.0f; // 本次冲刺位移不再用于日志（被打断）
+    for (DodgeTrailPoint& point : m_dodgeTrail)
+    {
+        point.used = false; // 残影轨迹失效：下一帧不再绘制残影
+    }
+}
+
 // 覆写更新：渐近加减速移动 + 朝向跟随鼠标 + 攻击计时与横扫表现推进 + 动画切换。
 // 速度模型：目标速度 = 输入方向 x m_speed；当前速度以 accel（有输入）/
 // friction（无输入）逐轴逼近；位移 = 速度 x 固定步长（与帧率解耦）
@@ -215,6 +274,10 @@ void Player::update(const UpdateContext& ctx)
         m_swingLeft = std::max(m_swingLeft - ctx.deltaTime, 0.0f);
     }
 
+    // 冲刺冷却递减（M3·丙）：与固定步同源；冻结期间也照常走时（玩家被
+    // 冻住时冷却自然流逝，解冻后按剩余时间决定能否冲刺——报告口径）
+    m_dodgeCooldownLeft = DodgeRules::cooldownAfter(m_dodgeCooldownLeft, ctx.deltaTime);
+
     // 受击红染计时递减（批五A）：纯渲染反馈的剩余时长，与固定步长同源
     // （暂停时随 update 门控冻结，画面保持静止的既有承诺不变）
     if (m_hitTintLeft > 0.0f)
@@ -227,6 +290,7 @@ void Player::update(const UpdateContext& ctx)
     // 残余清零，避免解冻瞬间带着冻结前的惯性滑出去
     if (m_frozen)
     {
+        cancelDodge();         // 冻结立即打断冲刺（防御：冲刺无敌期正常不会冻住）
         m_velocityX = 0.0f;    // 水平速度清零
         m_velocityY = 0.0f;    // 垂直速度清零
         m_knockbackVX = 0.0f;  // 击退速度 x 清零
@@ -301,6 +365,74 @@ void Player::update(const UpdateContext& ctx)
     //    - 有输入：目标 = 方向 x 最大速度，以 accel 逼近（起步逐渐变快）
     //    - 无输入：目标 = 0，以 friction 逼近（松键滑行一小段后停住）
     const float dt = ctx.deltaTime; // 本固定步的时长（秒），目前恒为 1/120
+
+    // ---- 冲刺位移（M3·丙）：累计曲线差分 + 既有分轴碰撞滑动 ----
+    // 本步位移 = [累计距离(新进度) - 累计距离(旧进度)] x 固定方向。
+    // 二次缓出曲线在连续时间上的积分恰为 120px；用「差分」而不是
+    // 「瞬时速度 x dt」，离散积分不会因步数取整丢失距离（总位移更稳定）。
+    // 位移提交走 slideMovePlayer：撞墙该轴即停、另一轴照常滑动，
+    // 水域仍可通行（进入水域后由 PlayScene 照常触发落水）。
+    if (m_dodgeActive)
+    {
+        const float previousProgress = DodgeRules::progressAtElapsed(m_dodgeElapsed); // 本步起点进度
+        m_dodgeElapsed += dt;                                                        // 推进冲刺计时
+        const float currentProgress = DodgeRules::progressAtElapsed(m_dodgeElapsed); // 本步终点进度（到点夹 1）
+
+        // 本步应位移的距离（像素）：两条累计曲线的差值，恒 >= 0
+        const float stepDistance = DodgeRules::distanceAtProgress(currentProgress) -
+                                   DodgeRules::distanceAtProgress(previousProgress); // 终点累计距离 - 起点累计距离
+        const float stepDX = m_dodgeDirX * stepDistance; // 本步水平位移（方向锁定）
+        const float stepDY = m_dodgeDirY * stepDistance; // 本步垂直位移（同上）
+
+        const SDL_FRect startBox = collisionRect(); // 本步起点的玩家脚盒（世界坐标）
+        if (m_world != nullptr)
+        {
+            // 世界在位：与常规移动同一条滑动路径——墙/怪物实心、水可通行；
+            // 一轴被挡不影响另一轴，天然产生「贴墙滑行」而不会穿透
+            const SDL_FPoint moved = m_world->slideMovePlayer(
+                startBox.x, startBox.y, startBox.w, startBox.h,
+                stepDX, stepDY, &Player::solidBlockedCallback, this); // 分轴滑动提交（墙/怪物实心、水可通行）
+            m_x += moved.x - startBox.x; // 落定：脚盒的水平实际位移换算回精灵坐标
+            m_y += moved.y - startBox.y; // 落定：脚盒的垂直实际位移换算回精灵坐标
+        }
+        else
+        {
+            // 防御：未注入世界时退化为无碰撞位移（不限制、不崩溃）
+            m_x += stepDX; // 直接推进水平位置
+            m_y += stepDY; // 直接推进垂直位置
+        }
+
+        // 实际位移统计（供冲刺结束日志/冒烟证据）：以脚盒前后位置差计算，
+        // 撞墙时如实变小——「报告总距离」与「实际位移」因此可区分
+        const SDL_FRect endBox = collisionRect();                       // 本步终点的玩家脚盒
+        const float actualDX = endBox.x - startBox.x;                   // 水平实际位移
+        const float actualDY = endBox.y - startBox.y;                   // 垂直实际位移
+        m_dodgeTravelled += std::sqrt(actualDX * actualDX + actualDY * actualDY); // 累计实际位移
+
+        // 残影采样：每 0.03s 把「本步开始前的位置」推入轨迹（下标 0 最新），
+        // 三段历史位置在渲染时形成 3 道渐隐残影；采样间隔比固定步长
+        // 大，残影之间才有可见间距（每步都采会挤在一起）
+        m_dodgeTrailTimer += dt; // 采样计时累计
+        if (m_dodgeTrailTimer >= kDodgeTrailSampleSeconds)
+        {
+            m_dodgeTrailTimer -= kDodgeTrailSampleSeconds; // 保留余量（采样节奏稳定）
+            m_dodgeTrail[2] = m_dodgeTrail[1];             // 最旧槽位丢弃，第二旧后移
+            m_dodgeTrail[1] = m_dodgeTrail[0];             // 最近槽位后移一格
+            m_dodgeTrail[0].x = m_prevX;                   // 新采样：本步开始前的世界 x
+            m_dodgeTrail[0].y = m_prevY;                   // 新采样：本步开始前的世界 y
+            m_dodgeTrail[0].used = true;                   // 槽位有效
+        }
+
+        // 冲刺期动画：沿用跑动帧子区间（高速位移观感），不做站立判定
+        m_animTime += dt;                            // 累积动画时间
+        setAnimationRange(kRunFirst, kRunLast);      // 循环播放跑动帧
+
+        if (currentProgress >= 1.0f) // 到达 0.18s：本步位移结算完后退出冲刺
+        {
+            m_dodgeActive = false; // 下一步恢复常规移动/受击结算
+        }
+        return; // 冲刺接管本步移动：跳过常规加减速与动画切换
+    }
 
     if (inputX != 0.0f)
     {
@@ -401,6 +533,13 @@ void Player::render(SDL_Renderer* renderer, float alpha, const Camera& camera) c
     {
         renderDrownBody(renderer, alpha, camera); // 本体按落水视觉参数绘制
         return;                                   // 落水过场期间不再叠加武器/红染
+    }
+
+    // 冲刺残影（M3·丙）：先画历史位置的 3 道渐隐精灵（在本体之下），
+    // 再画本体——读作「高速移动拖出的残像」，不影响任何碰撞/判定
+    if (m_dodgeActive)
+    {
+        renderDodgeGhosts(renderer, camera); // 残影绘制（内部处理纹理状态还原）
     }
 
     // 基础绘制（含未加载纹理时的安全跳过）：按插值位置画当前动画帧
@@ -606,6 +745,68 @@ void Player::renderFreezeOverlay(SDL_Renderer* renderer, float alpha, const Came
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE); // 恢复默认混合
 }
 
+// 冲刺残影（M3·丙）：3 道历史位置精灵 + α 递减（复用武器残影的「近浓远淡」
+// 思路）。轨迹由 update 在冲刺期每 0.03s 采样；绘制在本体之前（残影在下），
+// 颜色略偏青蓝以区分实体。纹理颜色/alpha 绘制后恢复，不污染本体与后续绘制
+void Player::renderDodgeGhosts(SDL_Renderer* renderer, const Camera& camera) const
+{
+    if (m_texture == nullptr) // 纹理未加载（极端降级）：没有可画的残影
+    {
+        return; // 直接结束（不影响玩法）
+    }
+
+    // 帧号换算：残影沿用本体当前的跑动帧（与 renderDrownBody 同一算法），
+    // 让残影看起来就是「刚才那一帧的自己」而不是固定姿势
+    const int firstFrame = std::clamp(m_animFirst, 0, m_frameCount - 1); // 子区间起点（防御夹取）
+    const int lastFrame = (m_animLast < 0)
+        ? m_frameCount - 1
+        : std::clamp(m_animLast, firstFrame, m_frameCount - 1); // 子区间终点
+    const int rangeLength = lastFrame - firstFrame + 1; // 子区间长度（含两端）
+    const int frameIndex =
+        firstFrame + static_cast<int>(m_animTime / m_frameTime) % rangeLength; // 当前帧号
+    const SDL_FRect src{ static_cast<float>(frameIndex) * m_w, 0.0f, m_w, m_h }; // 精灵表裁帧
+
+    // 从最旧到最新绘制（index 2 -> 0）：旧残影更淡、最新残影稍浓；
+    // 三段都画在本体之下，本体最后绘制自然盖住最浓的一段
+    for (int i = kDodgeTrailCount - 1; i >= 0; --i)
+    {
+        const DodgeTrailPoint& point = m_dodgeTrail[i]; // 本道历史位置
+        if (!point.used) // 槽位无效（被取消/尚未采样）：跳过
+        {
+            continue; // 不绘制本道
+        }
+
+        // 与当前位置几乎重合的残影没有意义（只会叠成一层亮边）：
+        // 位移小于 2px 时跳过，冲刺起点的三段重叠因此不会糊成一团
+        if (std::fabs(point.x - m_x) + std::fabs(point.y - m_y) < 2.0f)
+        {
+            continue; // 与本体重合：跳过
+        }
+
+        const Vec2 screen = camera.worldToScreen(point.x, point.y); // 历史位置 -> 屏幕
+        const SDL_FRect dst{ screen.x, screen.y, m_w, m_h };        // 绘制矩形（完整精灵）
+
+        // 纹理调制：偏青蓝 + 残影 α（近浓远淡）；每道绘制前显式设置
+        SDL_SetTextureColorMod(m_texture, 170, 220, 255); // 偏青蓝色的残影调制
+        SDL_SetTextureAlphaMod(m_texture,
+                               static_cast<Uint8>(kDodgeTrailAlphas[i] * 255.0f + 0.5f)); // 本道 α（0~255）
+
+        if (m_flipped) // 朝向与本体一致：翻转时同样水平镜像
+        {
+            SDL_RenderTextureRotated(renderer, m_texture, &src, &dst, 0.0, nullptr,
+                                     SDL_FLIP_HORIZONTAL); // 镜像绘制残影
+        }
+        else // 常规朝向：快路径
+        {
+            SDL_RenderTexture(renderer, m_texture, &src, &dst); // 直接绘制残影
+        }
+    }
+
+    // 恢复纹理状态为中性：本体与后续实体按原始颜色/不透明度绘制
+    SDL_SetTextureColorMod(m_texture, 255, 255, 255); // 恢复原始颜色调制
+    SDL_SetTextureAlphaMod(m_texture, 255);           // 恢复完全不透明
+}
+
 // 受击击退（批五A）：沿「伤害来源 -> 玩家」方向被推开 + 红染 + 输入抑制
 //（契约见头文件；PlayScene 在怪物攻击命中时调用）
 void Player::applyHitKnockback(float fromCenterX, float fromCenterY)
@@ -664,6 +865,17 @@ void Player::reset(float x, float y)
     m_drownSinkY = 0.0f;    // 下沉偏移归零
     m_drownAlpha = 255;     // 不透明度恢复 255
     m_frozen = false;       // 冻结锁定解除（新一局/复活不带旧状态）
+
+    // 冲刺状态清零（M3·丙）：R 重开/复活归位后冷却立即就绪、无残影残留
+    m_dodgeActive = false;       // 退出冲刺（不带着无敌/位移状态进新一局）
+    m_dodgeElapsed = 0.0f;       // 冲刺计时清零
+    m_dodgeCooldownLeft = 0.0f;  // 冷却清零：新一局/复活后立即可冲刺
+    m_dodgeTravelled = 0.0f;     // 位移统计清零
+    m_dodgeTrailTimer = 0.0f;    // 残影采样计时清零
+    for (DodgeTrailPoint& point : m_dodgeTrail)
+    {
+        point.used = false; // 残影槽位失效：重开后不残留上一局拖影
+    }
 
     // 挥砍朝向回初始（向右）：新一局的第一个固定步会按鼠标位置重新
     // 决定朝向与瞄准方向，这里只是把状态归到与构造时一致的起点
