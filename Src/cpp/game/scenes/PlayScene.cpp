@@ -2314,6 +2314,11 @@ void PlayScene::beginDeath(DeathCause cause)
         m_spellCooldownLeft[penalty.lostSpellIndex] = 0.0f; // 冷却清零
     }
 
+    // 观察项修复（M4）：失去护盾术时清空当前护盾——护盾是该技能的主动
+    // 效果，技能移除后不得残留；减速/冻结等减益与技能层数无关，不在此清
+    const bool shieldCleared = deathPenaltyClearsShield(penalty); // 本次是否需清盾
+    m_playerShield = shieldAfterDeathPenalty(m_playerShield, penalty); // 写回护盾点数（必要时 0）
+
     // 日志技能名：实际丢失时取法术名；无损失（等级 1/历史为空）写「无」
     const char* lostSkillName = "无"; // 默认：本次没有失去技能
     if (penalty.skillLost && penalty.lostSpellIndex >= 0 &&
@@ -2326,6 +2331,12 @@ void PlayScene::beginDeath(DeathCause cause)
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "惩罚：金币 %d→%d；等级 %d→%d；失去技能：%s",
                 coinsBefore, m_coinCount, levelBefore, m_level, lostSkillName);
+
+    // 冒烟观测点：护盾主动效果清理日志（观察项验收文案，紧随惩罚摘要）
+    if (shieldCleared)
+    {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "失去护盾术：护盾已清空"); // 明确记录护盾被清
+    }
 
     // ---- 复活点选择：距死亡地点最近的已激活神龛 ----
     int shrineIndex = nearestActiveShrine(m_shrineActive, deathCenterX, deathCenterY);

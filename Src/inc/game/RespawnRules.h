@@ -4,6 +4,8 @@
 #include <algorithm> // std::max：金币/等级/经验的非负与最低等级夹取
 #include <vector>    // std::vector：升级历史栈（每次升级选择入栈一笔）
 
+#include "game/Spell.h" // SpellId / kSpellCount：护盾术下标与法术池常量
+
 // ============================================================
 // RespawnRules：死亡惩罚与升级历史栈（批六乙·纯逻辑）
 // ============================================================
@@ -107,6 +109,46 @@ inline DeathPenaltyResult applyDeathPenalty(int coins, int level, int xp,
     }
 
     return result; // 交还惩罚结果（调用方负责写回与日志）
+}
+
+// ============================================================
+// 死亡惩罚 · 主动效果清理（M4 观察项修复）
+// ============================================================
+//
+// 规则：死亡惩罚「失去技能」时，该技能产生的主动效果必须一并消失。
+// 当前唯一需要显式清理的常驻主动效果是护盾术的护盾点数——护盾存在
+// PlayScene 的 m_playerShield（不在纯逻辑层），因此本文件提供判定与
+// 取值两个纯函数，场景层只负责写回与日志。
+//
+// 边界：
+//   - 只处理护盾术：层数从 2 降到 1 时技能仍在，护盾保留；
+//   - 减速 / 冻结条等减益与技能层数无关（死亡流程另行复位），不在此清；
+//   - 非护盾技能丢失、无技能损失（等级 1 / 历史为空）一律不清盾。
+// ============================================================
+
+// 是否应在本次死亡惩罚后清空护盾：实际丢失护盾术且层数归零才算。
+inline bool deathPenaltyClearsShield(const DeathPenaltyResult& result)
+{
+    // 条件 1：本次确实丢失了一层技能（before > 0）
+    return result.skillLost &&
+           // 条件 2：丢失的正是护盾术（按下标比对）
+           result.lostSpellIndex == static_cast<int>(SpellId::Shield) &&
+           // 条件 3：护盾术层数归零（技能已彻底移除，主动效果不得残留）
+           result.lostSpellLevelAfter <= 0;
+}
+
+// 死亡惩罚结算后的护盾点数：需要清盾时返回 0，否则保持当前值。
+inline int shieldAfterDeathPenalty(int currentShield, const DeathPenaltyResult& result)
+{
+    // 技能已失去：护盾是该技能的主动效果，必须清零（观察项修复核心）
+    if (deathPenaltyClearsShield(result))
+    {
+        // 返回 0：HUD「护盾 N」与护盾罩在下一帧随值为 0 自然消失
+        return 0;
+    }
+
+    // 其余场景保持原护盾；夹到非负（防御：异常负值不进入 HUD）
+    return std::max(0, currentShield);
 }
 
 #endif // !__RESPAWN_RULES_H__

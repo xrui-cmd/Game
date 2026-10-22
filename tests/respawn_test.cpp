@@ -11,6 +11,8 @@
 //             ⑤ 死亡惩罚数学（金币减半向下取整 / 最低 1 级 / 经验清零）
 //             ⑥ 升级历史栈出栈（层数 -1、归零移除、空栈防御、非法下标）
 //             ⑦ 多次死亡连续出栈（逐次归还升级所得技能）
+//             ⑧ 失去护盾术清空护盾（M4 观察项：清盾判定 / 仍有层数不清 /
+//                非护盾技能不清 / 减速与冻结条不受影响）
 //
 //  依赖 : 纯头文件逻辑；Shrine.h 经 Zone.h/World.h 使用 SDL 类型与内联
 //  函数（不链接 SDL3 运行时）——任何环境都能确定性运行。
@@ -18,9 +20,10 @@
 //  退出码 : main 返回"失败用例数"（全部通过 = 0）
 // ============================================================================
 
-#include "game/Shrine.h"       // 被测：神龛表 / nearestActiveShrine / 交互范围
-#include "game/RespawnRules.h" // 被测：升级历史栈 / applyDeathPenalty
-#include "game/Spell.h"        // kSpellCount：法术层数数组尺寸
+#include "game/Shrine.h"        // 被测：神龛表 / nearestActiveShrine / 交互范围
+#include "game/RespawnRules.h"  // 被测：升级历史栈 / applyDeathPenalty / 清盾判定
+#include "game/Spell.h"         // kSpellCount / SpellId：法术层数数组尺寸与护盾下标
+#include "game/ElementStatus.h" // SlowStatus / FreezeMeter：验证减益不被清盾逻辑误伤
 
 #include <cmath>   // std::fabs：浮点近似断言
 #include <cstdio>  // std::printf
@@ -364,6 +367,78 @@ int main()
         expectTrue("第 3 次死亡：不降级", !third.levelLost);   // 无等级惩罚
     }
     endCase(7, p0, f0);
+
+    // ------------------------------------------------------------------
+    // CASE 8 失去护盾术清空主动效果（M4 观察项修复）
+    // ------------------------------------------------------------------
+    beginCase(8, "失去护盾术：护盾清零 / 仍有层数保留 / 非护盾技能与减益不受影响");
+    p0 = gPass; f0 = gFail;
+    {
+        const int shieldIndex = static_cast<int>(SpellId::Shield); // 护盾术在法术表中的下标
+
+        // ---- 场景 A：持有护盾术 1 层 + 30 点护盾，死亡丢失该技能 ----
+        int spellLevels[kSpellCount];              // 法术层数数组
+        clearSpellLevels(spellLevels);             // 全 0 起步
+        spellLevels[shieldIndex] = 1;              // 只学了护盾术 1 层
+        std::vector<UpgradeChoiceRecord> history;  // 升级历史栈
+        pushUpgradeChoice(history, shieldIndex, 1); // 唯一一笔：护盾术 1 层
+
+        const DeathPenaltyResult lostShield =
+            applyDeathPenalty(10, 2, 5, history, spellLevels, kSpellCount); // 2 级死亡
+        expectTrue("护盾术被判定为丢失", lostShield.skillLost);              // 实际丢了 1 层
+        expectInt("丢失下标 = 护盾术", lostShield.lostSpellIndex, shieldIndex); // 法术归属正确
+        expectInt("护盾术层数 1 -> 0", spellLevels[shieldIndex], 0);         // 技能移除
+        expectTrue("清盾判定成立", deathPenaltyClearsShield(lostShield));    // 应清空护盾
+        expectInt("护盾 30 -> 0", shieldAfterDeathPenalty(30, lostShield), 0); // 护盾值清空
+
+        // ---- 场景 B：护盾术 2 层降到 1 层（技能仍在），护盾保留 ----
+        clearSpellLevels(spellLevels);              // 层数复位
+        spellLevels[shieldIndex] = 2;               // 护盾术 2 层
+        history.clear();                            // 历史复位
+        pushUpgradeChoice(history, shieldIndex, 2);  // 记录一次升到 2 层
+        const DeathPenaltyResult stillShield =
+            applyDeathPenalty(10, 3, 5, history, spellLevels, kSpellCount); // 3 级死亡
+        expectInt("护盾术 2 -> 1（仍持有）", spellLevels[shieldIndex], 1); // 只降一层
+        expectTrue("仍有护盾术：不清盾", !deathPenaltyClearsShield(stillShield)); // 技能未移除
+        expectInt("护盾 30 保留", shieldAfterDeathPenalty(30, stillShield), 30); // 主动效果留存
+
+        // ---- 场景 C：失去其他技能（火球术），护盾不受影响 ----
+        clearSpellLevels(spellLevels);              // 层数复位
+        spellLevels[0] = 1;                         // 只学了火球术 1 层
+        history.clear();                            // 历史复位
+        pushUpgradeChoice(history, 0, 1);           // 记录火球术
+        const DeathPenaltyResult lostFireball =
+            applyDeathPenalty(10, 2, 5, history, spellLevels, kSpellCount); // 2 级死亡
+        expectInt("火球术 1 -> 0", spellLevels[0], 0);                        // 火球被移除
+        expectTrue("失去火球术：不清盾", !deathPenaltyClearsShield(lostFireball)); // 非护盾技能
+        expectInt("护盾 30 保留（非护盾技能）", shieldAfterDeathPenalty(30, lostFireball), 30); // 不动护盾
+
+        // ---- 场景 D：无技能损失（等级 1），护盾不受影响 ----
+        history.clear();                            // 空历史
+        const DeathPenaltyResult noLoss =
+            applyDeathPenalty(5, 1, 0, history, spellLevels, kSpellCount); // 1 级死亡
+        expectTrue("等级 1 无技能损失", !noLoss.skillLost);                  // 不降级不出栈
+        expectTrue("无技能损失：不清盾", !deathPenaltyClearsShield(noLoss)); // 判定为 false
+        expectInt("护盾 30 保留（无损失）", shieldAfterDeathPenalty(30, noLoss), 30); // 不动护盾
+
+        // ---- 场景 E：清盾判定不影响减益（减速 / 冻结条） ----
+        SlowStatus slow;              // 被测联动：减速状态
+        slow.apply(0.5f, 3.0f);       // 施加较强减速（x0.5，3 秒）
+        FreezeMeter freeze;           // 被测联动：冻结条
+        freeze.add(65);               // 累积到 65（未触发冻结）
+
+        clearSpellLevels(spellLevels);               // 层数复位
+        spellLevels[shieldIndex] = 1;                // 再次只学护盾术
+        history.clear();                             // 历史复位
+        pushUpgradeChoice(history, shieldIndex, 1);  // 记录护盾术
+        const DeathPenaltyResult debuffCase =
+            applyDeathPenalty(8, 2, 4, history, spellLevels, kSpellCount); // 2 级死亡
+        expectTrue("减益场景：清盾判定成立", deathPenaltyClearsShield(debuffCase)); // 护盾应清
+        expectInt("减益场景：护盾 45 -> 0", shieldAfterDeathPenalty(45, debuffCase), 0); // 护盾照清
+        expectNear("减速不被清盾逻辑影响（x0.5）", slow.moveMultiplier(), 0.5f); // 减益原样
+        expectNear("冻结条不被清盾逻辑影响（65）", freeze.value(), 65.0f);        // 冻结原样
+    }
+    endCase(8, p0, f0);
 
     // ------------------------------------------------------------------
     // 总结
