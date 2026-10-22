@@ -31,6 +31,12 @@ $stagingDir = Join-Path $distDir ".staging-$version"
 # 玩家说明源文件（打包时放到 zip 根目录）
 $notesPath = Join-Path $repoRoot "docs\玩家说明.txt"
 
+# 源素材目录：打包前用它刷新构建输出，确保包内素材与仓库一致
+$sourceAssets = Join-Path $repoRoot "assets"
+
+# 源配置目录：同样用于刷新构建输出（game.ini 以仓库当前版本为准）
+$sourceConfig = Join-Path $repoRoot "config"
+
 # 运行时必需的 4 个 DLL（SDL3 系列；顺序仅用于日志显示）
 $runtimeDlls = @("SDL3.dll", "SDL3_image.dll", "SDL3_ttf.dll", "SDL3_mixer.dll")
 
@@ -190,6 +196,31 @@ if ($warningLines.Count -gt 0)
 # 构建完成提示（0 警告是本脚本的硬性门槛）
 Write-Host "[package] 构建完成：0 警告"
 
+# 构建输出中的素材目录：随后用仓库源目录刷新（去掉历史残留）
+$buildAssets = Join-Path $buildDir "assets"
+
+# 构建输出中的配置目录：随后用仓库源目录刷新
+$buildConfig = Join-Path $buildDir "config"
+
+# 源素材目录缺失：无法刷新，直接报错
+if (-not (Test-Path -LiteralPath $sourceAssets))
+{
+    # 指出缺失路径（素材是运行必需项）
+    throw "素材目录缺失：$sourceAssets"
+}
+
+# 刷新素材：CMake POST_BUILD 只增改不删除，旧版本文件会残留在构建目录
+Remove-Item -LiteralPath $buildAssets -Recurse -Force -ErrorAction SilentlyContinue
+
+# 从仓库源目录整目录复制，保证包内素材与当前仓库完全一致
+Copy-Item -LiteralPath $sourceAssets -Destination $buildDir -Recurse
+
+# 刷新配置：先删旧副本（避免已删除的配置键残留在包内）
+Remove-Item -LiteralPath $buildConfig -Recurse -Force -ErrorAction SilentlyContinue
+
+# 复制仓库当前配置（game.ini 修改后重启生效——包内需为最新版本）
+Copy-Item -LiteralPath $sourceConfig -Destination $buildDir -Recurse
+
 # 必需文件清单：主程序 + 4 个运行库（均在构建输出根目录）
 $requiredFiles = @("GameDev.exe") + $runtimeDlls
 
@@ -206,23 +237,17 @@ foreach ($name in $requiredFiles)
     }
 }
 
-# assets 目录由 CMake POST_BUILD 复制到构建输出目录
-$buildAssets = Join-Path $buildDir "assets"
-
-# config 目录同理（配置随包发布）
-$buildConfig = Join-Path $buildDir "config"
-
-# 素材目录缺失：构建后复制步骤未执行或失败
+# 素材目录缺失：上方刷新步骤未成功（复制失败或源目录为空）
 if (-not (Test-Path -LiteralPath $buildAssets))
 {
-    # 输出期望路径，便于核对 POST_BUILD 配置
+    # 输出期望路径，便于排查刷新步骤
     throw "构建输出缺少 assets 目录：$buildAssets"
 }
 
-# 配置目录缺失：同上
+# 配置目录缺失：上方刷新步骤未成功
 if (-not (Test-Path -LiteralPath $buildConfig))
 {
-    # 输出期望路径，便于核对 POST_BUILD 配置
+    # 输出期望路径，便于排查刷新步骤
     throw "构建输出缺少 config 目录：$buildConfig"
 }
 
