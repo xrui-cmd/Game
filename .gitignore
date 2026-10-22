@@ -19,3 +19,6 @@
 /tests/build/
 /tests/bin/
 /tests/*.exe
+
+# 发布打包产物（tools/package.ps1 输出 zip 与临时 staging，不入库）
+/dist/
